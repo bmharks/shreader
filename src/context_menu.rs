@@ -21,6 +21,7 @@ pub struct ContextMenu<'a, Message, Theme, Renderer> {
     on_right_press: Option<Message>,
     on_dismiss: Option<Message>,
     on_escape: Option<Message>,
+    focus_on_right_press: bool,
 }
 
 pub fn context_menu<'a, Message, Theme, Renderer>(
@@ -32,6 +33,7 @@ pub fn context_menu<'a, Message, Theme, Renderer>(
         on_right_press: None,
         on_dismiss: None,
         on_escape: None,
+        focus_on_right_press: false,
     }
 }
 
@@ -56,6 +58,15 @@ impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer> {
     /// Defaults to `on_dismiss`.
     pub fn on_escape(mut self, message: Message) -> Self {
         self.on_escape = Some(message);
+        self
+    }
+
+    /// Give keyboard focus to the content on right click, as a left click
+    /// would. Needed for a read-only `text_editor`: it only shows its
+    /// selection (and handles Ctrl+C) while focused, and "Select all" from
+    /// the menu should be visible and copyable.
+    pub fn focus_on_right_press(mut self) -> Self {
+        self.focus_on_right_press = true;
         self
     }
 }
@@ -151,6 +162,14 @@ where
                 (&self.on_right_press, cursor.position_over(layout.bounds()))
             {
                 tree.state.downcast_mut::<State>().position = Some(position);
+                if self.focus_on_right_press {
+                    self.content.as_widget().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        &mut FocusAll,
+                    );
+                }
                 shell.publish(message.clone());
                 return event::Status::Captured;
             }
@@ -225,6 +244,24 @@ where
                 translation,
             ),
         }
+    }
+}
+
+/// Focuses every focusable widget it visits.
+struct FocusAll;
+
+impl widget::Operation for FocusAll {
+    fn container(
+        &mut self,
+        _id: Option<&widget::Id>,
+        _bounds: Rectangle,
+        operate_on_children: &mut dyn FnMut(&mut dyn widget::Operation),
+    ) {
+        operate_on_children(self);
+    }
+
+    fn focusable(&mut self, state: &mut dyn widget::operation::Focusable, _id: Option<&widget::Id>) {
+        state.focus();
     }
 }
 

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use iced::mouse;
 use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, mouse_area, pick_list, row,
-    scrollable, stack, text, text_input, vertical_rule, Space,
+    scrollable, stack, text, text_editor, text_input, vertical_rule, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme, Vector};
 
@@ -68,6 +68,11 @@ pub struct RssApp {
     reader_body: Option<(i64, Vec<Block>)>,
     /// Images of the open story, by URL
     story_images: HashMap<String, ImageState>,
+    /// The open story's text blocks as read-only editors, so text can be
+    /// selected and copied (iced's plain `text` can't be selected)
+    reader_texts: Vec<text_editor::Content>,
+    /// Text block whose right-click (Copy / Select all) menu is open
+    reader_text_menu: Option<usize>,
     search_query: String,
     new_folder_input: String,
     show_new_folder_input: bool,
@@ -212,6 +217,12 @@ pub enum Message {
     StatusTimedOut(u64),
     ShowMoreArticles,
 
+    /// Selecting text etc. in story text block `.0` (edits are ignored)
+    ReaderTextAction(usize, text_editor::Action),
+    OpenReaderTextMenu(usize),
+    CloseReaderTextMenu,
+    CopyReaderSelection(usize),
+    SelectAllReaderText(usize),
     /// An image in the open story finished downloading (or failed)
     StoryImageLoaded(String, Result<StoryImage, String>),
 
@@ -312,6 +323,8 @@ impl RssApp {
             selected_article_id: None,
             reader_body: None,
             story_images: HashMap::new(),
+            reader_texts: Vec::new(),
+            reader_text_menu: None,
             search_query: String::new(),
             new_folder_input: String::new(),
             show_new_folder_input: false,
@@ -475,8 +488,50 @@ impl RssApp {
                     .map(reader_blocks)
                     .unwrap_or_default();
                 let task = self.load_story_images(&blocks);
+                self.reader_texts = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text(body) => Some(text_editor::Content::with_text(body)),
+                        Block::Image { .. } => None,
+                    })
+                    .collect();
+                self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
                 task
+            }
+            Message::ReaderTextAction(index, action) => {
+                // Read-only: allow selecting, moving, clicking, but never editing
+                if !action.is_edit() {
+                    if let Some(content) = self.reader_texts.get_mut(index) {
+                        content.perform(action);
+                    }
+                }
+                Task::none()
+            }
+            Message::OpenReaderTextMenu(index) => {
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = None;
+                self.reader_text_menu = Some(index);
+                Task::none()
+            }
+            Message::CloseReaderTextMenu => {
+                self.reader_text_menu = None;
+                Task::none()
+            }
+            Message::CopyReaderSelection(index) => {
+                self.reader_text_menu = None;
+                match self.reader_texts.get(index).and_then(|content| content.selection()) {
+                    Some(selection) => iced::clipboard::write(selection),
+                    None => Task::none(),
+                }
+            }
+            Message::SelectAllReaderText(index) => {
+                self.reader_text_menu = None;
+                if let Some(content) = self.reader_texts.get_mut(index) {
+                    content.perform(text_editor::Action::SelectAll);
+                }
+                Task::none()
             }
             Message::StoryImageLoaded(url, result) => {
                 // Ignore downloads for a story that's no longer open
@@ -710,6 +765,7 @@ impl RssApp {
             Message::OpenArticleMenu(article_id) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.reader_text_menu = None;
                 self.article_menu = Some(article_id);
                 Task::none()
             }
@@ -849,6 +905,7 @@ impl RssApp {
             Message::OpenFeedMenu(feed_id) => {
                 self.folder_menu = None;
                 self.article_menu = None;
+                self.reader_text_menu = None;
                 self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::Main });
                 Task::none()
             }
@@ -1092,6 +1149,7 @@ impl RssApp {
             Message::OpenFolderMenu(folder_id) => {
                 self.feed_menu = None;
                 self.article_menu = None;
+                self.reader_text_menu = None;
                 self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false });
                 Task::none()
             }
@@ -1292,17 +1350,77 @@ impl RssApp {
     }
 
     /// The story body: text paragraphs with the story's images in between.
-    fn story_body<'a>(&'a self, blocks: &[Block]) -> Element<'a, Message> {
+    ///
+    /// With `selectable`, text blocks are the read-only editors in
+    /// `reader_texts` (one per text block, in order) so they can be copied.
+    fn story_body<'a>(&'a self, blocks: &[Block], selectable: bool) -> Element<'a, Message> {
         let mut body = column![].spacing(14).width(Length::Fill);
+        let mut text_index = 0;
         for block in blocks {
             body = body.push(match block {
                 Block::Text(text_block) => {
-                    Element::from(text(text_block.clone()).size(14).width(Length::Fill))
+                    let index = text_index;
+                    text_index += 1;
+                    match self.reader_texts.get(index).filter(|_| selectable) {
+                        Some(content) => self.selectable_text(index, content),
+                        None => text(text_block.clone()).size(14).width(Length::Fill).into(),
+                    }
                 }
                 Block::Image { src } => self.story_image(src),
             });
         }
         body.into()
+    }
+
+    /// A story text block that can be selected (drag, double/triple click,
+    /// Ctrl+A) and copied (Ctrl+C or right click). Styled to look like plain text.
+    fn selectable_text<'a>(
+        &'a self,
+        index: usize,
+        content: &'a text_editor::Content,
+    ) -> Element<'a, Message> {
+        let editor = text_editor(content)
+            .on_action(move |action| Message::ReaderTextAction(index, action))
+            .size(14)
+            .padding(0)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .style(|theme: &Theme, _status| {
+                let palette = theme.extended_palette();
+                text_editor::Style {
+                    background: iced::Color::TRANSPARENT.into(),
+                    border: iced::Border::default(),
+                    icon: palette.background.weak.text,
+                    placeholder: palette.background.strong.color,
+                    value: palette.background.base.text,
+                    selection: palette.primary.weak.color,
+                }
+            });
+
+        let has_selection = content.selection().is_some();
+        let menu = (self.reader_text_menu == Some(index)).then(|| {
+            let menu_item = |label: &'static str, message: Option<Message>| {
+                button(text(label).size(13))
+                    .width(Length::Fill)
+                    .padding([5, 10])
+                    .style(button::text)
+                    .on_press_maybe(message)
+            };
+            menu_card(
+                column![
+                    menu_item("Copy", has_selection.then_some(Message::CopyReaderSelection(index))),
+                    menu_item("Select all", Some(Message::SelectAllReaderText(index))),
+                ]
+                .spacing(2),
+                150.0,
+            )
+        });
+
+        context_menu(editor)
+            .menu(menu)
+            .focus_on_right_press()
+            .on_right_press(Message::OpenReaderTextMenu(index))
+            .on_dismiss(Message::CloseReaderTextMenu)
+            .into()
     }
 
     /// One story image, centered. Clicking it opens the full image in the browser.
@@ -2536,8 +2654,8 @@ impl RssApp {
                 // Header details
                 // Before fields are moved out of `art` below
                 let body = match &self.reader_body {
-                    Some((id, blocks)) if *id == art.id => self.story_body(blocks),
-                    _ => self.story_body(&reader_blocks(&art)),
+                    Some((id, blocks)) if *id == art.id => self.story_body(blocks, true),
+                    _ => self.story_body(&reader_blocks(&art), false),
                 };
                 let title = text(art.title).size(22);
 
