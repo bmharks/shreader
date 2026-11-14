@@ -3,9 +3,11 @@ pub mod context_menu;
 pub mod db;
 pub mod feed;
 pub mod follow_cursor;
+pub mod icons;
 pub mod models;
 pub mod on_escape;
 pub mod opml;
+pub mod split;
 
 use std::env;
 use std::fs;

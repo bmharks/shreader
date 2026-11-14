@@ -89,6 +89,11 @@ impl Database {
         // 2. Core Tables
         conn.execute_batch(
             r#"
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS folders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -183,6 +188,25 @@ impl Database {
     }
 
     // --- Folder Operations ---
+
+    /// A saved UI setting, if any.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let value = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| row.get(0))
+            .optional()?;
+        Ok(value)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 
     pub fn create_folder(&self, name: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -702,19 +726,31 @@ impl Database {
         feed_id: Option<i64>,
         folder_id: Option<i64>,
     ) -> Result<()> {
+        self.set_articles_read_state(feed_id, folder_id, true)
+    }
+
+    /// Marks every story in a feed, else a folder, else everywhere, as read or
+    /// unread.
+    pub fn set_articles_read_state(
+        &self,
+        feed_id: Option<i64>,
+        folder_id: Option<i64>,
+        is_read: bool,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let is_read = is_read as i64;
         if let Some(feed_id) = feed_id {
             conn.execute(
-                "UPDATE articles SET is_read = 1 WHERE feed_id = ?1 AND is_read = 0",
-                params![feed_id],
+                "UPDATE articles SET is_read = ?1 WHERE feed_id = ?2 AND is_read != ?1",
+                params![is_read, feed_id],
             )?;
         } else if let Some(folder_id) = folder_id {
             conn.execute(
-                "UPDATE articles SET is_read = 1 WHERE feed_id IN (SELECT id FROM feeds WHERE folder_id = ?1) AND is_read = 0",
-                params![folder_id],
+                "UPDATE articles SET is_read = ?1 WHERE feed_id IN (SELECT id FROM feeds WHERE folder_id = ?2) AND is_read != ?1",
+                params![is_read, folder_id],
             )?;
         } else {
-            conn.execute("UPDATE articles SET is_read = 1 WHERE is_read = 0", [])?;
+            conn.execute("UPDATE articles SET is_read = ?1 WHERE is_read != ?1", params![is_read])?;
         }
         Ok(())
     }

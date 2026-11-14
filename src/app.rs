@@ -12,6 +12,8 @@ use crate::db::Database;
 use crate::feed::{FeedFetcher, FeedPreview};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
+use crate::icons::{icon, Icon, Tint};
+use crate::split::split;
 use crate::on_escape::on_escape;
 use crate::models::{Article, ArticleFilter, Feed, Folder, FeedSyncSummary};
 
@@ -25,6 +27,17 @@ const ADD_FEED_URL_INPUT_ID: &str = "add_feed_url_input_id";
 /// re-lays out the whole widget tree, so rendering thousands of cards made each
 /// update cost 100+ ms (and made drag-and-drop lag). More load on demand.
 const ARTICLE_PAGE_SIZE: usize = 150;
+
+/// Story list column width: default, limits, and where it's saved
+const ARTICLE_LIST_DEFAULT_WIDTH: f32 = 360.0;
+const ARTICLE_LIST_MIN_WIDTH: f32 = 260.0;
+const READER_MIN_WIDTH: f32 = 320.0;
+/// Widest the story text gets; past this, lines get too long to read comfortably
+const READER_TEXT_MAX_WIDTH: f32 = 760.0;
+/// Room the story's scrollbar takes on the right (default 10px bar + 4px gap).
+/// The headline and footer leave the same room, so all three center alike.
+const READER_SCROLLBAR_GUTTER: f32 = 14.0;
+const ARTICLE_LIST_WIDTH_SETTING: &str = "article_list_width";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveFilter {
@@ -45,6 +58,8 @@ pub struct RssApp {
     expanded_folders: HashSet<i64>,
     active_filter: ActiveFilter,
     selected_article_id: Option<i64>,
+    /// Reader text for the selected story, converted once when it's opened
+    reader_body: Option<(i64, String)>,
     search_query: String,
     new_folder_input: String,
     show_new_folder_input: bool,
@@ -61,6 +76,7 @@ pub struct RssApp {
     editing_feed: Option<EditFeedDialog>,
 
     add_feed: Option<AddFeedDialog>,
+    article_list_width: f32,
 
     // Folder context menu (right click) and in-place rename
     folder_menu: Option<FolderMenu>,
@@ -173,6 +189,10 @@ pub enum Message {
     DismissStatus,
     ShowMoreArticles,
 
+    // Divider between the story list and the reader
+    ArticleListResized(f32),
+    ArticleListResizeEnded,
+
     // Add feed dialog
     OpenAddFeed,
     AddFeedUrlChanged(String),
@@ -198,6 +218,14 @@ pub enum Message {
     RenameFolderInputChanged(String),
     SubmitRenameFolder,
     CancelRenameFolder,
+
+    // Read state & refresh for one feed or folder (context menus)
+    SetFeedRead(i64, bool),
+    SetFolderRead(i64, bool),
+    RefreshFeed(i64),
+    RefreshFolder(i64),
+    /// A single feed / folder refresh finished; carries its display name
+    PartialRefreshFinished(String, Result<Vec<FeedSyncSummary>, String>),
 
     // Feed context menu & rename
     OpenFeedMenu(i64),
@@ -250,6 +278,7 @@ impl RssApp {
             expanded_folders: HashSet::new(),
             active_filter: ActiveFilter::All,
             selected_article_id: None,
+            reader_body: None,
             search_query: String::new(),
             new_folder_input: String::new(),
             show_new_folder_input: false,
@@ -261,12 +290,24 @@ impl RssApp {
             renaming_feed: None,
             editing_feed: None,
             add_feed: None,
+            article_list_width: ARTICLE_LIST_DEFAULT_WIDTH,
             folder_menu: None,
             renaming_folder: None,
             drag_hover_target: None,
         };
 
         app.reload_data();
+
+        if let Some(width) = app
+            .db
+            .get_setting(ARTICLE_LIST_WIDTH_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|w| w.parse::<f32>().ok())
+            .filter(|w| w.is_finite())
+        {
+            app.article_list_width = width;
+        }
 
         // By default, expand all folders so user sees their structure
         for f in &app.folders {
@@ -386,6 +427,12 @@ impl RssApp {
                 // Mark as read when selected
                 let _ = self.db.set_article_read(article_id, true);
                 self.reload_data();
+                // Converting HTML is too slow to redo on every view rebuild
+                self.reader_body = self
+                    .articles
+                    .iter()
+                    .find(|a| a.id == article_id)
+                    .map(|a| (article_id, reader_text(a)));
                 Task::none()
             }
             Message::FeedAdded(result) => {
@@ -406,6 +453,16 @@ impl RssApp {
                         self.status_message = Some((e, true));
                     }
                 }
+                Task::none()
+            }
+            Message::ArticleListResized(width) => {
+                self.article_list_width = width;
+                Task::none()
+            }
+            Message::ArticleListResizeEnded => {
+                let _ = self
+                    .db
+                    .set_setting(ARTICLE_LIST_WIDTH_SETTING, &self.article_list_width.to_string());
                 Task::none()
             }
             Message::OpenAddFeed => {
@@ -586,6 +643,87 @@ impl RssApp {
                     let _ = self.db.set_article_read(article_id, !art.is_read);
                     self.reload_data();
                 }
+                Task::none()
+            }
+            Message::SetFeedRead(feed_id, is_read) => {
+                self.feed_menu = None;
+                if let Err(e) = self.db.set_articles_read_state(Some(feed_id), None, is_read) {
+                    self.status_message = Some((format!("Failed to update stories: {}", e), true));
+                }
+                self.reload_data();
+                Task::none()
+            }
+            Message::SetFolderRead(folder_id, is_read) => {
+                self.folder_menu = None;
+                if let Err(e) = self.db.set_articles_read_state(None, Some(folder_id), is_read) {
+                    self.status_message = Some((format!("Failed to update stories: {}", e), true));
+                }
+                self.reload_data();
+                Task::none()
+            }
+            Message::RefreshFeed(feed_id) => {
+                self.feed_menu = None;
+                let name = self
+                    .feeds
+                    .iter()
+                    .find(|f| f.id == feed_id)
+                    .map(|f| format!("'{}'", f.title))
+                    .unwrap_or_else(|| "feed".to_string());
+                self.refresh_feeds(name, vec![feed_id])
+            }
+            Message::RefreshFolder(folder_id) => {
+                self.folder_menu = None;
+                let name = self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == folder_id)
+                    .map(|f| format!("'{}'", f.name))
+                    .unwrap_or_else(|| "folder".to_string());
+                let feed_ids = self.feed_ids_in(Some(folder_id));
+                self.refresh_feeds(name, feed_ids)
+            }
+            Message::PartialRefreshFinished(name, result) => {
+                self.is_syncing = false;
+                self.reload_data();
+                self.status_message = Some(match result {
+                    Ok(summaries) => {
+                        let inserted: usize = summaries.iter().map(|s| s.articles_inserted).sum();
+                        let failed: Vec<&str> = summaries
+                            .iter()
+                            .filter(|s| s.error.is_some())
+                            .map(|s| s.feed_title.as_str())
+                            .collect();
+                        let new_stories = match inserted {
+                            0 => "no new stories".to_string(),
+                            1 => "1 new story".to_string(),
+                            n => format!("{} new stories", n),
+                        };
+                        match (failed.len(), summaries.len()) {
+                            (0, _) => (format!("Refreshed {}: {}", name, new_stories), false),
+                            // A single feed: say why it failed
+                            (_, 1) => (
+                                format!(
+                                    "Couldn't refresh {}: {}",
+                                    name,
+                                    summaries[0].error.as_deref().unwrap_or("unknown error")
+                                ),
+                                true,
+                            ),
+                            (n, _) => (
+                                format!(
+                                    "Refreshed {}: {}. {} feed{} failed: {}",
+                                    name,
+                                    new_stories,
+                                    n,
+                                    if n == 1 { "" } else { "s" },
+                                    failed.join(", ")
+                                ),
+                                true,
+                            ),
+                        }
+                    }
+                    Err(e) => (format!("Couldn't refresh {}: {}", name, e), true),
+                });
                 Task::none()
             }
             Message::MarkAllRead => {
@@ -992,6 +1130,38 @@ impl RssApp {
                 Ok((feed_id, url))
             },
             Message::FeedAdded,
+        )
+    }
+
+    /// Fetches the given feeds in the background; reports with
+    /// `PartialRefreshFinished`. Shares the "syncing" state with Refresh All,
+    /// so the two never run at once.
+    fn refresh_feeds(&mut self, name: String, feed_ids: Vec<i64>) -> Task<Message> {
+        if self.is_syncing {
+            self.status_message =
+                Some(("A refresh is already running. Try again when it finishes.".to_string(), true));
+            return Task::none();
+        }
+        if feed_ids.is_empty() {
+            return Task::none();
+        }
+        self.is_syncing = true;
+        let db = self.db.clone();
+        let fetcher = self.fetcher.clone();
+        Task::perform(
+            async move {
+                let mut summaries = Vec::with_capacity(feed_ids.len());
+                for feed_id in feed_ids {
+                    summaries.push(
+                        fetcher
+                            .fetch_and_sync(&db, feed_id)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                Ok(summaries)
+            },
+            move |result| Message::PartialRefreshFinished(name.clone(), result),
         )
     }
 
@@ -1442,6 +1612,20 @@ impl RssApp {
             .into()
         } else {
             column![
+                menu_item(
+                    "Refresh".to_string(),
+                    (!self.is_syncing).then_some(Message::RefreshFeed(feed.id)),
+                ),
+                menu_item(
+                    "Mark as read".to_string(),
+                    (feed.unread_count > 0).then_some(Message::SetFeedRead(feed.id, true)),
+                ),
+                menu_item(
+                    "Mark as unread".to_string(),
+                    (feed.unread_count < feed.total_count)
+                        .then_some(Message::SetFeedRead(feed.id, false)),
+                ),
+                horizontal_rule(1),
                 menu_item("Rename".to_string(), Some(Message::StartRenameFeed(feed.id))),
                 menu_item("Edit feed…".to_string(), Some(Message::OpenEditFeed(feed.id))),
                 menu_item("Move to…".to_string(), Some(Message::ShowMoveToMenu(feed.id))),
@@ -1496,17 +1680,33 @@ impl RssApp {
             return menu_card(body, 260.0);
         }
 
-        let menu_item = |label: &'static str, message: Message| {
+        // A `None` message shows the item disabled
+        let menu_item = |label: &'static str, message: Option<Message>| {
             button(text(label).size(13))
                 .width(Length::Fill)
                 .padding([5, 10])
                 .style(button::text)
-                .on_press(message)
+                .on_press_maybe(message)
         };
         let body = column![
-            menu_item("Rename", Message::StartRenameFolder(folder.id)),
+            menu_item(
+                "Refresh",
+                (!self.is_syncing && folder.feed_count > 0)
+                    .then_some(Message::RefreshFolder(folder.id)),
+            ),
+            menu_item(
+                "Mark as read",
+                (folder.unread_count > 0).then_some(Message::SetFolderRead(folder.id, true)),
+            ),
+            menu_item(
+                "Mark as unread",
+                (folder.unread_count < folder.total_count)
+                    .then_some(Message::SetFolderRead(folder.id, false)),
+            ),
             horizontal_rule(1),
-            menu_item("Delete…", Message::AskDeleteFolder(folder.id)),
+            menu_item("Rename", Some(Message::StartRenameFolder(folder.id))),
+            horizontal_rule(1),
+            menu_item("Delete…", Some(Message::AskDeleteFolder(folder.id))),
         ]
         .spacing(2);
         menu_card(body, 160.0)
@@ -1520,9 +1720,9 @@ impl RssApp {
         let content = row![
             sidebar,
             vertical_rule(1),
-            article_list,
-            vertical_rule(1),
-            reader_view,
+            split(article_list, reader_view, self.article_list_width, Message::ArticleListResized)
+                .min_widths(ARTICLE_LIST_MIN_WIDTH, READER_MIN_WIDTH)
+                .on_resize_end(Message::ArticleListResizeEnded),
         ]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1620,12 +1820,15 @@ impl RssApp {
         .spacing(2);
 
         // Refresh Button
-        let refresh_label = if self.is_syncing {
-            "Syncing Feeds..."
+        let refresh_label: Element<'_, Message> = if self.is_syncing {
+            text("Syncing Feeds...").size(13).into()
         } else {
-            "⟳ Refresh All Feeds"
+            row![icon(Icon::Refresh, 13.0, Tint::OnPrimary), text("Refresh All Feeds").size(13)]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
         };
-        let refresh_btn = button(text(refresh_label).size(13))
+        let refresh_btn = button(refresh_label)
             .width(Length::Fill)
             .padding([6, 10])
             .on_press(Message::RefreshClicked);
@@ -1635,12 +1838,14 @@ impl RssApp {
 
         let all_btn = self.filter_button(
             ActiveFilter::All,
+            None,
             "All Stories",
             &total_articles.to_string(),
         );
 
         let unread_btn = self.filter_button(
             ActiveFilter::Unread,
+            None,
             "Unread",
             &unread_articles.to_string(),
         );
@@ -1652,7 +1857,8 @@ impl RssApp {
             .count();
         let starred_btn = self.filter_button(
             ActiveFilter::Starred,
-            "★ Starred",
+            Some(Icon::StarFilled),
+            "Starred",
             &starred_count.to_string(),
         );
 
@@ -1751,7 +1957,17 @@ impl RssApp {
                 } else {
                     button(
                     row![
-                        text(format!("📁 {}", folder.name)).size(13).width(Length::Fill),
+                        row![
+                            icon(
+                                Icon::Folder,
+                                13.0,
+                                if is_folder_active { Tint::OnPrimary } else { Tint::Text },
+                            ),
+                            text(&folder.name).size(13),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
                         if !unread_badge.is_empty() {
                             text(unread_badge).size(11).style(text::primary)
                         } else {
@@ -1918,6 +2134,7 @@ impl RssApp {
     fn filter_button(
         &self,
         target_filter: ActiveFilter,
+        leading_icon: Option<Icon>,
         label: &str,
         badge: &str,
     ) -> Element<'_, Message> {
@@ -1925,9 +2142,19 @@ impl RssApp {
         let label_owned = label.to_string();
         let badge_owned = badge.to_string();
 
+        let mut label_row = row![].spacing(6).align_y(Alignment::Center).width(Length::Fill);
+        if let Some(leading_icon) = leading_icon {
+            label_row = label_row.push(icon(
+                leading_icon,
+                13.0,
+                if is_selected { Tint::OnPrimary } else { Tint::Text },
+            ));
+        }
+        label_row = label_row.push(text(label_owned).size(13));
+
         button(
             row![
-                text(label_owned).size(13).width(Length::Fill),
+                label_row,
                 if !badge.is_empty() {
                     text(badge_owned).size(12).style(text::secondary)
                 } else {
@@ -1965,7 +2192,7 @@ impl RssApp {
                     .find(|f| f.id == foid)
                     .map(|f| f.name.as_str())
                     .unwrap_or("Folder");
-                format!("📁 {} ({})", name, self.articles.len())
+                format!("{} ({})", name, self.articles.len())
             }
             ActiveFilter::Feed(fid) => {
                 let name = self
@@ -1978,8 +2205,14 @@ impl RssApp {
             }
         };
 
+        let mut header_label = row![].spacing(6).align_y(Alignment::Center).width(Length::Fill);
+        if matches!(self.active_filter, ActiveFilter::Folder(_)) {
+            header_label = header_label.push(icon(Icon::Folder, 14.0, Tint::Text));
+        }
+        header_label = header_label.push(text(list_header_label).size(14));
+
         let header_row = row![
-            text(list_header_label).size(14).width(Length::Fill),
+            header_label,
             button(text("Mark All Read").size(12))
                 .padding([4, 8])
                 .style(button::secondary)
@@ -1994,7 +2227,7 @@ impl RssApp {
             let empty_msg = if !self.search_query.is_empty() {
                 "No stories match your search query."
             } else if self.feeds.is_empty() {
-                "No feeds added yet. Paste a feed URL on the left to start archiving!"
+                "No feeds added yet. Click + Feed on the left to start archiving!"
             } else {
                 "No stories found in this view."
             };
@@ -2007,7 +2240,6 @@ impl RssApp {
         } else {
             for article in self.articles.iter().take(self.article_render_limit) {
                 let is_selected = self.selected_article_id == Some(article.id);
-                let star_symbol = if article.is_starred { "★" } else { "☆" };
 
                 let feed_name = article.feed_title.as_deref().unwrap_or("RSS");
                 let date_str = article
@@ -2015,7 +2247,11 @@ impl RssApp {
                     .map(format_date)
                     .unwrap_or_else(|| "Unknown date".to_string());
 
-                let star_btn = button(text(star_symbol).size(14))
+                let star_btn = button(if article.is_starred {
+                    icon(Icon::StarFilled, 14.0, Tint::Gold)
+                } else {
+                    icon(Icon::Star, 14.0, Tint::Secondary)
+                })
                     .padding([2, 6])
                     .style(button::text)
                     .on_press(Message::ToggleStar(article.id));
@@ -2071,14 +2307,14 @@ impl RssApp {
             }
         }
 
-        let scroll_list = scrollable(article_items).height(Length::Fill);
+        let scroll_list = scrollable(article_items).width(Length::Fill).height(Length::Fill);
 
         container(
             column![search_box, header_row, horizontal_rule(1), scroll_list]
                 .spacing(8)
                 .padding(10),
         )
-        .width(Length::Fixed(360.0))
+        .width(Length::Fill)
         .height(Length::Fill)
         .into()
     }
@@ -2096,9 +2332,13 @@ impl RssApp {
                         .size(13)
                         .style(text::secondary),
                     Space::with_height(10),
-                    text("🔒 Archival Guarantee: Every story fetched is stored in SQLite and will remain accessible even if the source feed removes it.")
-                        .size(12)
-                        .style(text::secondary),
+                    row![
+                        icon(Icon::Lock, 12.0, Tint::Secondary),
+                        text("Archival Guarantee: Every story fetched is stored in SQLite and will remain accessible even if the source feed removes it.")
+                            .size(12)
+                            .style(text::secondary),
+                    ]
+                    .spacing(6),
                 ]
                 .spacing(6)
                 .align_x(Alignment::Center),
@@ -2111,6 +2351,11 @@ impl RssApp {
 
             Some(art) => {
                 // Header details
+                // Before fields are moved out of `art` below
+                let body_str = match &self.reader_body {
+                    Some((id, body)) if *id == art.id => body.clone(),
+                    _ => reader_text(&art),
+                };
                 let title = text(art.title).size(22);
 
                 let feed = self.feeds.iter().find(|f| f.id == art.feed_id);
@@ -2132,7 +2377,14 @@ impl RssApp {
 
                 if let Some(ref fld) = folder_name {
                     meta_items = meta_items.push(text("•").size(12).style(text::secondary));
-                    meta_items = meta_items.push(text(format!("📁 {}", fld)).size(12).style(text::secondary));
+                    meta_items = meta_items.push(
+                        row![
+                            icon(Icon::Folder, 12.0, Tint::Secondary),
+                            text(fld.clone()).size(12).style(text::secondary),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                    );
                 }
 
                 meta_items = meta_items.push(text("•").size(12).style(text::secondary));
@@ -2149,7 +2401,18 @@ impl RssApp {
                         .padding([4, 10])
                         .style(button::secondary)
                         .on_press(Message::ToggleRead(art.id)),
-                    button(text(if art.is_starred { "★ Starred" } else { "☆ Star" }).size(12))
+                    button(
+                        row![
+                            if art.is_starred {
+                                icon(Icon::StarFilled, 12.0, Tint::Gold)
+                            } else {
+                                icon(Icon::Star, 12.0, Tint::OnSecondary)
+                            },
+                            text(if art.is_starred { "Starred" } else { "Star" }).size(12),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    )
                         .padding([4, 10])
                         .style(button::secondary)
                         .on_press(Message::ToggleStar(art.id)),
@@ -2157,7 +2420,14 @@ impl RssApp {
                 .spacing(8);
 
                 if let Some(url) = art.url {
-                    let open_btn = button(text("↗ Open in Browser").size(12))
+                    let open_btn = button(
+                        row![
+                            icon(Icon::ExternalLink, 12.0, Tint::OnPrimary),
+                            text("Open in Browser").size(12),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
+                    )
                         .padding([4, 10])
                         .style(button::primary)
                         .on_press(Message::OpenUrl(url));
@@ -2165,17 +2435,21 @@ impl RssApp {
                 }
 
                 // Body text (clean text extracted from HTML)
-                let body_str = art
-                    .content_text
-                    .or(art.summary)
-                    .unwrap_or_else(|| "No content available for this story.".to_string());
 
-                let body = text(body_str).size(14);
+                let body = text(body_str).size(14).width(Length::Fill);
 
-                let body_scroll = scrollable(
-                    column![body].spacing(10).padding([10, 15]),
-                )
-                .height(Length::Fill);
+                // Fill the reader's width: a shrink-sized scrollable is only as wide
+                // as its text, which leaves the scrollbar mid-window for short stories
+                // The scrollable spans the reader (scrollbar at the window edge); the
+                // text inside it is a centered column
+                let body_scroll = scrollable(reading_column(
+                    column![body].spacing(10).padding([10, 0]),
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new().width(10).scroller_width(10).spacing(4),
+                ));
 
                 // Footer with permanent archival info
                 let footer = column![
@@ -2194,12 +2468,13 @@ impl RssApp {
 
                 container(
                     column![
-                        title,
-                        meta_items,
-                        action_row,
-                        horizontal_rule(1),
+                        gutter(reading_column(
+                            // Wrap so a narrow reader moves items to a new line instead of squeezing them
+                            column![title, meta_items.wrap(), action_row.wrap(), horizontal_rule(1)]
+                                .spacing(12),
+                        )),
                         body_scroll,
-                        footer,
+                        gutter(reading_column(footer)),
                     ]
                     .spacing(12)
                     .padding(20),
@@ -2386,4 +2661,40 @@ fn normalize_feed_url(input: &str) -> Option<String> {
         return None;
     }
     Some(candidate)
+}
+
+/// Centers `content` in a column at most `READER_TEXT_MAX_WIDTH` wide, so the
+/// story doesn't hug the left edge of a wide reader pane.
+fn reading_column<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(container(content).width(Length::Fill).max_width(READER_TEXT_MAX_WIDTH))
+        .center_x(Length::Fill)
+        .into()
+}
+
+
+/// The story as plain text for the reader.
+///
+/// The stored `content_text` is hard-wrapped at 80 columns (it's made for
+/// search), which leaves a ragged block narrower than the reading column and
+/// the headline. Converting the HTML again without a wrap width keeps each
+/// paragraph on one line, so the reader wraps it to the column's width.
+fn reader_text(article: &Article) -> String {
+    // Wide enough that html2text never wraps a paragraph itself
+    const NO_WRAP: usize = 100_000;
+    article
+        .content_html
+        .as_deref()
+        .or(article.summary.as_deref())
+        .and_then(|html| html2text::from_read(html.as_bytes(), NO_WRAP).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .or_else(|| article.content_text.clone())
+        .unwrap_or_else(|| "No content available for this story.".to_string())
+}
+
+/// Leaves room on the right matching the story's scrollbar (see `READER_SCROLLBAR_GUTTER`).
+fn gutter<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(iced::Padding::ZERO.right(READER_SCROLLBAR_GUTTER))
+        .into()
 }
