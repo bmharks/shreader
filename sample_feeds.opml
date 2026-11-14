@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head>
+    <title>Sample Subscriptions</title>
+  </head>
+  <body>
+    <outline text="Rust Blog" title="Rust Blog" type="rss" xmlUrl="https://blog.rust-lang.org/feed.xml" htmlUrl="https://blog.rust-lang.org" />
+    <outline text="LWN.net" title="LWN.net" type="rss" xmlUrl="https://lwn.net/headlines/rss" htmlUrl="https://lwn.net" />
+    <outline text="Phoronix" title="Phoronix" type="rss" xmlUrl="https://www.phoronix.com/rss.php" htmlUrl="https://www.phoronix.com" />
+  </body>
+</opml>
