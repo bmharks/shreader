@@ -13,6 +13,7 @@ use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
 use crate::story_content::{self, Block};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
+use crate::lazy_load::on_visible;
 use crate::icons::{icon, Icon, Tint};
 use crate::spinner::spinner;
 use crate::split::split;
@@ -32,6 +33,10 @@ const ARTICLE_PAGE_SIZE: usize = 150;
 
 /// How long a status message (toast) stays up before dismissing itself
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Story images start downloading once they're within this distance of the
+/// visible part of the reader (about a screen ahead)
+const IMAGE_PRELOAD_MARGIN: f32 = 1000.0;
 
 /// Story list column width: default, limits, and where it's saved
 const ARTICLE_LIST_DEFAULT_WIDTH: f32 = 360.0;
@@ -223,6 +228,8 @@ pub enum Message {
     CloseReaderTextMenu,
     CopyReaderSelection(usize),
     SelectAllReaderText(usize),
+    /// A story image scrolled near the visible area: download it
+    LoadStoryImage(String),
     /// An image in the open story finished downloading (or failed)
     StoryImageLoaded(String, Result<StoryImage, String>),
 
@@ -478,16 +485,16 @@ impl RssApp {
             }
             Message::SelectArticle(article_id) => {
                 self.selected_article_id = Some(article_id);
-                // Mark as read when selected
-                let _ = self.db.set_article_read(article_id, true);
-                self.reload_data();
+                self.mark_opened_story_read(article_id);
+                // The list holds no story bodies; load just this one
                 let blocks = self
-                    .articles
-                    .iter()
-                    .find(|a| a.id == article_id)
-                    .map(reader_blocks)
+                    .db
+                    .get_article(article_id)
+                    .ok()
+                    .flatten()
+                    .map(|article| reader_blocks(&article))
                     .unwrap_or_default();
-                let task = self.load_story_images(&blocks);
+                self.prune_story_images(&blocks);
                 self.reader_texts = blocks
                     .iter()
                     .filter_map(|block| match block {
@@ -497,7 +504,21 @@ impl RssApp {
                     .collect();
                 self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
-                task
+                Task::none()
+            }
+            Message::LoadStoryImage(url) => {
+                if self.story_images.contains_key(&url) {
+                    return Task::none(); // already requested
+                }
+                self.story_images.insert(url.clone(), ImageState::Loading);
+                let fetcher = self.fetcher.clone();
+                Task::perform(
+                    {
+                        let url = url.clone();
+                        async move { fetcher.fetch_image(&url).await }
+                    },
+                    move |result| Message::StoryImageLoaded(url.clone(), result),
+                )
             }
             Message::ReaderTextAction(index, action) => {
                 // Read-only: allow selecting, moving, clicking, but never editing
@@ -537,9 +558,9 @@ impl RssApp {
                 // Ignore downloads for a story that's no longer open
                 if let Some(state) = self.story_images.get_mut(&url) {
                     *state = match result {
-                        Ok(StoryImage::Raster(bytes)) => {
-                            ImageState::Raster(iced::widget::image::Handle::from_bytes(bytes))
-                        }
+                        Ok(StoryImage::Raster { width, height, pixels }) => ImageState::Raster(
+                            iced::widget::image::Handle::from_rgba(width, height, pixels),
+                        ),
                         Ok(StoryImage::Svg(bytes)) => {
                             ImageState::Svg(iced::widget::svg::Handle::from_memory(bytes))
                         }
@@ -1316,9 +1337,39 @@ impl RssApp {
         )
     }
 
-    /// Starts downloading the images in `blocks` that aren't loaded yet, and
-    /// forgets images from the previously open story.
-    fn load_story_images(&mut self, blocks: &[Block]) -> Task<Message> {
+    /// Marks a story read when it's opened. Updates the counts in memory
+    /// instead of reloading everything from the database, which took ~100 ms
+    /// per click with a few thousand stories.
+    fn mark_opened_story_read(&mut self, article_id: i64) {
+        let Some(article) = self.articles.iter_mut().find(|a| a.id == article_id) else {
+            return;
+        };
+        if article.is_read {
+            return;
+        }
+        if let Err(e) = self.db.set_article_read(article_id, true) {
+            self.status_message = Some((format!("Failed to mark story read: {}", e), true));
+            return;
+        }
+        article.is_read = true;
+        let feed_id = article.feed_id;
+
+        self.stats.2 = (self.stats.2 - 1).max(0);
+        if let Some(feed) = self.feeds.iter_mut().find(|f| f.id == feed_id) {
+            feed.unread_count = (feed.unread_count - 1).max(0);
+            if let Some(folder_id) = feed.folder_id {
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) {
+                    folder.unread_count = (folder.unread_count - 1).max(0);
+                }
+            }
+        }
+    }
+
+    /// Forgets images that aren't in `blocks` (the newly opened story), and
+    /// failed ones so they're retried. Downloads start as images scroll into
+    /// view (`LoadStoryImage`), not all at once: a story can have 100+ large
+    /// images, ~1.5 GB once decoded.
+    fn prune_story_images(&mut self, blocks: &[Block]) {
         let urls: HashSet<&str> = blocks
             .iter()
             .filter_map(|block| match block {
@@ -1329,24 +1380,6 @@ impl RssApp {
         // Keep what this story still uses (e.g. reopening the same story); retry failures
         self.story_images
             .retain(|url, state| urls.contains(url.as_str()) && !matches!(state, ImageState::Failed));
-
-        let mut tasks = Vec::new();
-        for url in urls {
-            if self.story_images.contains_key(url) {
-                continue;
-            }
-            self.story_images.insert(url.to_string(), ImageState::Loading);
-            let fetcher = self.fetcher.clone();
-            let url = url.to_string();
-            tasks.push(Task::perform(
-                {
-                    let url = url.clone();
-                    async move { fetcher.fetch_image(&url).await }
-                },
-                move |result| Message::StoryImageLoaded(url.clone(), result),
-            ));
-        }
-        Task::batch(tasks)
     }
 
     /// The story body: text paragraphs with the story's images in between.
@@ -1441,9 +1474,16 @@ impl RssApp {
             .on_press(open)
             .interaction(mouse::Interaction::Pointer)
             .into(),
-            Some(ImageState::Loading) | None => {
+            Some(ImageState::Loading) => {
                 text("Loading image…").size(11).style(text::secondary).into()
             }
+            // Not requested yet: ask for it once it's near the visible area
+            None => on_visible(
+                text("Loading image…").size(11).style(text::secondary),
+                Message::LoadStoryImage(src.to_string()),
+                IMAGE_PRELOAD_MARGIN,
+            )
+            .into(),
             Some(ImageState::Failed) => button(
                 text("Image couldn't be loaded. Open it in the browser").size(11),
             )
@@ -2655,7 +2695,8 @@ impl RssApp {
                 // Before fields are moved out of `art` below
                 let body = match &self.reader_body {
                     Some((id, blocks)) if *id == art.id => self.story_body(blocks, true),
-                    _ => self.story_body(&reader_blocks(&art), false),
+                    // Not prepared yet (bodies are loaded when a story is opened)
+                    _ => Space::with_height(0).into(),
                 };
                 let title = text(art.title).size(22);
 

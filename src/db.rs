@@ -578,6 +578,11 @@ impl Database {
         }
     }
 
+    /// Stories matching `filter`, newest first, for the story list.
+    ///
+    /// Bodies (`summary`, `content_html`, `content_text`) are left out (`None`):
+    /// they add up to tens of MB over a few thousand stories and the list never
+    /// shows them. Use `get_article` for one complete story.
     pub fn get_articles(&self, filter: &ArticleFilter) -> Result<Vec<Article>> {
         let conn = self.conn.lock().unwrap();
 
@@ -585,7 +590,7 @@ impl Database {
             r#"
             SELECT 
                 a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
-                a.title, a.url, a.author, a.summary, a.content_html, a.content_text,
+                a.title, a.url, a.author, NULL, NULL, NULL,
                 a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
             FROM articles a
             JOIN feeds f ON f.id = a.feed_id

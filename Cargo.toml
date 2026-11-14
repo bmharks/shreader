@@ -35,3 +35,12 @@ tracing-subscriber = "0.3"
 
 # GUI
 iced = { version = "0.13", features = ["tokio", "svg", "image", "advanced"] }
+# Same version iced uses; story images are decoded in the background with it
+image = "0.24"
+
+# Optimise dependencies even in debug builds. Image decoding, HTML conversion,
+# text layout and SQLite are 10-50x slower unoptimised, which made the UI
+# freeze on image-heavy stories. Our own crate stays at opt-level 0, so
+# rebuilding after an edit is still fast.
+[profile.dev.package."*"]
+opt-level = 3

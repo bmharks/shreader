@@ -9,12 +9,44 @@ use url::Url;
 use crate::db::Database;
 use crate::models::{FeedSyncSummary, IngestionResult};
 
-/// A downloaded story image, by how it has to be drawn.
-#[derive(Debug, Clone)]
+/// A downloaded story image, ready to draw.
+#[derive(Clone)]
 pub enum StoryImage {
-    /// PNG, JPEG, GIF, WebP, …
-    Raster(Vec<u8>),
+    /// Decoded RGBA pixels. Decoding happens on a background thread: iced
+    /// would otherwise decode on the UI thread during layout, for every image
+    /// in the story at once, freezing the window on image-heavy stories.
+    Raster { width: u32, height: u32, pixels: Vec<u8> },
     Svg(Vec<u8>),
+}
+
+// Hand-written so a message holding megabytes of pixels isn't dumped in full
+impl std::fmt::Debug for StoryImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoryImage::Raster { width, height, .. } => write!(f, "Raster({}x{})", width, height),
+            StoryImage::Svg(bytes) => write!(f, "Svg({} bytes)", bytes.len()),
+        }
+    }
+}
+
+/// Largest size a story image is kept at. The reading column is at most 760
+/// logical pixels wide, so this stays sharp on 2x displays while capping
+/// memory (a 6000x4000 photo would otherwise take ~96 MB as RGBA).
+const MAX_IMAGE_WIDTH: u32 = 1600;
+const MAX_IMAGE_HEIGHT: u32 = 4800;
+
+/// Decodes (and if needed shrinks) an image. CPU-heavy: run it off the UI thread.
+fn decode_image(bytes: &[u8]) -> Result<StoryImage, String> {
+    let mut image = image::load_from_memory(bytes).map_err(|e| format!("can't decode: {}", e))?;
+    if image.width() > MAX_IMAGE_WIDTH || image.height() > MAX_IMAGE_HEIGHT {
+        image = image.resize(MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT, image::imageops::FilterType::Triangle);
+    }
+    let rgba = image.into_rgba8();
+    Ok(StoryImage::Raster {
+        width: rgba.width(),
+        height: rgba.height(),
+        pixels: rgba.into_raw(),
+    })
 }
 
 /// What `FeedFetcher::preview` found at a URL.
@@ -282,11 +314,12 @@ impl FeedFetcher {
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
             return Err("image too large".to_string());
         }
-        Ok(if is_svg {
-            StoryImage::Svg(bytes.to_vec())
-        } else {
-            StoryImage::Raster(bytes.to_vec())
-        })
+        if is_svg {
+            return Ok(StoryImage::Svg(bytes.to_vec()));
+        }
+        tokio::task::spawn_blocking(move || decode_image(&bytes))
+            .await
+            .map_err(|e| format!("decoding failed: {}", e))?
     }
 
     /// Fetches all feeds currently in the database concurrently

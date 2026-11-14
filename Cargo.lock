@@ -3655,6 +3655,7 @@ dependencies = [
  "hex",
  "html2text",
  "iced",
+ "image",
  "quick-xml 0.31.0",
  "reqwest",
  "rusqlite",
