@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use iced::mouse;
@@ -9,7 +9,8 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Subscription, Task, Theme, Vector};
 
 use crate::db::Database;
-use crate::feed::{FeedFetcher, FeedPreview};
+use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
+use crate::story_content::{self, Block};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
 use crate::icons::{icon, Icon, Tint};
@@ -62,8 +63,11 @@ pub struct RssApp {
     expanded_folders: HashSet<i64>,
     active_filter: ActiveFilter,
     selected_article_id: Option<i64>,
-    /// Reader text for the selected story, converted once when it's opened
-    reader_body: Option<(i64, String)>,
+    /// The selected story split into text and images, converted once when
+    /// it's opened (too slow to redo on every view rebuild)
+    reader_body: Option<(i64, Vec<Block>)>,
+    /// Images of the open story, by URL
+    story_images: HashMap<String, ImageState>,
     search_query: String,
     new_folder_input: String,
     show_new_folder_input: bool,
@@ -135,6 +139,15 @@ struct EditFeedDialog {
     error: Option<String>,
 }
 
+/// Download state of an image in the open story.
+#[derive(Debug, Clone)]
+enum ImageState {
+    Loading,
+    Raster(iced::widget::image::Handle),
+    Svg(iced::widget::svg::Handle),
+    Failed,
+}
+
 /// State of the "Add feed" dialog.
 #[derive(Debug, Clone)]
 struct AddFeedDialog {
@@ -198,6 +211,9 @@ pub enum Message {
     /// The auto-dismiss timer for status message number `.0` ran out
     StatusTimedOut(u64),
     ShowMoreArticles,
+
+    /// An image in the open story finished downloading (or failed)
+    StoryImageLoaded(String, Result<StoryImage, String>),
 
     // Divider between the story list and the reader
     ArticleListResized(f32),
@@ -295,6 +311,7 @@ impl RssApp {
             active_filter: ActiveFilter::All,
             selected_article_id: None,
             reader_body: None,
+            story_images: HashMap::new(),
             search_query: String::new(),
             new_folder_input: String::new(),
             show_new_folder_input: false,
@@ -451,12 +468,32 @@ impl RssApp {
                 // Mark as read when selected
                 let _ = self.db.set_article_read(article_id, true);
                 self.reload_data();
-                // Converting HTML is too slow to redo on every view rebuild
-                self.reader_body = self
+                let blocks = self
                     .articles
                     .iter()
                     .find(|a| a.id == article_id)
-                    .map(|a| (article_id, reader_text(a)));
+                    .map(reader_blocks)
+                    .unwrap_or_default();
+                let task = self.load_story_images(&blocks);
+                self.reader_body = Some((article_id, blocks));
+                task
+            }
+            Message::StoryImageLoaded(url, result) => {
+                // Ignore downloads for a story that's no longer open
+                if let Some(state) = self.story_images.get_mut(&url) {
+                    *state = match result {
+                        Ok(StoryImage::Raster(bytes)) => {
+                            ImageState::Raster(iced::widget::image::Handle::from_bytes(bytes))
+                        }
+                        Ok(StoryImage::Svg(bytes)) => {
+                            ImageState::Svg(iced::widget::svg::Handle::from_memory(bytes))
+                        }
+                        Err(e) => {
+                            tracing::debug!("Story image {} failed: {}", url, e);
+                            ImageState::Failed
+                        }
+                    };
+                }
                 Task::none()
             }
             Message::FeedAdded(result) => {
@@ -1219,6 +1256,85 @@ impl RssApp {
             },
             move |result| Message::PartialRefreshFinished(name.clone(), result),
         )
+    }
+
+    /// Starts downloading the images in `blocks` that aren't loaded yet, and
+    /// forgets images from the previously open story.
+    fn load_story_images(&mut self, blocks: &[Block]) -> Task<Message> {
+        let urls: HashSet<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Image { src } => Some(src.as_str()),
+                Block::Text(_) => None,
+            })
+            .collect();
+        // Keep what this story still uses (e.g. reopening the same story); retry failures
+        self.story_images
+            .retain(|url, state| urls.contains(url.as_str()) && !matches!(state, ImageState::Failed));
+
+        let mut tasks = Vec::new();
+        for url in urls {
+            if self.story_images.contains_key(url) {
+                continue;
+            }
+            self.story_images.insert(url.to_string(), ImageState::Loading);
+            let fetcher = self.fetcher.clone();
+            let url = url.to_string();
+            tasks.push(Task::perform(
+                {
+                    let url = url.clone();
+                    async move { fetcher.fetch_image(&url).await }
+                },
+                move |result| Message::StoryImageLoaded(url.clone(), result),
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The story body: text paragraphs with the story's images in between.
+    fn story_body<'a>(&'a self, blocks: &[Block]) -> Element<'a, Message> {
+        let mut body = column![].spacing(14).width(Length::Fill);
+        for block in blocks {
+            body = body.push(match block {
+                Block::Text(text_block) => {
+                    Element::from(text(text_block.clone()).size(14).width(Length::Fill))
+                }
+                Block::Image { src } => self.story_image(src),
+            });
+        }
+        body.into()
+    }
+
+    /// One story image, centered. Clicking it opens the full image in the browser.
+    fn story_image<'a>(&'a self, src: &str) -> Element<'a, Message> {
+        let open = Message::OpenUrl(src.to_string());
+        let content: Element<'a, Message> = match self.story_images.get(src) {
+            // Shrink-sized: small images stay at their own size, large ones are
+            // scaled down to the column width (keeping their proportions)
+            Some(ImageState::Raster(handle)) => mouse_area(iced::widget::image(handle.clone()))
+                .on_press(open)
+                .interaction(mouse::Interaction::Pointer)
+                .into(),
+            Some(ImageState::Svg(handle)) => mouse_area(
+                iced::widget::svg(handle.clone())
+                    .width(Length::Shrink)
+                    .height(Length::Shrink),
+            )
+            .on_press(open)
+            .interaction(mouse::Interaction::Pointer)
+            .into(),
+            Some(ImageState::Loading) | None => {
+                text("Loading image…").size(11).style(text::secondary).into()
+            }
+            Some(ImageState::Failed) => button(
+                text("Image couldn't be loaded. Open it in the browser").size(11),
+            )
+            .padding([2, 6])
+            .style(button::text)
+            .on_press(open)
+            .into(),
+        };
+        container(content).center_x(Length::Fill).into()
     }
 
     /// The folder a new feed goes into: the selected folder, or the folder of
@@ -2419,9 +2535,9 @@ impl RssApp {
             Some(art) => {
                 // Header details
                 // Before fields are moved out of `art` below
-                let body_str = match &self.reader_body {
-                    Some((id, body)) if *id == art.id => body.clone(),
-                    _ => reader_text(&art),
+                let body = match &self.reader_body {
+                    Some((id, blocks)) if *id == art.id => self.story_body(blocks),
+                    _ => self.story_body(&reader_blocks(&art)),
                 };
                 let title = text(art.title).size(22);
 
@@ -2500,10 +2616,6 @@ impl RssApp {
                         .on_press(Message::OpenUrl(url));
                     action_row = action_row.push(open_btn);
                 }
-
-                // Body text (clean text extracted from HTML)
-
-                let body = text(body_str).size(14).width(Length::Fill);
 
                 // Fill the reader's width: a shrink-sized scrollable is only as wide
                 // as its text, which leaves the scrollbar mid-window for short stories
@@ -2739,24 +2851,26 @@ fn reading_column<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, M
 }
 
 
-/// The story as plain text for the reader.
+/// The story as text and image blocks for the reader.
 ///
-/// The stored `content_text` is hard-wrapped at 80 columns (it's made for
-/// search), which leaves a ragged block narrower than the reading column and
-/// the headline. Converting the HTML again without a wrap width keeps each
-/// paragraph on one line, so the reader wraps it to the column's width.
-fn reader_text(article: &Article) -> String {
-    // Wide enough that html2text never wraps a paragraph itself
-    const NO_WRAP: usize = 100_000;
-    article
+/// Built from the HTML rather than the stored `content_text`: that one is
+/// hard-wrapped at 80 columns (it's made for search) and has no images.
+fn reader_blocks(article: &Article) -> Vec<Block> {
+    let blocks = article
         .content_html
         .as_deref()
         .or(article.summary.as_deref())
-        .and_then(|html| html2text::from_read(html.as_bytes(), NO_WRAP).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .or_else(|| article.content_text.clone())
-        .unwrap_or_else(|| "No content available for this story.".to_string())
+        .map(|html| story_content::blocks(html, article.url.as_deref()))
+        .unwrap_or_default();
+    if !blocks.is_empty() {
+        return blocks;
+    }
+    vec![Block::Text(
+        article
+            .content_text
+            .clone()
+            .unwrap_or_else(|| "No content available for this story.".to_string()),
+    )]
 }
 
 /// Leaves room on the right matching the story's scrollbar (see `READER_SCROLLBAR_GUTTER`).

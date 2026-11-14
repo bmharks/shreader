@@ -9,6 +9,14 @@ use url::Url;
 use crate::db::Database;
 use crate::models::{FeedSyncSummary, IngestionResult};
 
+/// A downloaded story image, by how it has to be drawn.
+#[derive(Debug, Clone)]
+pub enum StoryImage {
+    /// PNG, JPEG, GIF, WebP, …
+    Raster(Vec<u8>),
+    Svg(Vec<u8>),
+}
+
 /// What `FeedFetcher::preview` found at a URL.
 #[derive(Debug, Clone)]
 pub struct FeedPreview {
@@ -234,6 +242,50 @@ impl FeedFetcher {
         Ok(FeedPreview {
             title,
             story_count: parsed.entries.len(),
+        })
+    }
+
+    /// Downloads an image from a story. Refuses web pages and anything over
+    /// `MAX_IMAGE_BYTES`.
+    pub async fn fetch_image(&self, url: &str) -> Result<StoryImage, String> {
+        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+        let resp = self
+            .client
+            .get(url)
+            .header(USER_AGENT, "RSSReader/0.1 (Linux; Rust; +https://github.com/system76/rss_reader)")
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status().as_u16()));
+        }
+        if resp.content_length().is_some_and(|len| len > MAX_IMAGE_BYTES) {
+            return Err("image too large".to_string());
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.starts_with("text/html") {
+            return Err("not an image".to_string());
+        }
+        let is_svg = content_type.starts_with("image/svg")
+            || Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(".svg"));
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("download interrupted: {}", e))?;
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return Err("image too large".to_string());
+        }
+        Ok(if is_svg {
+            StoryImage::Svg(bytes.to_vec())
+        } else {
+            StoryImage::Raster(bytes.to_vec())
         })
     }
 
