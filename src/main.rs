@@ -7,6 +7,7 @@ pub mod icons;
 pub mod models;
 pub mod on_escape;
 pub mod opml;
+pub mod spinner;
 pub mod split;
 
 use std::env;

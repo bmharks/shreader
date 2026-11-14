@@ -13,6 +13,7 @@ use crate::feed::{FeedFetcher, FeedPreview};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
 use crate::icons::{icon, Icon, Tint};
+use crate::spinner::spinner;
 use crate::split::split;
 use crate::on_escape::on_escape;
 use crate::models::{Article, ArticleFilter, Feed, Folder, FeedSyncSummary};
@@ -27,6 +28,9 @@ const ADD_FEED_URL_INPUT_ID: &str = "add_feed_url_input_id";
 /// re-lays out the whole widget tree, so rendering thousands of cards made each
 /// update cost 100+ ms (and made drag-and-drop lag). More load on demand.
 const ARTICLE_PAGE_SIZE: usize = 150;
+
+/// How long a status message (toast) stays up before dismissing itself
+const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Story list column width: default, limits, and where it's saved
 const ARTICLE_LIST_DEFAULT_WIDTH: f32 = 360.0;
@@ -65,6 +69,8 @@ pub struct RssApp {
     show_new_folder_input: bool,
     is_syncing: bool,
     status_message: Option<(String, bool)>,
+    /// Bumped whenever a new status message appears; see `STATUS_TIMEOUT`
+    status_generation: u64,
     stats: (i64, i64, i64), // (total_feeds, total_articles, unread_articles)
 
     // Drag-and-drop state
@@ -189,6 +195,8 @@ pub enum Message {
     DeleteFeed(i64),
     OpenUrl(String),
     DismissStatus,
+    /// The auto-dismiss timer for status message number `.0` ran out
+    StatusTimedOut(u64),
     ShowMoreArticles,
 
     // Divider between the story list and the reader
@@ -292,6 +300,7 @@ impl RssApp {
             show_new_folder_input: false,
             is_syncing: false,
             status_message: None,
+            status_generation: 0,
             stats: (0, 0, 0),
             dragging_feed: None,
             feed_menu: None,
@@ -412,6 +421,24 @@ impl RssApp {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let previous_status = self.status_message.clone();
+        let task = self.handle_message(message);
+
+        // Any new status message starts its own auto-dismiss timer. The timer only
+        // clears the message it was started for, so a newer message gets its own
+        // full time on screen.
+        if self.status_message.is_some() && self.status_message != previous_status {
+            self.status_generation += 1;
+            let generation = self.status_generation;
+            let timeout = Task::perform(tokio::time::sleep(STATUS_TIMEOUT), move |_| {
+                Message::StatusTimedOut(generation)
+            });
+            return Task::batch([task, timeout]);
+        }
+        task
+    }
+
+    fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SelectFilter(filter) => {
                 self.active_filter = filter;
@@ -937,6 +964,12 @@ impl RssApp {
             }
             Message::ShowMoreArticles => {
                 self.article_render_limit += ARTICLE_PAGE_SIZE;
+                Task::none()
+            }
+            Message::StatusTimedOut(generation) => {
+                if generation == self.status_generation {
+                    self.status_message = None;
+                }
                 Task::none()
             }
             Message::DismissStatus => {
@@ -1845,7 +1878,10 @@ impl RssApp {
 
         // Refresh Button
         let refresh_label: Element<'_, Message> = if self.is_syncing {
-            text("Syncing Feeds...").size(13).into()
+            row![spinner(Icon::Refresh, 13.0, Tint::OnPrimary), text("Syncing Feeds...").size(13)]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
         } else {
             row![icon(Icon::Refresh, 13.0, Tint::OnPrimary), text("Refresh All Feeds").size(13)]
                 .spacing(6)

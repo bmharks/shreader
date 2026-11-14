@@ -61,12 +61,13 @@ pub enum Tint {
 }
 
 impl Tint {
-    fn color(self, theme: &Theme) -> Color {
+    pub(crate) fn color(self, theme: &Theme) -> Color {
         let palette = theme.extended_palette();
         match self {
             Tint::Text => palette.background.base.text,
             Tint::Secondary => palette.secondary.strong.color,
-            Tint::OnPrimary => palette.primary.base.text,
+            // `button::primary` draws on `primary.strong`; `primary.base.text` is black
+            Tint::OnPrimary => palette.primary.strong.text,
             Tint::OnSecondary => palette.secondary.base.text,
             Tint::Gold => Color::from_rgb8(0xF5, 0xB4, 0x2A),
         }
@@ -75,6 +76,15 @@ impl Tint {
 
 /// A square icon of `size` pixels, tinted with `tint`.
 pub fn icon<'a>(icon: Icon, size: f32, tint: Tint) -> Svg<'a> {
+    Svg::new(handle(icon))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |theme: &Theme, _status| svg::Style {
+            color: Some(tint.color(theme)),
+        })
+}
+
+pub(crate) fn handle(icon: Icon) -> svg::Handle {
     let handle = match icon {
         Icon::Folder => &*FOLDER_H,
         Icon::Star => &*STAR_H,
@@ -83,10 +93,5 @@ pub fn icon<'a>(icon: Icon, size: f32, tint: Tint) -> Svg<'a> {
         Icon::Lock => &*LOCK_H,
         Icon::ExternalLink => &*EXTERNAL_LINK_H,
     };
-    Svg::new(handle.clone())
-        .width(Length::Fixed(size))
-        .height(Length::Fixed(size))
-        .style(move |theme: &Theme, _status| svg::Style {
-            color: Some(tint.color(theme)),
-        })
+    handle.clone()
 }
