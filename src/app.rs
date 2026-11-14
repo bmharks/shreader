@@ -3,17 +3,23 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use iced::mouse;
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, mouse_area, row, scrollable,
-    stack, text, text_input, vertical_rule, Space,
+    button, column, container, horizontal_rule, horizontal_space, mouse_area, pick_list, row,
+    scrollable, stack, text, text_input, vertical_rule, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme, Vector};
 
 use crate::db::Database;
-use crate::feed::FeedFetcher;
+use crate::feed::{FeedFetcher, FeedPreview};
+use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
+use crate::on_escape::on_escape;
 use crate::models::{Article, ArticleFilter, Feed, Folder, FeedSyncSummary};
 
 const FOLDER_INPUT_ID: &str = "new_folder_input_id";
+const RENAME_FEED_INPUT_ID: &str = "rename_feed_input_id";
+const EDIT_FEED_TITLE_INPUT_ID: &str = "edit_feed_title_input_id";
+const RENAME_FOLDER_INPUT_ID: &str = "rename_folder_input_id";
+const ADD_FEED_URL_INPUT_ID: &str = "add_feed_url_input_id";
 
 /// How many article cards to render at a time. Every message rebuilds and
 /// re-lays out the whole widget tree, so rendering thousands of cards made each
@@ -40,16 +46,25 @@ pub struct RssApp {
     active_filter: ActiveFilter,
     selected_article_id: Option<i64>,
     search_query: String,
-    new_feed_input: String,
     new_folder_input: String,
     show_new_folder_input: bool,
-    moving_feed_id: Option<i64>,
     is_syncing: bool,
     status_message: Option<(String, bool)>,
     stats: (i64, i64, i64), // (total_feeds, total_articles, unread_articles)
 
     // Drag-and-drop state
     dragging_feed: Option<i64>,                 // feed_id being dragged
+
+    // Feed context menu (right click) and in-place rename
+    feed_menu: Option<FeedMenu>,
+    renaming_feed: Option<(i64, String)>,       // (feed_id, edited title)
+    editing_feed: Option<EditFeedDialog>,
+
+    add_feed: Option<AddFeedDialog>,
+
+    // Folder context menu (right click) and in-place rename
+    folder_menu: Option<FolderMenu>,
+    renaming_folder: Option<(i64, String)>,     // (folder_id, edited name)
     drag_hover_target: Option<DropTarget>,
 }
 
@@ -63,6 +78,78 @@ pub enum DropTarget {
     Feed(i64),
 }
 
+/// The open right-click menu for a feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeedMenu {
+    feed_id: i64,
+    page: FeedMenuPage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedMenuPage {
+    Main,
+    /// Folder list for "Move to…"
+    MoveTo,
+    /// The "are you sure?" step for Delete
+    ConfirmDelete,
+}
+
+/// The open right-click menu for a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FolderMenu {
+    folder_id: i64,
+    /// Showing the "are you sure?" step for Delete
+    confirm_delete: bool,
+}
+
+/// State of the "Edit feed" dialog.
+#[derive(Debug, Clone)]
+struct EditFeedDialog {
+    feed_id: i64,
+    title: String,
+    url: String,
+    error: Option<String>,
+}
+
+/// State of the "Add feed" dialog.
+#[derive(Debug, Clone)]
+struct AddFeedDialog {
+    url: String,
+    name: String,
+    /// The user typed their own name, so the feed's title no longer overwrites it
+    name_edited: bool,
+    folder: FolderChoice,
+    lookup: FeedLookup,
+    /// Bumped on every URL edit; lookups for older URLs are ignored
+    lookup_generation: u64,
+    error: Option<String>,
+}
+
+/// Progress of fetching the typed URL to fill in the feed's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedLookup {
+    Idle,
+    Pending,
+    Found { story_count: usize },
+    Failed(String),
+}
+
+/// An entry in the Add feed dialog's folder picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderChoice {
+    id: Option<i64>,
+    name: String,
+}
+
+impl std::fmt::Display for FolderChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// How long URL typing must pause before the feed is looked up.
+const FEED_LOOKUP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Which edge of a feed row shows the insertion line while dragging over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InsertEdge {
@@ -74,8 +161,6 @@ enum InsertEdge {
 pub enum Message {
     SelectFilter(ActiveFilter),
     SelectArticle(i64),
-    NewFeedInputChanged(String),
-    AddFeedClicked,
     FeedAdded(Result<(i64, String), String>),
     RefreshClicked,
     SyncFinished(Result<Vec<FeedSyncSummary>, String>),
@@ -88,6 +173,17 @@ pub enum Message {
     DismissStatus,
     ShowMoreArticles,
 
+    // Add feed dialog
+    OpenAddFeed,
+    AddFeedUrlChanged(String),
+    AddFeedNameChanged(String),
+    AddFeedFolderSelected(FolderChoice),
+    /// The URL stopped changing; fetch it if it's still the current one
+    AddFeedLookupDue(u64),
+    AddFeedLookupDone(u64, Result<FeedPreview, String>),
+    SubmitAddFeed,
+    CancelAddFeed,
+
     // Folder Actions
     ToggleFolderExpand(i64),
     ShowNewFolderInput,
@@ -95,9 +191,33 @@ pub enum Message {
     NewFolderInputChanged(String),
     CreateFolderClicked,
     DeleteFolder(i64),
-    StartMovingFeed(i64),
-    AssignFeedToFolder(i64, Option<i64>),
-    CancelMoveFeed,
+    OpenFolderMenu(i64),
+    CloseFolderMenu,
+    AskDeleteFolder(i64),
+    StartRenameFolder(i64),
+    RenameFolderInputChanged(String),
+    SubmitRenameFolder,
+    CancelRenameFolder,
+
+    // Feed context menu & rename
+    OpenFeedMenu(i64),
+    CloseFeedMenu,
+    AskDeleteFeed(i64),
+    ShowMoveToMenu(i64),
+    FeedMenuBack(i64),
+    MoveFeedTo(i64, Option<i64>),
+    OpenEditFeed(i64),
+    EditFeedTitleChanged(String),
+    EditFeedUrlChanged(String),
+    SaveEditFeed,
+    CancelEditFeed,
+    /// Does nothing; used where an event must be consumed (e.g. a modal backdrop)
+    Noop,
+    StartRenameFeed(i64),
+    RenameFeedInputChanged(String),
+    SubmitRenameFeed,
+    CancelRenameFeed,
+    EscapePressed,
 
     // Drag-and-Drop Actions
     DragFeedStarted(i64),
@@ -131,14 +251,18 @@ impl RssApp {
             active_filter: ActiveFilter::All,
             selected_article_id: None,
             search_query: String::new(),
-            new_feed_input: String::new(),
             new_folder_input: String::new(),
             show_new_folder_input: false,
-            moving_feed_id: None,
             is_syncing: false,
             status_message: None,
             stats: (0, 0, 0),
             dragging_feed: None,
+            feed_menu: None,
+            renaming_feed: None,
+            editing_feed: None,
+            add_feed: None,
+            folder_menu: None,
+            renaming_folder: None,
             drag_hover_target: None,
         };
 
@@ -174,7 +298,21 @@ impl RssApp {
         // Drag release is reported by the floating badge widget (follow_cursor.rs)
         // rather than a global event listener, which would also be fed every
         // mouse move and can overflow its channel ("TrySendError { kind: Full }").
-        Subscription::none()
+        //
+        // Esc closes the feed context menu. Key presses are low-volume, so this
+        // listener is cheap; it's only active while the menu is open. (Esc in the
+        // rename field and Edit dialog is handled by `on_escape` wrappers, because
+        // a focused text input swallows Esc before subscriptions see it.)
+        if self.feed_menu.is_some() || self.folder_menu.is_some() {
+            iced::keyboard::on_key_press(|key, _modifiers| match key {
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
+                    Some(Message::EscapePressed)
+                }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        }
     }
 
     fn reload_data(&mut self) {
@@ -250,59 +388,147 @@ impl RssApp {
                 self.reload_data();
                 Task::none()
             }
-            Message::NewFeedInputChanged(url) => {
-                self.new_feed_input = url;
-                Task::none()
-            }
-            Message::AddFeedClicked => {
-                let url = self.new_feed_input.trim().to_string();
-                if url.is_empty() {
-                    return Task::none();
-                }
-
-                // If a folder is currently selected, add the new feed into that folder!
-                let folder_id = match self.active_filter {
-                    ActiveFilter::Folder(fid) => Some(fid),
-                    ActiveFilter::Feed(fid) => {
-                        self.feeds.iter().find(|f| f.id == fid).and_then(|f| f.folder_id)
-                    }
-                    _ => None,
-                };
-
-                self.new_feed_input.clear();
-                self.is_syncing = true;
-                let db_clone = self.db.clone();
-                let fetcher_clone = self.fetcher.clone();
-
-                Task::perform(
-                    async move {
-                        // 1. Add feed placeholder
-                        let feed_id = db_clone
-                            .add_or_update_feed(&url, &url, None, None, folder_id)
-                            .map_err(|e| format!("Database error: {}", e))?;
-
-                        // 2. Fetch and sync feed items
-                        fetcher_clone
-                            .fetch_and_sync(&db_clone, feed_id)
-                            .await
-                            .map_err(|e| format!("Feed fetch error: {}", e))?;
-
-                        Ok((feed_id, url))
-                    },
-                    Message::FeedAdded,
-                )
-            }
             Message::FeedAdded(result) => {
                 self.is_syncing = false;
+                // Reload either way: on a failed first fetch the feed is still added
+                self.reload_data();
                 match result {
-                    Ok((_feed_id, url)) => {
-                        self.status_message = Some((format!("Subscribed to: {}", url), false));
-                        self.reload_data();
+                    Ok((feed_id, url)) => {
+                        let name = self
+                            .feeds
+                            .iter()
+                            .find(|f| f.id == feed_id)
+                            .map(|f| f.title.clone())
+                            .unwrap_or(url);
+                        self.status_message = Some((format!("Subscribed to '{}'", name), false));
                     }
                     Err(e) => {
                         self.status_message = Some((e, true));
                     }
                 }
+                Task::none()
+            }
+            Message::OpenAddFeed => {
+                self.feed_menu = None;
+                self.folder_menu = None;
+                let folder_id = self.default_new_feed_folder();
+                self.add_feed = Some(AddFeedDialog {
+                    url: String::new(),
+                    name: String::new(),
+                    name_edited: false,
+                    folder: self
+                        .folder_choices()
+                        .into_iter()
+                        .find(|c| c.id == folder_id)
+                        .unwrap_or_else(uncategorized_choice),
+                    lookup: FeedLookup::Idle,
+                    lookup_generation: 0,
+                    error: None,
+                });
+                text_input::focus(text_input::Id::new(ADD_FEED_URL_INPUT_ID))
+            }
+            Message::AddFeedUrlChanged(value) => {
+                let Some(dialog) = &mut self.add_feed else {
+                    return Task::none();
+                };
+                dialog.url = value;
+                dialog.error = None;
+                dialog.lookup_generation += 1;
+                // A name filled in from the previous URL no longer applies
+                if !dialog.name_edited {
+                    dialog.name.clear();
+                }
+                let url = normalize_feed_url(&dialog.url);
+                if url.as_ref().is_some_and(|url| self.feeds.iter().any(|f| &f.url == url)) {
+                    // No point fetching a feed that's already subscribed
+                    dialog.lookup = FeedLookup::Idle;
+                    dialog.error = Some("You're already subscribed to that URL.".to_string());
+                    Task::none()
+                } else if url.is_some() {
+                    dialog.lookup = FeedLookup::Pending;
+                    // Wait for typing to pause rather than fetching on every keystroke
+                    let generation = dialog.lookup_generation;
+                    Task::perform(tokio::time::sleep(FEED_LOOKUP_DELAY), move |_| {
+                        Message::AddFeedLookupDue(generation)
+                    })
+                } else {
+                    dialog.lookup = FeedLookup::Idle;
+                    Task::none()
+                }
+            }
+            Message::AddFeedLookupDue(generation) => {
+                let Some(dialog) = &self.add_feed else {
+                    return Task::none();
+                };
+                if generation != dialog.lookup_generation {
+                    return Task::none(); // URL changed again since; a newer lookup is queued
+                }
+                let Some(url) = normalize_feed_url(&dialog.url) else {
+                    return Task::none();
+                };
+                let fetcher = self.fetcher.clone();
+                Task::perform(async move { fetcher.preview(&url).await }, move |result| {
+                    Message::AddFeedLookupDone(generation, result)
+                })
+            }
+            Message::AddFeedLookupDone(generation, result) => {
+                let Some(dialog) = &mut self.add_feed else {
+                    return Task::none();
+                };
+                if generation != dialog.lookup_generation {
+                    return Task::none();
+                }
+                match result {
+                    Ok(preview) => {
+                        dialog.lookup = FeedLookup::Found { story_count: preview.story_count };
+                        if !dialog.name_edited {
+                            dialog.name = preview.title.unwrap_or_default();
+                        }
+                    }
+                    Err(e) => dialog.lookup = FeedLookup::Failed(e),
+                }
+                Task::none()
+            }
+            Message::AddFeedNameChanged(value) => {
+                if let Some(dialog) = &mut self.add_feed {
+                    // Clearing the name hands it back to the auto-fill
+                    dialog.name_edited = !value.trim().is_empty();
+                    dialog.name = value;
+                    dialog.error = None;
+                }
+                Task::none()
+            }
+            Message::AddFeedFolderSelected(choice) => {
+                if let Some(dialog) = &mut self.add_feed {
+                    dialog.folder = choice;
+                }
+                Task::none()
+            }
+            Message::SubmitAddFeed => {
+                let Some(dialog) = &mut self.add_feed else {
+                    return Task::none();
+                };
+                let Some(url) = normalize_feed_url(&dialog.url) else {
+                    dialog.error = Some(
+                        "Enter a feed address, e.g. https://example.com/feed.xml".to_string(),
+                    );
+                    return Task::none();
+                };
+                if self.feeds.iter().any(|f| f.url == url) {
+                    dialog.error = Some("You're already subscribed to that URL.".to_string());
+                    return Task::none();
+                }
+                let name = dialog.name.trim().to_string();
+                let folder_id = dialog.folder.id;
+                self.add_feed = None;
+                if let Some(id) = folder_id {
+                    self.expanded_folders.insert(id);
+                }
+                // An empty name lets the first sync fill in the feed's own title
+                self.subscribe(url, (!name.is_empty()).then_some(name), folder_id)
+            }
+            Message::CancelAddFeed => {
+                self.add_feed = None;
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -373,11 +599,175 @@ impl RssApp {
                 Task::none()
             }
             Message::DeleteFeed(feed_id) => {
-                let _ = self.db.delete_feed(feed_id);
+                self.feed_menu = None;
+                if self.renaming_feed.as_ref().is_some_and(|(id, _)| *id == feed_id) {
+                    self.renaming_feed = None;
+                }
+                let title = self
+                    .feeds
+                    .iter()
+                    .find(|f| f.id == feed_id)
+                    .map(|f| f.title.clone())
+                    .unwrap_or_else(|| "Feed".to_string());
+                match self.db.delete_feed(feed_id) {
+                    Ok(()) => {
+                        self.status_message = Some((format!("Deleted '{}'", title), false));
+                    }
+                    Err(e) => {
+                        self.status_message =
+                            Some((format!("Failed to delete '{}': {}", title, e), true));
+                    }
+                }
                 if self.active_filter == ActiveFilter::Feed(feed_id) {
                     self.active_filter = ActiveFilter::All;
                 }
                 self.reload_data();
+                Task::none()
+            }
+            Message::OpenFeedMenu(feed_id) => {
+                self.folder_menu = None;
+                self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::Main });
+                Task::none()
+            }
+            Message::CloseFeedMenu => {
+                self.feed_menu = None;
+                Task::none()
+            }
+            Message::AskDeleteFeed(feed_id) => {
+                self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::ConfirmDelete });
+                Task::none()
+            }
+            Message::StartRenameFeed(feed_id) => {
+                self.feed_menu = None;
+                let title = self
+                    .feeds
+                    .iter()
+                    .find(|f| f.id == feed_id)
+                    .map(|f| f.title.clone())
+                    .unwrap_or_default();
+                self.renaming_folder = None;
+                self.renaming_feed = Some((feed_id, title));
+                let id = text_input::Id::new(RENAME_FEED_INPUT_ID);
+                Task::batch([text_input::focus(id.clone()), text_input::select_all(id)])
+            }
+            Message::RenameFeedInputChanged(value) => {
+                if let Some((_, title)) = &mut self.renaming_feed {
+                    *title = value;
+                }
+                Task::none()
+            }
+            Message::SubmitRenameFeed => {
+                if let Some((feed_id, title)) = self.renaming_feed.take() {
+                    let title = title.trim();
+                    // An empty name would also let the next sync replace it with the
+                    // feed's own title, so treat it as "cancel"
+                    if !title.is_empty() {
+                        if let Err(e) = self.db.rename_feed(feed_id, title) {
+                            self.status_message = Some((format!("Failed to rename feed: {}", e), true));
+                        }
+                        self.reload_data();
+                    }
+                }
+                Task::none()
+            }
+            Message::ShowMoveToMenu(feed_id) => {
+                self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::MoveTo });
+                Task::none()
+            }
+            Message::FeedMenuBack(feed_id) => {
+                self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::Main });
+                Task::none()
+            }
+            Message::MoveFeedTo(feed_id, folder_id) => {
+                self.feed_menu = None;
+                // Same path as dropping onto a folder header: goes to the end of
+                // the folder, with a "Moved … into …" toast
+                self.drop_feed(feed_id, DropTarget::Folder(folder_id));
+                Task::none()
+            }
+            Message::OpenEditFeed(feed_id) => {
+                self.feed_menu = None;
+                self.renaming_feed = None;
+                if let Some(feed) = self.feeds.iter().find(|f| f.id == feed_id) {
+                    self.editing_feed = Some(EditFeedDialog {
+                        feed_id,
+                        title: feed.title.clone(),
+                        url: feed.url.clone(),
+                        error: None,
+                    });
+                    return text_input::focus(text_input::Id::new(EDIT_FEED_TITLE_INPUT_ID));
+                }
+                Task::none()
+            }
+            Message::EditFeedTitleChanged(value) => {
+                if let Some(dialog) = &mut self.editing_feed {
+                    dialog.title = value;
+                    dialog.error = None;
+                }
+                Task::none()
+            }
+            Message::EditFeedUrlChanged(value) => {
+                if let Some(dialog) = &mut self.editing_feed {
+                    dialog.url = value;
+                    dialog.error = None;
+                }
+                Task::none()
+            }
+            Message::SaveEditFeed => {
+                let Some(dialog) = &mut self.editing_feed else {
+                    return Task::none();
+                };
+                let title = dialog.title.trim().to_string();
+                let url = dialog.url.trim().to_string();
+
+                if title.is_empty() {
+                    dialog.error = Some("Name can't be empty.".to_string());
+                    return Task::none();
+                }
+                match url::Url::parse(&url) {
+                    Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+                    _ => {
+                        dialog.error =
+                            Some("Feed URL must be a full http:// or https:// address.".to_string());
+                        return Task::none();
+                    }
+                }
+                if self.feeds.iter().any(|f| f.url == url && f.id != dialog.feed_id) {
+                    dialog.error = Some("You're already subscribed to that URL.".to_string());
+                    return Task::none();
+                }
+
+                match self.db.update_feed_details(dialog.feed_id, &title, &url) {
+                    Ok(()) => {
+                        self.editing_feed = None;
+                        self.reload_data();
+                    }
+                    Err(e) => dialog.error = Some(format!("Couldn't save: {}", e)),
+                }
+                Task::none()
+            }
+            Message::Noop => Task::none(),
+            Message::CancelRenameFeed => {
+                self.renaming_feed = None;
+                Task::none()
+            }
+            Message::CancelEditFeed => {
+                self.editing_feed = None;
+                Task::none()
+            }
+            Message::EscapePressed => {
+                // From a sub-page (Move to / Delete confirm), Esc goes back first
+                if let Some(menu) = self.feed_menu {
+                    self.feed_menu = match menu.page {
+                        FeedMenuPage::Main => None,
+                        _ => Some(FeedMenu { page: FeedMenuPage::Main, ..menu }),
+                    };
+                }
+                if let Some(menu) = self.folder_menu {
+                    self.folder_menu = menu
+                        .confirm_delete
+                        .then_some(FolderMenu { confirm_delete: false, ..menu });
+                }
                 Task::none()
             }
             Message::OpenUrl(url) => {
@@ -438,30 +828,106 @@ impl RssApp {
                 Task::none()
             }
             Message::DeleteFolder(folder_id) => {
-                let _ = self.db.delete_folder(folder_id);
+                self.folder_menu = None;
+                if self.renaming_folder.as_ref().is_some_and(|(id, _)| *id == folder_id) {
+                    self.renaming_folder = None;
+                }
+                let (name, feed_count) = self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == folder_id)
+                    .map(|f| (f.name.clone(), f.feed_count))
+                    .unwrap_or_else(|| ("Folder".to_string(), 0));
+                match self.db.delete_folder(folder_id) {
+                    Ok(()) => {
+                        let moved = match feed_count {
+                            0 => String::new(),
+                            1 => "; its feed moved to Uncategorized".to_string(),
+                            n => format!("; its {} feeds moved to Uncategorized", n),
+                        };
+                        self.status_message =
+                            Some((format!("Deleted folder '{}'{}", name, moved), false));
+                    }
+                    Err(e) => {
+                        self.status_message =
+                            Some((format!("Failed to delete folder '{}': {}", name, e), true));
+                    }
+                }
+                self.expanded_folders.remove(&folder_id);
                 if self.active_filter == ActiveFilter::Folder(folder_id) {
                     self.active_filter = ActiveFilter::All;
                 }
                 self.reload_data();
                 Task::none()
             }
-            Message::StartMovingFeed(feed_id) => {
-                self.moving_feed_id = Some(feed_id);
+            Message::OpenFolderMenu(folder_id) => {
+                self.feed_menu = None;
+                self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false });
                 Task::none()
             }
-            Message::AssignFeedToFolder(feed_id, folder_id) => {
-                let _ = self.db.set_feed_folder(feed_id, folder_id);
-                self.moving_feed_id = None;
+            Message::CloseFolderMenu => {
+                self.folder_menu = None;
+                Task::none()
+            }
+            Message::AskDeleteFolder(folder_id) => {
+                self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: true });
+                Task::none()
+            }
+            Message::StartRenameFolder(folder_id) => {
+                self.folder_menu = None;
+                self.renaming_feed = None;
+                let name = self
+                    .folders
+                    .iter()
+                    .find(|f| f.id == folder_id)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_default();
+                self.renaming_folder = Some((folder_id, name));
+                let id = text_input::Id::new(RENAME_FOLDER_INPUT_ID);
+                Task::batch([text_input::focus(id.clone()), text_input::select_all(id)])
+            }
+            Message::RenameFolderInputChanged(value) => {
+                if let Some((_, name)) = &mut self.renaming_folder {
+                    *name = value;
+                }
+                Task::none()
+            }
+            Message::SubmitRenameFolder => {
+                let Some((folder_id, name)) = &self.renaming_folder else {
+                    return Task::none();
+                };
+                let (folder_id, name) = (*folder_id, name.trim().to_string());
+                // Empty name = cancel, same as feed rename
+                if name.is_empty() {
+                    self.renaming_folder = None;
+                    return Task::none();
+                }
+                // Folder names are unique. Keep the field open so the name can be fixed.
+                if self
+                    .folders
+                    .iter()
+                    .any(|f| f.id != folder_id && f.name.eq_ignore_ascii_case(&name))
+                {
+                    self.status_message =
+                        Some((format!("A folder named '{}' already exists", name), true));
+                    return Task::none();
+                }
+                self.renaming_folder = None;
+                if let Err(e) = self.db.rename_folder(folder_id, &name) {
+                    self.status_message = Some((format!("Failed to rename folder: {}", e), true));
+                }
                 self.reload_data();
                 Task::none()
             }
-            Message::CancelMoveFeed => {
-                self.moving_feed_id = None;
+            Message::CancelRenameFolder => {
+                self.renaming_folder = None;
                 Task::none()
             }
 
             // Drag-and-Drop Handlers
             Message::DragFeedStarted(feed_id) => {
+                self.feed_menu = None;
+                self.folder_menu = None;
                 self.dragging_feed = Some(feed_id);
                 self.drag_hover_target = None;
                 // No status banner here: showing one would push the whole layout down
@@ -499,6 +965,50 @@ impl RssApp {
         }
         self.dragging_feed = None;
         self.drag_hover_target = None;
+    }
+
+    /// Adds a feed and fetches its stories in the background (reports via
+    /// `FeedAdded`). With no `title`, the URL stands in until the first sync
+    /// replaces it with the feed's own title.
+    fn subscribe(&mut self, url: String, title: Option<String>, folder_id: Option<i64>) -> Task<Message> {
+        self.is_syncing = true;
+        let db = self.db.clone();
+        let fetcher = self.fetcher.clone();
+
+        Task::perform(
+            async move {
+                let title = title.unwrap_or_else(|| url.clone());
+                let feed_id = db
+                    .add_or_update_feed(&url, &title, None, None, folder_id)
+                    .map_err(|e| format!("Database error: {}", e))?;
+
+                let summary = fetcher
+                    .fetch_and_sync(&db, feed_id)
+                    .await
+                    .map_err(|e| format!("Feed fetch error: {}", e))?;
+                if let Some(error) = summary.error {
+                    return Err(format!("Added '{}', but fetching it failed: {}", title, error));
+                }
+                Ok((feed_id, url))
+            },
+            Message::FeedAdded,
+        )
+    }
+
+    /// The folder a new feed goes into: the selected folder, or the folder of
+    /// the selected feed.
+    fn default_new_feed_folder(&self) -> Option<i64> {
+        match self.active_filter {
+            ActiveFilter::Folder(fid) => Some(fid),
+            ActiveFilter::Feed(fid) => self.feeds.iter().find(|f| f.id == fid).and_then(|f| f.folder_id),
+            _ => None,
+        }
+    }
+
+    fn folder_choices(&self) -> Vec<FolderChoice> {
+        std::iter::once(uncategorized_choice())
+            .chain(self.folders.iter().map(|f| FolderChoice { id: Some(f.id), name: f.name.clone() }))
+            .collect()
     }
 
     /// Feed ids in `folder_id` (None = Uncategorized) in display order.
@@ -622,7 +1132,28 @@ impl RssApp {
             mouse::Interaction::Grab
         });
 
-        let feed_btn = button(
+        let renaming_title = self
+            .renaming_feed
+            .as_ref()
+            .filter(|(id, _)| *id == feed.id)
+            .map(|(_, title)| title);
+
+        let feed_btn: Element<'a, Message> = if let Some(title) = renaming_title {
+            // In-place rename: Enter saves, Esc cancels
+            // on_escape: the focused input would otherwise swallow Esc
+            on_escape(
+                text_input("Feed name", title)
+                    .id(text_input::Id::new(RENAME_FEED_INPUT_ID))
+                    .on_input(Message::RenameFeedInputChanged)
+                    .on_submit(Message::SubmitRenameFeed)
+                    .size(12)
+                    .padding([2, 6])
+                    .width(Length::Fill),
+                Message::CancelRenameFeed,
+            )
+            .into()
+        } else {
+            button(
             row![
                 text(&feed.title).size(12).width(Length::Fill),
                 if !feed_unread.is_empty() {
@@ -642,24 +1173,14 @@ impl RssApp {
         } else {
             button::text
         })
-        .on_press(Message::SelectFilter(ActiveFilter::Feed(feed.id)));
-
-        let move_btn = button(text("⇄").size(11))
-            .padding([2, 4])
-            .style(button::text)
-            .on_press(Message::StartMovingFeed(feed.id));
-
-        let del_btn = button(text("×").size(12))
-            .padding([2, 4])
-            .style(button::text)
-            .on_press(Message::DeleteFeed(feed.id));
+        .on_press(Message::SelectFilter(ActiveFilter::Feed(feed.id)))
+        .into()
+        };
 
         let feed_row = row![
             Space::with_width(if indented { 12 } else { 0 }),
             Element::from(grip_btn),
-            Element::from(feed_btn),
-            Element::from(move_btn),
-            Element::from(del_btn),
+            feed_btn,
         ]
         .spacing(2)
         .align_y(Alignment::Center);
@@ -695,7 +1216,300 @@ impl RssApp {
                 .on_release(Message::DropOnTarget(target))
                 .interaction(mouse::Interaction::Grabbing);
         }
-        drop_area.into()
+
+        let menu = self
+            .feed_menu
+            .filter(|m| m.feed_id == feed.id && !is_dragging)
+            .map(|m| self.feed_menu_view(feed, m.page));
+
+        let mut row_with_menu = context_menu(drop_area)
+            .menu(menu)
+            .on_dismiss(Message::CloseFeedMenu);
+        if !is_dragging {
+            row_with_menu = row_with_menu.on_right_press(Message::OpenFeedMenu(feed.id));
+        }
+        row_with_menu.into()
+    }
+
+    /// Modal "Edit feed" dialog, drawn over a dimmed backdrop.
+    fn edit_feed_dialog_view<'a>(&'a self, dialog: &'a EditFeedDialog) -> Element<'a, Message> {
+        let url_changed = self
+            .feeds
+            .iter()
+            .find(|f| f.id == dialog.feed_id)
+            .is_some_and(|f| f.url != dialog.url.trim());
+
+        let mut form = column![
+            text("Edit feed").size(16),
+            column![
+                text("Name").size(12).style(text::secondary),
+                text_input("Feed name", &dialog.title)
+                    .id(text_input::Id::new(EDIT_FEED_TITLE_INPUT_ID))
+                    .on_input(Message::EditFeedTitleChanged)
+                    .on_submit(Message::SaveEditFeed)
+                    .size(13)
+                    .padding(6),
+            ]
+            .spacing(4),
+            column![
+                text("Feed URL").size(12).style(text::secondary),
+                text_input("https://example.com/feed.xml", &dialog.url)
+                    .on_input(Message::EditFeedUrlChanged)
+                    .on_submit(Message::SaveEditFeed)
+                    .size(13)
+                    .padding(6),
+            ]
+            .spacing(4),
+        ]
+        .spacing(12);
+
+        // One message line with a fixed height (always present, possibly empty), so
+        // errors or the URL note never push the buttons around.
+        let message: Element<'a, Message> = if let Some(error) = &dialog.error {
+            text(error).size(12).style(text::danger).into()
+        } else if url_changed {
+            text("Archived stories are kept. The new URL is fetched on the next refresh.")
+                .size(11)
+                .style(text::secondary)
+                .into()
+        } else {
+            Space::with_height(0).into()
+        };
+        form = form.push(container(message).height(Length::Fixed(30.0)));
+
+        form = form.push(
+            row![
+                horizontal_space(),
+                button(text("Cancel").size(13))
+                    .padding([5, 12])
+                    .style(button::text)
+                    .on_press(Message::CancelEditFeed),
+                button(text("Save").size(13))
+                    .padding([5, 14])
+                    .style(button::primary)
+                    .on_press(Message::SaveEditFeed),
+            ]
+            .spacing(8),
+        );
+
+        modal(form, Message::CancelEditFeed)
+    }
+
+    /// Modal "Add feed" dialog. The name fills in from the feed once the URL
+    /// has been looked up, and stays editable.
+    fn add_feed_dialog_view<'a>(&'a self, dialog: &'a AddFeedDialog) -> Element<'a, Message> {
+        let lookup_note: Element<'a, Message> = match &dialog.lookup {
+            FeedLookup::Idle => Space::with_height(0).into(),
+            FeedLookup::Pending => text("Looking up feed…").size(11).style(text::secondary).into(),
+            FeedLookup::Found { story_count } => text(match story_count {
+                0 => "Found the feed. It has no stories right now.".to_string(),
+                1 => "Found the feed (1 story).".to_string(),
+                n => format!("Found the feed ({} stories).", n),
+            })
+            .size(11)
+            .style(text::success)
+            .into(),
+            FeedLookup::Failed(reason) => text(format!("{} You can still add it.", reason))
+                .size(11)
+                .style(text::danger)
+                .into(),
+        };
+
+        let error: Element<'a, Message> = match &dialog.error {
+            Some(error) => text(error).size(12).style(text::danger).into(),
+            None => Space::with_height(0).into(),
+        };
+
+        let form = column![
+            text("Add feed").size(16),
+            column![
+                text("Feed URL").size(12).style(text::secondary),
+                text_input("https://example.com/feed.xml", &dialog.url)
+                    .id(text_input::Id::new(ADD_FEED_URL_INPUT_ID))
+                    .on_input(Message::AddFeedUrlChanged)
+                    .on_submit(Message::SubmitAddFeed)
+                    .size(13)
+                    .padding(6),
+                // Fixed height so the note appearing doesn't move the fields below
+                container(lookup_note).height(Length::Fixed(16.0)),
+            ]
+            .spacing(4),
+            column![
+                text("Name").size(12).style(text::secondary),
+                text_input(
+                    if dialog.lookup == FeedLookup::Pending {
+                        "Filling in from the feed…"
+                    } else {
+                        "Filled in from the feed"
+                    },
+                    &dialog.name,
+                )
+                .on_input(Message::AddFeedNameChanged)
+                .on_submit(Message::SubmitAddFeed)
+                .size(13)
+                .padding(6),
+            ]
+            .spacing(4),
+            column![
+                text("Folder").size(12).style(text::secondary),
+                pick_list(
+                    self.folder_choices(),
+                    Some(dialog.folder.clone()),
+                    Message::AddFeedFolderSelected,
+                )
+                .text_size(13)
+                .padding(6)
+                .width(Length::Fill),
+            ]
+            .spacing(4),
+            container(error).height(Length::Fixed(20.0)),
+            row![
+                horizontal_space(),
+                button(text("Cancel").size(13))
+                    .padding([5, 12])
+                    .style(button::text)
+                    .on_press(Message::CancelAddFeed),
+                button(text("Add feed").size(13))
+                    .padding([5, 14])
+                    .style(button::primary)
+                    .on_press_maybe(
+                        (!dialog.url.trim().is_empty()).then_some(Message::SubmitAddFeed),
+                    ),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12);
+
+        modal(form, Message::CancelAddFeed)
+    }
+
+    /// Contents of a feed's right-click menu.
+    fn feed_menu_view<'a>(&'a self, feed: &'a Feed, page: FeedMenuPage) -> Element<'a, Message> {
+        let menu_item = |label: String, message: Option<Message>| {
+            button(text(label).size(13))
+                .width(Length::Fill)
+                .padding([5, 10])
+                .style(button::text)
+                .on_press_maybe(message)
+        };
+
+        let body: Element<'a, Message> = if page == FeedMenuPage::MoveTo {
+            // Destination list; the feed's current location is labelled and disabled
+            let destination = |label: String, folder_id: Option<i64>| {
+                let is_current = feed.folder_id == folder_id;
+                menu_item(
+                    // (No ✓ glyph: the default font doesn't have it)
+                    if is_current { format!("{} (current)", label) } else { label },
+                    (!is_current).then_some(Message::MoveFeedTo(feed.id, folder_id)),
+                )
+            };
+            let mut destinations = column![destination("Uncategorized".to_string(), None)];
+            for folder in &self.folders {
+                destinations = destinations.push(destination(folder.name.clone(), Some(folder.id)));
+            }
+            column![
+                menu_item("← Back".to_string(), Some(Message::FeedMenuBack(feed.id))),
+                horizontal_rule(1),
+                container(scrollable(destinations)).max_height(320),
+            ]
+            .spacing(2)
+            .into()
+        } else if page == FeedMenuPage::ConfirmDelete {
+            column![
+                text(format!("Delete '{}'?", feed.title)).size(13),
+                text(match feed.total_count {
+                    0 => "It has no archived stories.".to_string(),
+                    1 => "Its 1 archived story will be permanently deleted too.".to_string(),
+                    n => format!("Its {} archived stories will be permanently deleted too.", n),
+                })
+                .size(11)
+                .style(text::secondary),
+                row![
+                    horizontal_space(),
+                    button(text("Cancel").size(12))
+                        .padding([4, 10])
+                        .style(button::text)
+                        .on_press(Message::CloseFeedMenu),
+                    button(text("Delete").size(12))
+                        .padding([4, 10])
+                        .style(button::danger)
+                        .on_press(Message::DeleteFeed(feed.id)),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8)
+            .padding(8)
+            .into()
+        } else {
+            column![
+                menu_item("Rename".to_string(), Some(Message::StartRenameFeed(feed.id))),
+                menu_item("Edit feed…".to_string(), Some(Message::OpenEditFeed(feed.id))),
+                menu_item("Move to…".to_string(), Some(Message::ShowMoveToMenu(feed.id))),
+                horizontal_rule(1),
+                menu_item("Delete…".to_string(), Some(Message::AskDeleteFeed(feed.id))),
+            ]
+            .spacing(2)
+            .into()
+        };
+
+        menu_card(
+            body,
+            match page {
+                FeedMenuPage::Main => 160.0,
+                FeedMenuPage::MoveTo => 220.0,
+                FeedMenuPage::ConfirmDelete => 260.0,
+            },
+        )
+    }
+
+    /// Contents of a folder's right-click menu.
+    fn folder_menu_view<'a>(&'a self, folder: &'a Folder, confirm_delete: bool) -> Element<'a, Message> {
+        if confirm_delete {
+            let body = column![
+                text(format!("Delete folder '{}'?", folder.name)).size(13),
+                text(match folder.feed_count {
+                    0 => "The folder is empty.".to_string(),
+                    1 => "Its feed will move to Uncategorized. No feeds or stories are deleted."
+                        .to_string(),
+                    n => format!(
+                        "Its {} feeds will move to Uncategorized. No feeds or stories are deleted.",
+                        n
+                    ),
+                })
+                .size(11)
+                .style(text::secondary),
+                row![
+                    horizontal_space(),
+                    button(text("Cancel").size(12))
+                        .padding([4, 10])
+                        .style(button::text)
+                        .on_press(Message::CloseFolderMenu),
+                    button(text("Delete").size(12))
+                        .padding([4, 10])
+                        .style(button::danger)
+                        .on_press(Message::DeleteFolder(folder.id)),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8)
+            .padding(8);
+            return menu_card(body, 260.0);
+        }
+
+        let menu_item = |label: &'static str, message: Message| {
+            button(text(label).size(13))
+                .width(Length::Fill)
+                .padding([5, 10])
+                .style(button::text)
+                .on_press(message)
+        };
+        let body = column![
+            menu_item("Rename", Message::StartRenameFolder(folder.id)),
+            horizontal_rule(1),
+            menu_item("Delete…", Message::AskDeleteFolder(folder.id)),
+        ]
+        .spacing(2);
+        menu_card(body, 160.0)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -748,6 +1562,13 @@ impl RssApp {
         }
 
         // If dragging, render floating preview badge that follows the mouse cursor!
+        if let Some(dialog) = &self.editing_feed {
+            layers.push(self.edit_feed_dialog_view(dialog));
+        }
+        if let Some(dialog) = &self.add_feed {
+            layers.push(self.add_feed_dialog_view(dialog));
+        }
+
         if let Some(feed_id) = self.dragging_feed {
             let feed_title = self
                 .feeds
@@ -798,19 +1619,6 @@ impl RssApp {
         ]
         .spacing(2);
 
-        // Add Feed Input
-        let add_feed_row = row![
-            text_input("Add feed URL...", &self.new_feed_input)
-                .on_input(Message::NewFeedInputChanged)
-                .on_submit(Message::AddFeedClicked)
-                .padding(6)
-                .size(13),
-            button(text("+ Add").size(13))
-                .padding([6, 12])
-                .on_press(Message::AddFeedClicked),
-        ]
-        .spacing(6);
-
         // Refresh Button
         let refresh_label = if self.is_syncing {
             "Syncing Feeds..."
@@ -854,11 +1662,16 @@ impl RssApp {
         let subscriptions_header = row![
             text("SUBSCRIPTIONS").size(11).style(text::secondary),
             horizontal_space(),
+            button(text("+ Feed").size(11))
+                .padding([2, 6])
+                .style(button::secondary)
+                .on_press(Message::OpenAddFeed),
             button(text("+ Folder").size(11))
                 .padding([2, 6])
                 .style(button::secondary)
                 .on_press(Message::ShowNewFolderInput),
         ]
+        .spacing(4)
         .align_y(Alignment::Center);
 
         // New Folder Input Row (Immediately focused on creation!)
@@ -890,48 +1703,6 @@ impl RssApp {
             tree_items = tree_items.push(new_folder_box);
         }
 
-        // Folder Moving Overlay Prompt (Accessible click alternative)
-        if let Some(target_feed_id) = self.moving_feed_id {
-            let feed_title = self
-                .feeds
-                .iter()
-                .find(|f| f.id == target_feed_id)
-                .map(|f| f.title.as_str())
-                .unwrap_or("Feed");
-
-            let mut move_dialog = column![
-                text(format!("Move '{}' to:", feed_title)).size(12).style(text::primary),
-                button(text("(No Folder / Uncategorized)").size(11))
-                    .width(Length::Fill)
-                    .padding([3, 6])
-                    .style(button::secondary)
-                    .on_press(Message::AssignFeedToFolder(target_feed_id, None)),
-            ]
-            .spacing(3);
-
-            for fld in &self.folders {
-                move_dialog = move_dialog.push(
-                    button(text(format!("📁 {}", fld.name)).size(11))
-                        .width(Length::Fill)
-                        .padding([3, 6])
-                        .style(button::secondary)
-                        .on_press(Message::AssignFeedToFolder(target_feed_id, Some(fld.id))),
-                );
-            }
-
-            move_dialog = move_dialog.push(
-                button(text("Cancel").size(10))
-                    .padding([2, 6])
-                    .style(button::text)
-                    .on_press(Message::CancelMoveFeed),
-            );
-
-            tree_items = tree_items.push(
-                container(move_dialog)
-                    .padding(6)
-                    .style(container::bordered_box),
-            );
-        }
 
         let is_dragging = self.dragging_feed.is_some();
 
@@ -958,7 +1729,27 @@ impl RssApp {
                     .style(button::text)
                     .on_press(Message::ToggleFolderExpand(folder.id));
 
-                let folder_btn = button(
+                let renaming_name = self
+                    .renaming_folder
+                    .as_ref()
+                    .filter(|(id, _)| *id == folder.id)
+                    .map(|(_, name)| name);
+
+                let folder_btn: Element<'_, Message> = if let Some(name) = renaming_name {
+                    // In-place rename: Enter saves, Esc cancels
+                    on_escape(
+                        text_input("Folder name", name)
+                            .id(text_input::Id::new(RENAME_FOLDER_INPUT_ID))
+                            .on_input(Message::RenameFolderInputChanged)
+                            .on_submit(Message::SubmitRenameFolder)
+                            .size(13)
+                            .padding([3, 6])
+                            .width(Length::Fill),
+                        Message::CancelRenameFolder,
+                    )
+                    .into()
+                } else {
+                    button(
                     row![
                         text(format!("📁 {}", folder.name)).size(13).width(Length::Fill),
                         if !unread_badge.is_empty() {
@@ -976,17 +1767,13 @@ impl RssApp {
                 } else {
                     button::text
                 })
-                .on_press(Message::SelectFilter(ActiveFilter::Folder(folder.id)));
-
-                let delete_fld_btn = button(text("×").size(12))
-                    .padding([2, 5])
-                    .style(button::text)
-                    .on_press(Message::DeleteFolder(folder.id));
+                .on_press(Message::SelectFilter(ActiveFilter::Folder(folder.id)))
+                .into()
+                };
 
                 let folder_header_row = row![
                     Element::from(toggle_btn),
-                    Element::from(folder_btn),
-                    Element::from(delete_fld_btn),
+                    folder_btn,
                 ]
                 .spacing(2)
                 .align_y(Alignment::Center);
@@ -1004,7 +1791,20 @@ impl RssApp {
                         .interaction(mouse::Interaction::Grabbing);
                 }
 
-                tree_items = tree_items.push(folder_drop_area);
+                let menu = self
+                    .folder_menu
+                    .filter(|m| m.folder_id == folder.id && !is_dragging)
+                    .map(|m| self.folder_menu_view(folder, m.confirm_delete));
+
+                let mut header_with_menu = context_menu(folder_drop_area)
+                    .menu(menu)
+                    .on_dismiss(Message::CloseFolderMenu);
+                if !is_dragging {
+                    header_with_menu =
+                        header_with_menu.on_right_press(Message::OpenFolderMenu(folder.id));
+                }
+
+                tree_items = tree_items.push(header_with_menu);
             }
 
             // Nested Feeds under this folder
@@ -1099,7 +1899,6 @@ impl RssApp {
             column![
                 title_bar,
                 horizontal_rule(1),
-                add_feed_row,
                 refresh_btn,
                 horizontal_rule(1),
                 categories,
@@ -1354,10 +2153,6 @@ impl RssApp {
                         .padding([4, 10])
                         .style(button::secondary)
                         .on_press(Message::ToggleStar(art.id)),
-                    button(text("⇄ Move Feed").size(12))
-                        .padding([4, 10])
-                        .style(button::secondary)
-                        .on_press(Message::StartMovingFeed(art.feed_id)),
                 ]
                 .spacing(8);
 
@@ -1484,4 +2279,111 @@ fn drop_zone_style(
             ..Default::default()
         }
     }
+}
+
+/// The floating card that holds a right-click menu.
+fn menu_card<'a>(body: impl Into<Element<'a, Message>>, width: f32) -> Element<'a, Message> {
+    container(body)
+        .width(Length::Fixed(width))
+        .padding(4)
+        .style(|theme: &Theme| {
+            let palette = theme.extended_palette();
+            container::Style {
+                background: Some(palette.background.base.color.into()),
+                border: iced::Border {
+                    color: palette.background.strong.color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                    offset: Vector::new(0.0, 3.0),
+                    blur_radius: 10.0,
+                },
+                ..Default::default()
+            }
+        })
+        .into()
+}
+
+/// A dialog card over a dimmed backdrop that blocks the app behind it.
+/// Esc publishes `on_cancel`.
+fn modal<'a>(form: impl Into<Element<'a, Message>>, on_cancel: Message) -> Element<'a, Message> {
+    let card = container(form)
+        .width(Length::Fixed(440.0))
+        .padding(18)
+        .style(|theme: &Theme| {
+            let palette = theme.extended_palette();
+            container::Style {
+                background: Some(palette.background.base.color.into()),
+                border: iced::Border {
+                    color: palette.background.strong.color,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                    offset: Vector::new(0.0, 6.0),
+                    blur_radius: 24.0,
+                },
+                ..Default::default()
+            }
+        });
+
+    // The backdrop swallows clicks so nothing underneath reacts while the dialog
+    // is open. It deliberately doesn't cancel: `stack` passes clicks on blank
+    // parts of the card down to this layer, and a stray click shouldn't throw
+    // away edits. Cancel / Esc close the dialog.
+    let backdrop = mouse_area(
+        container(Space::new(Length::Fill, Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.45).into()),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::Noop)
+    .on_right_press(Message::Noop)
+    .on_middle_press(Message::Noop)
+    .interaction(mouse::Interaction::Idle);
+
+    // on_escape: a focused text field would otherwise swallow Esc
+    on_escape(stack![
+        backdrop,
+        // Anchored near the top rather than vertically centered, so when an
+        // error line appears the card grows downward and the fields and
+        // buttons stay where they are.
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .padding(iced::Padding::ZERO.top(140)),
+    ], on_cancel)
+    .into()
+}
+
+fn uncategorized_choice() -> FolderChoice {
+    FolderChoice { id: None, name: "Uncategorized".to_string() }
+}
+
+/// Turns typed input into a feed URL: adds https:// when no scheme was typed,
+/// and accepts only http(s) URLs with a host.
+fn normalize_feed_url(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() || input.contains(char::is_whitespace) {
+        return None;
+    }
+    let candidate = if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{}", input)
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    let host = parsed.host_str()?;
+    // "https://foo" alone is almost certainly still being typed
+    if !matches!(parsed.scheme(), "http" | "https") || !(host.contains('.') || host == "localhost") {
+        return None;
+    }
+    Some(candidate)
 }

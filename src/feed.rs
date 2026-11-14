@@ -9,6 +9,13 @@ use url::Url;
 use crate::db::Database;
 use crate::models::{FeedSyncSummary, IngestionResult};
 
+/// What `FeedFetcher::preview` found at a URL.
+#[derive(Debug, Clone)]
+pub struct FeedPreview {
+    pub title: Option<String>,
+    pub story_count: usize,
+}
+
 pub struct FeedFetcher {
     client: reqwest::Client,
 }
@@ -187,6 +194,46 @@ impl FeedFetcher {
             articles_updated: updated,
             articles_unchanged: unchanged,
             error: None,
+        })
+    }
+
+    /// Downloads and parses `url` without storing anything, so the Add Feed
+    /// dialog can show the feed's title before subscribing.
+    pub async fn preview(&self, url: &str) -> Result<FeedPreview, String> {
+        let resp = self
+            .client
+            .get(url)
+            .header(USER_AGENT, "RSSReader/0.1 (Linux; Rust; +https://github.com/system76/rss_reader)")
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "The site took too long to respond.".to_string()
+                } else {
+                    "Couldn't reach that address.".to_string()
+                }
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("The site answered with HTTP {}.", status.as_u16()));
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|_| "The download was interrupted.".to_string())?;
+        let parsed = feed_rs::parser::parse(&bytes[..])
+            .map_err(|_| "That address isn't an RSS or Atom feed.".to_string())?;
+
+        let title = parsed
+            .title
+            .map(|t| t.content.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|t| !t.is_empty());
+
+        Ok(FeedPreview {
+            title,
+            story_count: parsed.entries.len(),
         })
     }
 

@@ -224,10 +224,18 @@ impl Database {
     }
 
     pub fn delete_folder(&self, folder_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // Its feeds land in Uncategorized: forget their order in this folder so
+        // they slot in alphabetically after any feeds arranged there by hand.
+        tx.execute(
+            "UPDATE feeds SET sort_order = NULL WHERE folder_id = ?1",
+            params![folder_id],
+        )?;
         // Deleting the folder automatically unlinks feeds (folder_id becomes NULL),
         // preserving all feeds and archived stories.
-        conn.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+        tx.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -430,6 +438,34 @@ impl Database {
         }).optional()?;
 
         Ok(result)
+    }
+
+    /// Sets a custom display name. Sync keeps it, since it only replaces titles
+    /// that are empty or equal to the feed URL.
+    pub fn rename_feed(&self, feed_id: i64, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE feeds SET title = ?1 WHERE id = ?2", params![title, feed_id])?;
+        Ok(())
+    }
+
+    /// Updates a feed's name and URL. When the URL changes, the HTTP caching
+    /// headers are cleared so the next refresh does a full fetch of the new URL.
+    /// Archived stories stay attached to the feed either way.
+    pub fn update_feed_details(&self, feed_id: i64, title: &str, url: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE feeds
+            SET title = ?1,
+                etag            = CASE WHEN url = ?2 THEN etag ELSE NULL END,
+                last_modified   = CASE WHEN url = ?2 THEN last_modified ELSE NULL END,
+                last_fetched_at = CASE WHEN url = ?2 THEN last_fetched_at ELSE NULL END,
+                url = ?2
+            WHERE id = ?3
+            "#,
+            params![title, url, feed_id],
+        )?;
+        Ok(())
     }
 
     pub fn delete_feed(&self, feed_id: i64) -> Result<()> {
