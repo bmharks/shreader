@@ -4,13 +4,15 @@
 //! remembers where the click happened. When the app then passes a `menu`
 //! element (it decides which row's menu is open), the menu is shown as a
 //! floating overlay at that point, so it never shifts the layout.
-//! Clicking outside the menu publishes `on_dismiss`.
+//! Clicking outside the menu publishes `on_dismiss`; Esc publishes `on_escape`
+//! (or `on_dismiss` if none is set).
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::{self, tree, Tree, Widget};
 use iced::advanced::{Clipboard, Shell};
+use iced::keyboard::{self, key};
 use iced::{event, mouse, Element, Event, Length, Point, Rectangle, Size, Vector};
 
 pub struct ContextMenu<'a, Message, Theme, Renderer> {
@@ -18,6 +20,7 @@ pub struct ContextMenu<'a, Message, Theme, Renderer> {
     menu: Option<Element<'a, Message, Theme, Renderer>>,
     on_right_press: Option<Message>,
     on_dismiss: Option<Message>,
+    on_escape: Option<Message>,
 }
 
 pub fn context_menu<'a, Message, Theme, Renderer>(
@@ -28,6 +31,7 @@ pub fn context_menu<'a, Message, Theme, Renderer>(
         menu: None,
         on_right_press: None,
         on_dismiss: None,
+        on_escape: None,
     }
 }
 
@@ -45,6 +49,13 @@ impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer> {
 
     pub fn on_dismiss(mut self, message: Message) -> Self {
         self.on_dismiss = Some(message);
+        self
+    }
+
+    /// Message for Esc while the menu is open (e.g. "go back a page").
+    /// Defaults to `on_dismiss`.
+    pub fn on_escape(mut self, message: Message) -> Self {
+        self.on_escape = Some(message);
         self
     }
 }
@@ -204,6 +215,7 @@ where
                     // coordinates to window coordinates
                     position: position + translation,
                     on_dismiss: self.on_dismiss.clone(),
+                    on_escape: self.on_escape.clone().or_else(|| self.on_dismiss.clone()),
                 })))
             }
             _ => self.content.as_widget_mut().overlay(
@@ -221,6 +233,7 @@ struct MenuOverlay<'a, 'b, Message, Theme, Renderer> {
     tree: &'a mut Tree,
     position: Point,
     on_dismiss: Option<Message>,
+    on_escape: Option<Message>,
 }
 
 impl<'a, 'b, Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
@@ -291,9 +304,21 @@ where
             return status;
         }
 
+        // Esc is handled here rather than by an app-level key subscription:
+        // overlays see events before the widgets underneath, so a focused text
+        // field (e.g. the search box) can't swallow the Esc first.
+        if let Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key::Named::Escape),
+            ..
+        }) = event
+        {
+            if let Some(message) = &self.on_escape {
+                shell.publish(message.clone());
+                return event::Status::Captured;
+            }
+        }
+
         let Event::Mouse(mouse_event) = event else {
-            // Leave keyboard events alone so app-level shortcuts (Esc to close) still
-            // see them: iced's key subscriptions skip events marked as captured.
             return event::Status::Ignored;
         };
 

@@ -76,6 +76,8 @@ pub struct RssApp {
     editing_feed: Option<EditFeedDialog>,
 
     add_feed: Option<AddFeedDialog>,
+    /// Story whose right-click menu is open
+    article_menu: Option<i64>,
     article_list_width: f32,
 
     // Folder context menu (right click) and in-place rename
@@ -219,6 +221,12 @@ pub enum Message {
     SubmitRenameFolder,
     CancelRenameFolder,
 
+    // Story context menu
+    OpenArticleMenu(i64),
+    CloseArticleMenu,
+    SetArticleRead(i64, bool),
+    OpenArticleInBrowser(String),
+
     // Read state & refresh for one feed or folder (context menus)
     SetFeedRead(i64, bool),
     SetFolderRead(i64, bool),
@@ -290,6 +298,7 @@ impl RssApp {
             renaming_feed: None,
             editing_feed: None,
             add_feed: None,
+            article_menu: None,
             article_list_width: ARTICLE_LIST_DEFAULT_WIDTH,
             folder_menu: None,
             renaming_folder: None,
@@ -336,24 +345,12 @@ impl RssApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // Drag release is reported by the floating badge widget (follow_cursor.rs)
-        // rather than a global event listener, which would also be fed every
-        // mouse move and can overflow its channel ("TrySendError { kind: Full }").
-        //
-        // Esc closes the feed context menu. Key presses are low-volume, so this
-        // listener is cheap; it's only active while the menu is open. (Esc in the
-        // rename field and Edit dialog is handled by `on_escape` wrappers, because
-        // a focused text input swallows Esc before subscriptions see it.)
-        if self.feed_menu.is_some() || self.folder_menu.is_some() {
-            iced::keyboard::on_key_press(|key, _modifiers| match key {
-                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => {
-                    Some(Message::EscapePressed)
-                }
-                _ => None,
-            })
-        } else {
-            Subscription::none()
-        }
+        // No global event listeners: they're fed every mouse move and can overflow
+        // their channel ("TrySendError { kind: Full }"). Drag release comes from
+        // the floating badge (follow_cursor.rs); Esc for context menus from the
+        // menu overlay (context_menu.rs), and for the rename fields and dialogs
+        // from `on_escape` wrappers.
+        Subscription::none()
     }
 
     fn reload_data(&mut self) {
@@ -468,6 +465,7 @@ impl RssApp {
             Message::OpenAddFeed => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.article_menu = None;
                 let folder_id = self.default_new_feed_folder();
                 self.add_feed = Some(AddFeedDialog {
                     url: String::new(),
@@ -645,6 +643,28 @@ impl RssApp {
                 }
                 Task::none()
             }
+            Message::OpenArticleMenu(article_id) => {
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = Some(article_id);
+                Task::none()
+            }
+            Message::CloseArticleMenu => {
+                self.article_menu = None;
+                Task::none()
+            }
+            Message::SetArticleRead(article_id, is_read) => {
+                self.article_menu = None;
+                if let Err(e) = self.db.set_article_read(article_id, is_read) {
+                    self.status_message = Some((format!("Failed to update story: {}", e), true));
+                }
+                self.reload_data();
+                Task::none()
+            }
+            Message::OpenArticleInBrowser(url) => {
+                self.article_menu = None;
+                Task::done(Message::OpenUrl(url))
+            }
             Message::SetFeedRead(feed_id, is_read) => {
                 self.feed_menu = None;
                 if let Err(e) = self.db.set_articles_read_state(Some(feed_id), None, is_read) {
@@ -764,6 +784,7 @@ impl RssApp {
             }
             Message::OpenFeedMenu(feed_id) => {
                 self.folder_menu = None;
+                self.article_menu = None;
                 self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::Main });
                 Task::none()
             }
@@ -1000,6 +1021,7 @@ impl RssApp {
             }
             Message::OpenFolderMenu(folder_id) => {
                 self.feed_menu = None;
+                self.article_menu = None;
                 self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false });
                 Task::none()
             }
@@ -1066,6 +1088,7 @@ impl RssApp {
             Message::DragFeedStarted(feed_id) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.article_menu = None;
                 self.dragging_feed = Some(feed_id);
                 self.drag_hover_target = None;
                 // No status banner here: showing one would push the whole layout down
@@ -1394,7 +1417,8 @@ impl RssApp {
 
         let mut row_with_menu = context_menu(drop_area)
             .menu(menu)
-            .on_dismiss(Message::CloseFeedMenu);
+            .on_dismiss(Message::CloseFeedMenu)
+            .on_escape(Message::EscapePressed);
         if !is_dragging {
             row_with_menu = row_with_menu.on_right_press(Message::OpenFeedMenu(feed.id));
         }
@@ -2014,7 +2038,8 @@ impl RssApp {
 
                 let mut header_with_menu = context_menu(folder_drop_area)
                     .menu(menu)
-                    .on_dismiss(Message::CloseFolderMenu);
+                    .on_dismiss(Message::CloseFolderMenu)
+                    .on_escape(Message::EscapePressed);
                 if !is_dragging {
                     header_with_menu =
                         header_with_menu.on_right_press(Message::OpenFolderMenu(folder.id));
@@ -2283,7 +2308,13 @@ impl RssApp {
                     })
                     .on_press(Message::SelectArticle(article.id));
 
-                article_items = article_items.push(item_btn);
+                let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
+                article_items = article_items.push(
+                    context_menu(item_btn)
+                        .menu(menu)
+                        .on_right_press(Message::OpenArticleMenu(article.id))
+                        .on_dismiss(Message::CloseArticleMenu),
+                );
             }
 
             let remaining = self.articles.len().saturating_sub(self.article_render_limit);
@@ -2697,4 +2728,33 @@ fn gutter<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> 
     container(content)
         .padding(iced::Padding::ZERO.right(READER_SCROLLBAR_GUTTER))
         .into()
+}
+
+/// Contents of a story's right-click menu. Items that wouldn't change anything
+/// (or have nothing to open) are shown disabled.
+fn article_menu_view(article: &Article) -> Element<'_, Message> {
+    let menu_item = |label: &'static str, message: Option<Message>| {
+        button(text(label).size(13))
+            .width(Length::Fill)
+            .padding([5, 10])
+            .style(button::text)
+            .on_press_maybe(message)
+    };
+    let body = column![
+        menu_item(
+            "Mark read",
+            (!article.is_read).then_some(Message::SetArticleRead(article.id, true)),
+        ),
+        menu_item(
+            "Mark unread",
+            article.is_read.then_some(Message::SetArticleRead(article.id, false)),
+        ),
+        horizontal_rule(1),
+        menu_item(
+            "Open in browser",
+            article.url.clone().map(Message::OpenArticleInBrowser),
+        ),
+    ]
+    .spacing(2);
+    menu_card(body, 170.0)
 }
