@@ -3,6 +3,7 @@ pub mod context_menu;
 pub mod db;
 pub mod feed;
 pub mod follow_cursor;
+pub mod key_press;
 pub mod lazy_load;
 pub mod icons;
 pub mod models;

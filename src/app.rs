@@ -14,6 +14,7 @@ use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
 use crate::story_content::{self, Block};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
+use crate::key_press::{on_key_press, scroll_into_view};
 use crate::lazy_load::on_visible;
 use crate::icons::{icon, Icon, Tint};
 use crate::spinner::spinner;
@@ -226,6 +227,9 @@ enum InsertEdge {
 pub enum Message {
     SelectFilter(ActiveFilter),
     SelectArticle(i64),
+    /// Left/Right arrow: open the previous (`false`) or next (`true`) story
+    /// in the list
+    SelectAdjacentStory(bool),
     FeedAdded(Result<(i64, String), String>),
     RefreshClicked,
     SyncFinished(Result<Vec<FeedSyncSummary>, String>),
@@ -546,6 +550,41 @@ impl RssApp {
                 } else {
                     Task::none()
                 }
+            }
+            Message::SelectAdjacentStory(forward) => {
+                // Not while a dialog or rename field is up: the arrows belong there
+                if self.settings.is_some()
+                    || self.add_feed.is_some()
+                    || self.editing_feed.is_some()
+                    || self.renaming_feed.is_some()
+                    || self.renaming_folder.is_some()
+                    || self.articles.is_empty()
+                {
+                    return Task::none();
+                }
+                let current = self
+                    .selected_article_id
+                    .and_then(|id| self.articles.iter().position(|a| a.id == id));
+                let target = match (current, forward) {
+                    // Nothing open yet: either arrow starts at the top
+                    (None, _) => 0,
+                    (Some(i), true) if i + 1 < self.articles.len() => i + 1,
+                    (Some(i), false) if i > 0 => i - 1,
+                    _ => return Task::none(), // already at the end
+                };
+                // Stepping past the rendered part of the list renders more
+                if target >= self.article_render_limit {
+                    self.article_render_limit = target + 1 + ARTICLE_PAGE_SIZE;
+                }
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = None;
+                let id = self.articles[target].id;
+                let select = self.update(Message::SelectArticle(id));
+                Task::batch([
+                    select,
+                    scroll_into_view(article_list_scroll_id(), selected_story_id()),
+                ])
             }
             Message::LoadStoryImage(url) => {
                 if self.story_images.contains_key(&url) {
@@ -1678,6 +1717,14 @@ impl RssApp {
     ) -> Element<'a, Message> {
         let editor = text_editor(content)
             .on_action(move |action| Message::ReaderTextAction(index, action))
+            // Plain Left/Right switch stories even after clicking into the
+            // text (Shift+arrows still extend a selection)
+            .key_binding(|key_press| match key_press.key.as_ref() {
+                iced::keyboard::Key::Named(
+                    iced::keyboard::key::Named::ArrowLeft | iced::keyboard::key::Named::ArrowRight,
+                ) if key_press.modifiers.is_empty() => None,
+                _ => text_editor::Binding::from_key_press(key_press),
+            })
             .size(14)
             .padding(0)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
@@ -2475,6 +2522,20 @@ impl RssApp {
         .width(Length::Fill)
         .height(Length::Fill);
 
+        // Left/Right arrows step through the story list. Only keys nothing
+        // else used: a focused search or rename field keeps its arrows.
+        let content = on_key_press(content, |key, modifiers| {
+            use iced::keyboard::key::Named;
+            if !modifiers.is_empty() {
+                return None;
+            }
+            match key.as_ref() {
+                iced::keyboard::Key::Named(Named::ArrowLeft) => Some(Message::SelectAdjacentStory(false)),
+                iced::keyboard::Key::Named(Named::ArrowRight) => Some(Message::SelectAdjacentStory(true)),
+                _ => None,
+            }
+        });
+
         let mut layers: Vec<Element<'_, Message>> = vec![content.into()];
 
         // Status messages float as a toast over the bottom-right corner instead of
@@ -3039,12 +3100,17 @@ impl RssApp {
                     .on_press(Message::SelectArticle(article.id));
 
                 let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
-                article_items = article_items.push(
+                let mut card = container(
                     context_menu(item_btn)
                         .menu(menu)
                         .on_right_press(Message::OpenArticleMenu(article.id))
                         .on_dismiss(Message::CloseArticleMenu),
                 );
+                // So the arrow keys can scroll the open story into view
+                if is_selected {
+                    card = card.id(selected_story_id());
+                }
+                article_items = article_items.push(card);
             }
 
             let remaining = self.articles.len().saturating_sub(self.article_render_limit);
@@ -3070,7 +3136,10 @@ impl RssApp {
 
         // Room for the scrollbar, so it doesn't cover the cards' right outline
         let article_items = article_items.padding(iced::Padding { right: 12.0, ..iced::Padding::ZERO });
-        let scroll_list = scrollable(article_items).width(Length::Fill).height(Length::Fill);
+        let scroll_list = scrollable(article_items)
+            .id(article_list_scroll_id())
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         container(
             column![search_box, header_row, horizontal_rule(1), scroll_list]
@@ -3539,4 +3608,14 @@ fn story_card(theme: &Theme, status: button::Status, selected: bool) -> button::
         },
         ..button::Style::default()
     }
+}
+
+/// The story list's scrollable.
+fn article_list_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("article-list")
+}
+
+/// The open story's card in the list.
+fn selected_story_id() -> container::Id {
+    container::Id::new("selected-story")
 }
