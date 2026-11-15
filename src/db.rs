@@ -66,6 +66,19 @@ impl Database {
         &self.db_path
     }
 
+    /// Space the archive takes on disk, in bytes: the database file plus its
+    /// write-ahead log (recent changes not yet merged into the file). Story
+    /// images aren't stored, so this is everything. 0 for an in-memory database.
+    pub fn disk_size(&self) -> u64 {
+        let mut wal = self.db_path.clone().into_os_string();
+        wal.push("-wal");
+        [self.db_path.as_os_str(), wal.as_os_str()]
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .sum()
+    }
+
     pub fn default_db_path() -> Result<PathBuf> {
         let proj = ProjectDirs::from("org", "rss_reader", "rss_reader")
             .context("Could not determine user XDG data directory")?;

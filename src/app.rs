@@ -2350,6 +2350,15 @@ impl RssApp {
             );
         }
 
+        // Archive size, read fresh on each redraw: two file-size lookups, so
+        // it's current after a refresh or a clear without any bookkeeping
+        let archive_size = text(format!(
+            "Archive size: {} · {}",
+            format_size(self.db.disk_size()),
+            plural(self.stats.1, "story", "stories"),
+        ))
+        .size(12);
+
         // Clear archived stories
         let clear_section: Element<'a, Message> = if let Some((to_delete, starred)) = settings.confirm_clear {
             let mut details = String::new();
@@ -2383,6 +2392,7 @@ impl RssApp {
                         text("Delete stored stories. Your feeds and folders are kept.")
                             .size(12)
                             .style(text::secondary),
+                        archive_size,
                     ]
                     .spacing(2)
                     .width(Length::Fill),
@@ -3847,7 +3857,16 @@ fn selected_story_id() -> container::Id {
 
 #[cfg(test)]
 mod tests {
-    use super::RefreshInterval;
+    use super::{format_size, RefreshInterval};
+
+    #[test]
+    fn size_labels() {
+        assert_eq!(format_size(0), "1 KB");
+        assert_eq!(format_size(86 * 1024), "86 KB");
+        assert_eq!(format_size(4_404_019), "4.2 MB");
+        assert_eq!(format_size(60_659_000), "58 MB");
+        assert_eq!(format_size(1_395_864_371), "1.3 GB");
+    }
 
     #[test]
     fn refresh_interval_labels() {
@@ -3859,5 +3878,22 @@ mod tests {
         assert_eq!(label(720), "12 hours");
         assert_eq!(label(1440), "1 day");
         assert_eq!(label(2880), "2 days");
+    }
+}
+
+/// A byte count for people: "850 KB", "4.2 MB", "58 MB", "1.3 GB".
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= 10.0 * MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.0} KB", (b / KB).max(1.0))
     }
 }
