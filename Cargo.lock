@@ -549,7 +549,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -3764,10 +3763,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rusqlite",
- "serde",
- "serde_json",
  "sha2",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",

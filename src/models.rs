@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Folder {
     pub id: i64,
     pub name: String,
@@ -10,7 +9,7 @@ pub struct Folder {
     pub total_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Feed {
     pub id: i64,
     pub folder_id: Option<i64>,
@@ -26,7 +25,7 @@ pub struct Feed {
     pub total_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Article {
     pub id: i64,
     pub feed_id: i64,
@@ -66,7 +65,6 @@ pub enum IngestionResult {
 
 #[derive(Debug, Clone)]
 pub struct FeedSyncSummary {
-    pub feed_id: i64,
     pub feed_title: String,
     pub articles_inserted: usize,
     pub articles_updated: usize,

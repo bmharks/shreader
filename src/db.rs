@@ -52,6 +52,7 @@ impl Database {
     }
 
     /// Creates an in-memory database for testing.
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let db = Self {
@@ -834,12 +835,6 @@ impl Database {
             |row| Ok(row.get::<_, i64>(0)? != 0),
         )?;
         Ok(new_val)
-    }
-
-    pub fn delete_article(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM articles WHERE id = ?1", params![id])?;
-        Ok(())
     }
 
     pub fn get_total_stats(&self) -> Result<(i64, i64, i64)> {

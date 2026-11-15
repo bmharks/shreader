@@ -383,14 +383,9 @@ pub enum Message {
 
 impl RssApp {
     pub fn new() -> (Self, Task<Message>) {
-        let db = match Database::open_default() {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("Failed to open default XDG database: {}. Falling back to ./rss_reader.db", e);
-                Database::open(std::path::Path::new("rss_reader.db"))
-                    .expect("Failed to initialize SQLite database")
-            }
-        };
+        // `open_default` already falls back to ./rss_reader.db; if even that
+        // fails there's no archive to show
+        let db = Database::open_default().expect("Failed to open the SQLite database");
 
         let fetcher = Arc::new(FeedFetcher::new());
 

@@ -99,7 +99,6 @@ impl FeedFetcher {
             Ok(resp) => resp,
             Err(e) => {
                 return Ok(FeedSyncSummary {
-                    feed_id,
                     feed_title: feed.title.clone(),
                     articles_inserted: 0,
                     articles_updated: 0,
@@ -115,7 +114,6 @@ impl FeedFetcher {
         if status == StatusCode::NOT_MODIFIED {
             db.update_feed_http_meta(feed_id, feed.etag.as_deref(), feed.last_modified.as_deref(), Utc::now())?;
             return Ok(FeedSyncSummary {
-                feed_id,
                 feed_title: feed.title,
                 articles_inserted: 0,
                 articles_updated: 0,
@@ -126,7 +124,6 @@ impl FeedFetcher {
 
         if !status.is_success() {
             return Ok(FeedSyncSummary {
-                feed_id,
                 feed_title: feed.title.clone(),
                 articles_inserted: 0,
                 articles_updated: 0,
@@ -146,7 +143,6 @@ impl FeedFetcher {
             Ok(f) => f,
             Err(e) => {
                 return Ok(FeedSyncSummary {
-                    feed_id,
                     feed_title: feed.title.clone(),
                     articles_inserted: 0,
                     articles_updated: 0,
@@ -228,7 +224,6 @@ impl FeedFetcher {
         }
 
         Ok(FeedSyncSummary {
-            feed_id,
             feed_title,
             articles_inserted: inserted,
             articles_updated: updated,
