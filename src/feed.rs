@@ -1,6 +1,6 @@
 use std::time::Duration;
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::StatusCode;
@@ -82,6 +82,26 @@ async fn read_limited(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Parses a feed document.
+///
+/// An entry without an id gets one from feed-rs's usual link-and-title
+/// scheme, so stories already stored keep matching. With no link either,
+/// feed-rs would invent a random id on every download, making the same story
+/// look new on each refresh; such entries are left without an id, and
+/// `generate_guid_hash` identifies them by title and date instead.
+fn parse_feed(bytes: &[u8]) -> feed_rs::parser::ParseFeedResult<feed_rs::model::Feed> {
+    feed_rs::parser::Builder::new()
+        .id_generator(|links, title, uri| {
+            if links.is_empty() {
+                String::new()
+            } else {
+                feed_rs::parser::generate_id(links, title, uri)
+            }
+        })
+        .build()
+        .parse(bytes)
 }
 
 /// What `FeedFetcher::preview` found at a URL.
@@ -213,7 +233,7 @@ impl FeedFetcher {
         };
 
         // Parse feed using feed-rs
-        let parsed_feed = match feed_rs::parser::parse(&bytes[..]) {
+        let parsed_feed = match parse_feed(&bytes) {
             Ok(f) => f,
             Err(e) => {
                 return Ok(FeedSyncSummary {
@@ -268,7 +288,8 @@ impl FeedFetcher {
             };
 
             // Generate canonical deduplication hash to guarantee no stories are lost or duplicated
-            let guid_hash = generate_guid_hash(feed_id, guid.as_deref(), link.as_deref(), &title);
+            let guid_hash =
+                generate_guid_hash(feed_id, guid.as_deref(), link.as_deref(), &title, entry.published);
 
             let author = if !entry.authors.is_empty() {
                 Some(entry.authors.into_iter().map(|a| a.name).collect::<Vec<_>>().join(", "))
@@ -350,7 +371,7 @@ impl FeedFetcher {
                 "The download was interrupted.".to_string()
             }
         })?;
-        let parsed = feed_rs::parser::parse(&bytes[..])
+        let parsed = parse_feed(&bytes)
             .map_err(|_| "That address isn't an RSS or Atom feed.".to_string())?;
 
         let title = parsed
@@ -440,11 +461,14 @@ pub fn clean_tracking_params(raw_url: &str) -> String {
 /// Derives a deterministic canonical hash for an article.
 /// Fallback order ensures an article has a stable identifier even if
 /// the publisher doesn't supply a GUID, or changes URLs, or vice versa.
+/// With neither, the title and publication date identify it (the date
+/// keeps apart recurring titles like "Weekly update").
 pub fn generate_guid_hash(
     feed_id: i64,
     guid: Option<&str>,
     link: Option<&str>,
     title: &str,
+    published: Option<DateTime<Utc>>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(feed_id.to_le_bytes());
@@ -458,6 +482,10 @@ pub fn generate_guid_hash(
     } else {
         hasher.update(b"title:");
         hasher.update(title.trim().as_bytes());
+        if let Some(published) = published {
+            hasher.update(b"\npublished:");
+            hasher.update(published.to_rfc3339().as_bytes());
+        }
     }
 
     hex::encode(hasher.finalize())
@@ -479,13 +507,48 @@ mod tests {
 
     #[test]
     fn test_guid_hash_stability() {
-        let hash1 = generate_guid_hash(1, Some("guid-123"), Some("https://example.com"), "Title");
-        let hash2 = generate_guid_hash(1, Some("guid-123"), Some("https://different-link.com"), "Title 2");
+        let hash1 = generate_guid_hash(1, Some("guid-123"), Some("https://example.com"), "Title", None);
+        let hash2 = generate_guid_hash(1, Some("guid-123"), Some("https://different-link.com"), "Title 2", None);
         assert_eq!(hash1, hash2, "Same GUID should produce identical hash regardless of link");
 
-        let hash_link1 = generate_guid_hash(1, None, Some("https://example.com/post?utm_source=rss"), "Title");
-        let hash_link2 = generate_guid_hash(1, None, Some("https://example.com/post"), "Title");
+        let hash_link1 = generate_guid_hash(1, None, Some("https://example.com/post?utm_source=rss"), "Title", None);
+        let hash_link2 = generate_guid_hash(1, None, Some("https://example.com/post"), "Title", None);
         assert_eq!(hash_link1, hash_link2, "Same clean URL should produce identical hash");
+    }
+
+    /// Entries with no id and no link keep the same identity across
+    /// downloads (feed-rs alone gives them a new random id each time), and
+    /// entries with a link keep the id feed-rs has always given them.
+    #[test]
+    fn entries_without_id_or_link_keep_their_identity() {
+        let feed = br#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>
+            <item><title>No link</title><description>a</description><pubDate>Mon, 02 Nov 2026 10:00:00 GMT</pubDate></item>
+            <item><title>No link</title><description>b</description><pubDate>Mon, 09 Nov 2026 10:00:00 GMT</pubDate></item>
+            <item><title>Linked</title><link>https://example.com/a</link></item>
+            </channel></rss>"#;
+        let ids = |feed: &feed_rs::model::Feed| -> Vec<String> {
+            feed.entries
+                .iter()
+                .map(|e| {
+                    let guid = Some(e.id.as_str()).filter(|id| !id.is_empty());
+                    let link = e.links.first().map(|l| l.href.as_str());
+                    let title = e.title.as_ref().map(|t| t.content.as_str()).unwrap_or("");
+                    generate_guid_hash(1, guid, link, title, e.published)
+                })
+                .collect()
+        };
+        let first = parse_feed(feed).unwrap();
+        let second = parse_feed(feed).unwrap();
+        assert_eq!(ids(&first), ids(&second));
+        // Same title, different dates: two stories
+        assert_ne!(ids(&first)[0], ids(&first)[1]);
+        // Linked entries: unchanged from feed-rs's default id
+        assert_eq!(first.entries[2].id, feed_rs::parser::parse(&feed[..]).unwrap().entries[2].id);
+        // And the default really is random for unlinked entries
+        assert_ne!(
+            feed_rs::parser::parse(&feed[..]).unwrap().entries[0].id,
+            feed_rs::parser::parse(&feed[..]).unwrap().entries[0].id
+        );
     }
 
     /// A tiny HTTP server for tests. Paths:

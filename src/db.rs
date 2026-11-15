@@ -7,6 +7,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{Article, ArticleFilter, Feed, Folder, IngestionResult};
 
+/// How long a query waits for another connection's lock before failing.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -15,21 +18,17 @@ pub struct Database {
 
 impl Database {
     /// Opens or creates the SQLite database at standard Linux XDG path
-    /// (~/.local/share/rss_reader/rss_reader.db).
+    /// (~/.local/share/rss_reader/rss_reader.db), or at `$RSS_READER_DB`.
+    ///
+    /// There's deliberately no fallback location: opening an empty database
+    /// elsewhere would look like the archive was lost, and anything added
+    /// would land in the wrong file.
     pub fn open_default() -> Result<Self> {
-        if let Ok(env_path) = std::env::var("RSS_READER_DB") {
-            let path = PathBuf::from(env_path);
-            return Self::open(&path);
-        }
-
-        if let Ok(path) = Self::default_db_path() {
-            if let Ok(db) = Self::open(&path) {
-                return Ok(db);
-            }
-        }
-
-        // Fallback to local directory when XDG directory is not writable
-        Self::open(Path::new("rss_reader.db"))
+        let path = match std::env::var_os("RSS_READER_DB") {
+            Some(env_path) => PathBuf::from(env_path),
+            None => Self::default_db_path()?,
+        };
+        Self::open(&path)
     }
 
     /// Opens or creates the SQLite database at a specific path.
@@ -41,13 +40,18 @@ impl Database {
 
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open SQLite database at {:?}", path))?;
+        // Before anything else: switching to WAL below needs a lock too, and
+        // without a timeout a moment's lock by another copy of the app fails
+        // instantly
+        conn.busy_timeout(BUSY_TIMEOUT)?;
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: path.to_path_buf(),
         };
 
-        db.init_schema()?;
+        db.init_schema()
+            .with_context(|| format!("Failed to set up the SQLite database at {:?}", path))?;
         Ok(db)
     }
 
@@ -96,7 +100,6 @@ impl Database {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
             "#,
         )?;
 
@@ -743,7 +746,10 @@ impl Database {
             }
         }
 
-        query.push_str(" ORDER BY COALESCE(a.published_at, a.fetched_at) DESC");
+        // Newest first by publication date, but a date in the future counts
+        // as the time the story was downloaded (see `Article::shown_date`).
+        // Both are stored as UTC RFC 3339 text, which sorts chronologically.
+        query.push_str(" ORDER BY MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC");
 
         if let Some(limit) = filter.limit {
             query.push_str(&format!(" LIMIT {}", limit));
@@ -1076,6 +1082,32 @@ mod tests {
         };
         assert_eq!(search("haystack"), 1);
         assert_eq!(search("needle"), 0);
+    }
+
+    /// A story dated in the future sorts (and shows) as of when it was
+    /// downloaded, instead of staying above newer stories.
+    #[test]
+    fn future_dated_stories_sort_by_download_time() {
+        let db = Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://f.example/rss", "F", None, None, None).unwrap();
+        let now = Utc::now();
+        let add = |hash: &str, published: DateTime<Utc>| {
+            db.upsert_article(feed, None, hash, hash, None, None, None, None, None, Some(published), None)
+                .unwrap();
+        };
+        add("two hours ago", now - chrono::Duration::hours(2));
+        add("tomorrow", now + chrono::Duration::days(1));
+        add("next week", now + chrono::Duration::days(7));
+        add("one hour ago", now - chrono::Duration::hours(1));
+
+        let articles = db.get_articles(&ArticleFilter::default()).unwrap();
+        let titles: Vec<&str> = articles.iter().map(|a| a.title.as_str()).collect();
+        // Both future stories count as downloaded just now (in download order)
+        assert_eq!(titles[2..], ["one hour ago", "two hours ago"]);
+        assert!(titles[..2].contains(&"tomorrow") && titles[..2].contains(&"next week"));
+        for a in &articles {
+            assert!(a.shown_date().unwrap() <= Utc::now());
+        }
     }
 
     #[test]

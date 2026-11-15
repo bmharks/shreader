@@ -111,7 +111,10 @@ pub struct RssApp {
     search_query: String,
     new_folder_input: String,
     show_new_folder_input: bool,
-    is_syncing: bool,
+    /// Refreshes (and new-feed downloads) in progress. A count, not a flag:
+    /// adding a feed during a full refresh runs both at once, and the first
+    /// to finish mustn't make the app think nothing is running.
+    syncs_running: u32,
     status_message: Option<(String, bool)>,
     /// Bumped whenever a new status message appears; see `STATUS_TIMEOUT`
     status_generation: u64,
@@ -384,11 +387,7 @@ pub enum Message {
 }
 
 impl RssApp {
-    pub fn new() -> (Self, Task<Message>) {
-        // `open_default` already falls back to ./rss_reader.db; if even that
-        // fails there's no archive to show
-        let db = Database::open_default().expect("Failed to open the SQLite database");
-
+    pub fn new(db: Database) -> (Self, Task<Message>) {
         let fetcher = Arc::new(FeedFetcher::new());
 
         let mut app = Self {
@@ -408,7 +407,7 @@ impl RssApp {
             search_query: String::new(),
             new_folder_input: String::new(),
             show_new_folder_input: false,
-            is_syncing: false,
+            syncs_running: 0,
             status_message: None,
             status_generation: 0,
             stats: (0, 0, 0),
@@ -481,7 +480,7 @@ impl RssApp {
         let initial_task = if !app.feeds.is_empty() {
             let db_clone = app.db.clone();
             let fetcher_clone = app.fetcher.clone();
-            app.is_syncing = true;
+            app.syncs_running += 1;
             Task::perform(
                 async move {
                     fetcher_clone
@@ -739,7 +738,7 @@ impl RssApp {
                 Task::none()
             }
             Message::FeedAdded(result) => {
-                self.is_syncing = false;
+                self.syncs_running = self.syncs_running.saturating_sub(1);
                 // Reload either way: on a failed first fetch the feed is still added
                 self.reload_data();
                 match result {
@@ -809,7 +808,7 @@ impl RssApp {
             }
             Message::ClearStories => {
                 // A refresh in progress would immediately add stories back
-                if self.is_syncing {
+                if self.is_syncing() {
                     return Task::none();
                 }
                 let keep_starred = self.settings.as_ref().is_none_or(|s| s.keep_starred);
@@ -829,14 +828,9 @@ impl RssApp {
                         self.status_message = Some((format!("Failed to clear stories: {}", e), true));
                     }
                 }
-                // The open story may be gone
-                self.selected_article_id = None;
-                self.reader_body = None;
-                self.reader_texts.clear();
-                self.story_images.clear();
                 self.article_render_limit = ARTICLE_PAGE_SIZE;
                 self.reload_data();
-                release_memory_soon()
+                self.close_story_if_deleted()
             }
             Message::ImportOpml => {
                 if let Some(settings) = &mut self.settings {
@@ -906,7 +900,7 @@ impl RssApp {
                                 m
                             };
                             if added > 0 {
-                                if self.is_syncing {
+                                if self.is_syncing() {
                                     message += " Their stories will download on the next refresh.";
                                 } else {
                                     message += " Downloading their stories…";
@@ -1117,10 +1111,10 @@ impl RssApp {
                 Task::none()
             }
             Message::RefreshClicked => {
-                if self.is_syncing {
+                if self.is_syncing() {
                     return Task::none();
                 }
-                self.is_syncing = true;
+                self.syncs_running += 1;
                 let db_clone = self.db.clone();
                 let fetcher_clone = self.fetcher.clone();
 
@@ -1152,7 +1146,7 @@ impl RssApp {
                 Task::none()
             }
             Message::SyncFinished(result) => {
-                self.is_syncing = false;
+                self.syncs_running = self.syncs_running.saturating_sub(1);
                 match result {
                     Ok(summaries) => {
                         let total_inserted: usize = summaries.iter().map(|s| s.articles_inserted).sum();
@@ -1270,7 +1264,7 @@ impl RssApp {
                 self.refresh_feeds(name, feed_ids)
             }
             Message::PartialRefreshFinished(name, result) => {
-                self.is_syncing = false;
+                self.syncs_running = self.syncs_running.saturating_sub(1);
                 self.reload_data();
                 self.status_message = Some(match result {
                     Ok(summaries) => {
@@ -1347,7 +1341,7 @@ impl RssApp {
                     self.active_filter = ActiveFilter::All;
                 }
                 self.reload_data();
-                Task::none()
+                self.close_story_if_deleted()
             }
             Message::OpenFeedMenu(feed_id) => {
                 self.folder_menu = None;
@@ -1498,9 +1492,9 @@ impl RssApp {
                 Task::none()
             }
             Message::OpenUrl(url) => {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .spawn();
+                if let Err(e) = open_in_browser(&url) {
+                    self.status_message = Some((e, true));
+                }
                 Task::none()
             }
             Message::ShowMoreArticles => {
@@ -1704,6 +1698,32 @@ impl RssApp {
         }
     }
 
+    /// Closes the open story if it no longer exists (its feed was deleted or
+    /// the archive cleared), rather than leaving it on screen with buttons
+    /// that no longer do anything.
+    fn close_story_if_deleted(&mut self) -> Task<Message> {
+        let Some(id) = self.selected_article_id else {
+            return Task::none();
+        };
+        if matches!(self.db.get_article(id), Ok(Some(_))) {
+            return Task::none();
+        }
+        self.selected_article_id = None;
+        self.reader_body = None;
+        self.reader_texts.clear();
+        self.reader_text_menu = None;
+        if self.article_menu == Some(id) {
+            self.article_menu = None;
+        }
+        self.story_images.clear();
+        release_memory_soon()
+    }
+
+    /// Whether a refresh or a new feed's download is running.
+    fn is_syncing(&self) -> bool {
+        self.syncs_running > 0
+    }
+
     fn finish_drag(&mut self, target: Option<DropTarget>) {
         if let (Some(feed_id), Some(target)) = (self.dragging_feed, target) {
             self.drop_feed(feed_id, target);
@@ -1720,7 +1740,7 @@ impl RssApp {
     /// `FeedAdded`). With no `title`, the URL stands in until the first sync
     /// replaces it with the feed's own title.
     fn subscribe(&mut self, url: String, title: Option<String>, folder_id: Option<i64>) -> Task<Message> {
-        self.is_syncing = true;
+        self.syncs_running += 1;
         let db = self.db.clone();
         let fetcher = self.fetcher.clone();
 
@@ -1745,7 +1765,7 @@ impl RssApp {
     /// `PartialRefreshFinished`. Shares the "syncing" state with Refresh All,
     /// so the two never run at once.
     fn refresh_feeds(&mut self, name: String, feed_ids: Vec<i64>) -> Task<Message> {
-        if self.is_syncing {
+        if self.is_syncing() {
             self.status_message =
                 Some(("A refresh is already running. Try again when it finishes.".to_string(), true));
             return Task::none();
@@ -1753,7 +1773,7 @@ impl RssApp {
         if feed_ids.is_empty() {
             return Task::none();
         }
-        self.is_syncing = true;
+        self.syncs_running += 1;
         let db = self.db.clone();
         let fetcher = self.fetcher.clone();
         Task::perform(
@@ -2394,7 +2414,7 @@ impl RssApp {
                     button(text("Delete stories").size(13))
                         .padding([5, 12])
                         .style(button::danger)
-                        .on_press_maybe((!self.is_syncing && to_delete > 0).then_some(Message::ClearStories)),
+                        .on_press_maybe((!self.is_syncing() && to_delete > 0).then_some(Message::ClearStories)),
                 ]
                 .spacing(8),
             ]
@@ -2415,7 +2435,7 @@ impl RssApp {
                     button(text("Clear…").size(13))
                         .padding([5, 12])
                         .style(button::danger)
-                        .on_press_maybe((!self.is_syncing).then_some(Message::AskClearStories)),
+                        .on_press_maybe((!self.is_syncing()).then_some(Message::AskClearStories)),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -2428,7 +2448,7 @@ impl RssApp {
             .into()
         };
 
-        let note: Element<'a, Message> = if self.is_syncing {
+        let note: Element<'a, Message> = if self.is_syncing() {
             text("Wait for the current refresh to finish before clearing stories.")
                 .size(11)
                 .style(text::secondary)
@@ -2619,7 +2639,7 @@ impl RssApp {
             column![
                 menu_item(
                     "Refresh".to_string(),
-                    (!self.is_syncing).then_some(Message::RefreshFeed(feed.id)),
+                    (!self.is_syncing()).then_some(Message::RefreshFeed(feed.id)),
                 ),
                 menu_item(
                     "Mark as read".to_string(),
@@ -2696,7 +2716,7 @@ impl RssApp {
         let body = column![
             menu_item(
                 "Refresh",
-                (!self.is_syncing && folder.feed_count > 0)
+                (!self.is_syncing() && folder.feed_count > 0)
                     .then_some(Message::RefreshFolder(folder.id)),
             ),
             menu_item(
@@ -2879,7 +2899,7 @@ impl RssApp {
         .align_y(Alignment::Center);
 
         // Refresh Button
-        let refresh_label: Element<'_, Message> = if self.is_syncing {
+        let refresh_label: Element<'_, Message> = if self.is_syncing() {
             row![spinner(Icon::Refresh, 13.0, Tint::OnPrimary), text("Syncing Feeds...").size(13)]
                 .spacing(6)
                 .align_y(Alignment::Center)
@@ -3342,7 +3362,7 @@ impl RssApp {
 
                 let feed_name = article.feed_title.as_deref().unwrap_or("RSS");
                 let date_str = article
-                    .published_at
+                    .shown_date()
                     .map(format_date)
                     .unwrap_or_else(|| "Unknown date".to_string());
 
@@ -3456,6 +3476,10 @@ impl RssApp {
                     // Not prepared yet (bodies are loaded when a story is opened)
                     _ => Space::with_height(0).into(),
                 };
+                let date_str = art
+                    .shown_date()
+                    .map(format_date)
+                    .unwrap_or_else(|| "Unknown date".to_string());
                 let title = text(art.title).size(22);
 
                 let feed = self.feeds.iter().find(|f| f.id == art.feed_id);
@@ -3465,10 +3489,6 @@ impl RssApp {
                     .and_then(|foid| self.folders.iter().find(|fld| fld.id == foid))
                     .map(|fld| fld.name.clone());
 
-                let date_str = art
-                    .published_at
-                    .map(format_date)
-                    .unwrap_or_else(|| "Unknown date".to_string());
 
                 let mut meta_items = row![
                     text(format!("Feed: {}", feed_title)).size(12).style(text::secondary),
@@ -3827,6 +3847,26 @@ fn article_menu_view(article: &Article) -> Element<'_, Message> {
     menu_card(body, 170.0)
 }
 
+/// Opens a web link in the default browser.
+///
+/// Links come from feeds, so only http(s) is passed on: `xdg-open` would also
+/// open local files, launchers and other apps' URL schemes.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url.trim()).map_err(|_| format!("Not a valid link: {}", url))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("Only web links are opened, not '{}:' links", parsed.scheme()));
+    }
+    let mut child = std::process::Command::new("xdg-open")
+        .arg(parsed.as_str())
+        .spawn()
+        .map_err(|e| format!("Couldn't start the browser: {}", e))?;
+    // Collect its exit status, or it lingers as a zombie process until the app closes
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Schedules `release_memory` shortly after a story with images is closed:
 /// iced's renderer drops the images when it next draws without them, so
 /// trimming right away would find nothing to give back.
@@ -3899,7 +3939,15 @@ fn selected_story_id() -> container::Id {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_size, RefreshInterval};
+    use super::{format_size, open_in_browser, RefreshInterval};
+
+    #[test]
+    fn only_web_links_are_opened() {
+        // Refused before anything is launched
+        for url in ["file:///etc/passwd", "javascript:alert(1)", "-x", "/home/user/run.desktop", "steam://run/1"] {
+            assert!(open_in_browser(url).is_err(), "{}", url);
+        }
+    }
 
     #[test]
     fn size_labels() {

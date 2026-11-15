@@ -45,6 +45,17 @@ pub struct Article {
     pub is_starred: bool,
 }
 
+impl Article {
+    /// The date shown for the story: its publication date, but never later
+    /// than when it was downloaded. Some feeds date stories in the future
+    /// (often a time zone mistake); taken at face value those read "1m ago"
+    /// and stay above everything else until the date passes. The story list
+    /// is sorted the same way (`Database::get_articles`).
+    pub fn shown_date(&self) -> Option<DateTime<Utc>> {
+        self.published_at.map(|published| published.min(self.fetched_at))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ArticleFilter {
     pub feed_id: Option<i64>,

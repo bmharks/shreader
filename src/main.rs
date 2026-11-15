@@ -197,6 +197,16 @@ async fn run() -> Result<()> {
     }
 
     // Launch Desktop GUI (Iced)
+    let db = match Database::open_default() {
+        Ok(db) => db,
+        Err(e) => {
+            let reason = format!("{:#}", e);
+            eprintln!("Couldn't open the archive: {}", reason);
+            show_startup_error(reason);
+            return Ok(());
+        }
+    };
+
     let settings = iced::application("Shreader RSS Reader", RssApp::update, RssApp::view)
         .subscription(RssApp::subscription)
         .theme(RssApp::theme)
@@ -206,11 +216,56 @@ async fn run() -> Result<()> {
             ..Default::default()
         });
 
-    if let Err(e) = settings.run_with(RssApp::new) {
+    if let Err(e) = settings.run_with(move || RssApp::new(db)) {
         eprintln!("Failed to launch GUI: {}", e);
     }
 
     Ok(())
+}
+
+/// A small window explaining why the archive couldn't be opened, in place of
+/// the main window. (A terminal message alone would go unseen when the app
+/// is started from a launcher.)
+fn show_startup_error(reason: String) {
+    use iced::widget::{button, column, container, text};
+    use iced::{Element, Length, Task, Theme};
+
+    #[derive(Debug, Clone)]
+    struct Close;
+
+    let message = format!(
+        "Shreader couldn't open your story archive, so it won't start.\n\n\
+         {}\n\n\
+         If another copy of Shreader is running, close it and try again.",
+        reason
+    );
+    fn update(_: &mut String, _: Close) -> Task<Close> {
+        iced::exit()
+    }
+    fn view(message: &String) -> Element<'_, Close> {
+        container(
+            column![
+                text(message.as_str()).size(14),
+                button(text("Close")).padding([4, 14]).on_press(Close),
+            ]
+            .spacing(16),
+        )
+        .padding(20)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    let result = iced::application("Shreader RSS Reader", update, view)
+    .theme(|_| Theme::Dark)
+    .window(iced::window::Settings {
+        size: iced::Size::new(560.0, 240.0),
+        ..Default::default()
+    })
+    .run_with(move || (message, Task::none()));
+    if let Err(e) = result {
+        eprintln!("Failed to show the error window: {}", e);
+    }
 }
 
 fn print_help() {
