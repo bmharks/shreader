@@ -50,6 +50,9 @@ const READER_TEXT_MAX_WIDTH: f32 = 760.0;
 /// The headline and footer leave the same room, so all three center alike.
 const READER_SCROLLBAR_GUTTER: f32 = 14.0;
 const ARTICLE_LIST_WIDTH_SETTING: &str = "article_list_width";
+/// Settings key: comma-separated ids of folders the user collapsed. Collapsed
+/// rather than expanded ones are stored, so new folders start out open.
+const COLLAPSED_FOLDERS_SETTING: &str = "collapsed_folders";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveFilter {
@@ -91,6 +94,7 @@ pub struct RssApp {
 
     // Drag-and-drop state
     dragging_feed: Option<i64>,                 // feed_id being dragged
+    dragging_folder: Option<i64>,               // folder_id being dragged
 
     // Feed context menu (right click) and in-place rename
     feed_menu: Option<FeedMenu>,
@@ -338,6 +342,7 @@ pub enum Message {
 
     // Drag-and-Drop Actions
     DragFeedStarted(i64),
+    DragFolderStarted(i64),
     DragOverTarget(DropTarget),
     DragLeaveTarget(DropTarget),
     DropOnTarget(DropTarget),
@@ -379,6 +384,7 @@ impl RssApp {
             status_generation: 0,
             stats: (0, 0, 0),
             dragging_feed: None,
+            dragging_folder: None,
             feed_menu: None,
             renaming_feed: None,
             editing_feed: None,
@@ -404,9 +410,26 @@ impl RssApp {
             app.article_list_width = width;
         }
 
-        // By default, expand all folders so user sees their structure
-        for f in &app.folders {
-            app.expanded_folders.insert(f.id);
+        // Folders open as they were left: all expanded except those the user
+        // collapsed
+        let collapsed: HashSet<i64> = app
+            .db
+            .get_setting(COLLAPSED_FOLDERS_SETTING)
+            .ok()
+            .flatten()
+            .map(|ids| ids.split(',').filter_map(|id| id.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        app.expanded_folders = app
+            .folders
+            .iter()
+            .map(|f| f.id)
+            .filter(|id| !collapsed.contains(id))
+            .collect();
+
+        // Start in the top folder
+        if let Some(top) = app.folders.first() {
+            app.active_filter = ActiveFilter::Folder(top.id);
+            app.reload_articles();
         }
 
         // If feeds exist, automatically trigger an initial background sync
@@ -789,6 +812,7 @@ impl RssApp {
                             self.reload_data();
                             // Show where the new feeds went
                             self.expanded_folders.extend(self.folders.iter().map(|f| f.id));
+                            self.save_collapsed_folders();
                             let added = import.added.len();
                             let plural = |n: usize, one: &str, many: &str| {
                                 format!("{} {}", n, if n == 1 { one } else { many })
@@ -1402,6 +1426,7 @@ impl RssApp {
                 } else {
                     self.expanded_folders.insert(folder_id);
                 }
+                self.save_collapsed_folders();
                 Task::none()
             }
             Message::ShowNewFolderInput => {
@@ -1547,8 +1572,16 @@ impl RssApp {
                 // under the cursor. The drag hint lives in the floating badge instead.
                 Task::none()
             }
+            Message::DragFolderStarted(folder_id) => {
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = None;
+                self.dragging_folder = Some(folder_id);
+                self.drag_hover_target = None;
+                Task::none()
+            }
             Message::DragOverTarget(target) => {
-                if self.dragging_feed.is_some() {
+                if self.dragging_feed.is_some() || self.dragging_folder.is_some() {
                     self.drag_hover_target = Some(target);
                 }
                 Task::none()
@@ -1576,7 +1609,11 @@ impl RssApp {
         if let (Some(feed_id), Some(target)) = (self.dragging_feed, target) {
             self.drop_feed(feed_id, target);
         }
+        if let (Some(folder_id), Some(DropTarget::Folder(Some(target_id)))) = (self.dragging_folder, target) {
+            self.drop_folder(folder_id, target_id);
+        }
         self.dragging_feed = None;
+        self.dragging_folder = None;
         self.drag_hover_target = None;
     }
 
@@ -1841,6 +1878,48 @@ impl RssApp {
                 .unwrap_or_else(|| "folder".to_string()),
             None => "Uncategorized".to_string(),
         }
+    }
+
+    /// Saves which folders are collapsed, so they open the same way next time.
+    fn save_collapsed_folders(&self) {
+        let collapsed: Vec<String> = self
+            .folders
+            .iter()
+            .filter(|f| !self.expanded_folders.contains(&f.id))
+            .map(|f| f.id.to_string())
+            .collect();
+        let _ = self.db.set_setting(COLLAPSED_FOLDERS_SETTING, &collapsed.join(","));
+    }
+
+    /// Moves a dragged folder into the place of the folder it was dropped on.
+    fn drop_folder(&mut self, folder_id: i64, target_id: i64) {
+        if folder_id == target_id {
+            return;
+        }
+        let original: Vec<i64> = self.folders.iter().map(|f| f.id).collect();
+        let Some(target_idx) = original.iter().position(|&id| id == target_id) else {
+            return;
+        };
+        let mut order: Vec<i64> = original.iter().copied().filter(|&id| id != folder_id).collect();
+        // Same rule as feeds: it lands after the target when moving down, before
+        // it when moving up
+        order.insert(target_idx.min(order.len()), folder_id);
+        if let Err(e) = self.db.order_folders(&order) {
+            self.status_message = Some((format!("Failed to move folder: {}", e), true));
+        }
+        self.reload_data();
+    }
+
+    /// Where to draw the insertion line on a folder header, if a dragged
+    /// folder is hovering it.
+    fn folder_insert_edge(&self, folder_id: i64) -> Option<InsertEdge> {
+        let dragged_id = self.dragging_folder?;
+        if dragged_id == folder_id || self.drag_hover_target != Some(DropTarget::Folder(Some(folder_id))) {
+            return None;
+        }
+        let from = self.folders.iter().position(|f| f.id == dragged_id)?;
+        let to = self.folders.iter().position(|f| f.id == folder_id)?;
+        Some(if from < to { InsertEdge::Bottom } else { InsertEdge::Top })
     }
 
     fn drop_feed(&mut self, feed_id: i64, target: DropTarget) {
@@ -2581,20 +2660,33 @@ impl RssApp {
             layers.push(self.settings_view(settings));
         }
 
-        if let Some(feed_id) = self.dragging_feed {
-            let feed_title = self
+        let dragged = if let Some(feed_id) = self.dragging_feed {
+            let title = self
                 .feeds
                 .iter()
                 .find(|f| f.id == feed_id)
                 .map(|f| f.title.as_str())
                 .unwrap_or("Feed");
+            Some((title, "Drop on a folder to move, or on a feed to reorder"))
+        } else if let Some(folder_id) = self.dragging_folder {
+            let name = self
+                .folders
+                .iter()
+                .find(|f| f.id == folder_id)
+                .map(|f| f.name.as_str())
+                .unwrap_or("Folder");
+            Some((name, "Drop on another folder to put it there"))
+        } else {
+            None
+        };
+        if let Some((feed_title, hint)) = dragged {
 
             let floating_badge = container(
                 row![
                     grip_icon(true),
                     column![
                         text(format!("Dragging: {}", feed_title)).size(13).style(text::primary),
-                        text("Drop on a folder to move, or on a feed to reorder")
+                        text(hint)
                             .size(11)
                             .style(text::secondary),
                     ]
@@ -2734,6 +2826,7 @@ impl RssApp {
 
 
         let is_dragging = self.dragging_feed.is_some();
+        let is_dragging_folder = self.dragging_folder.is_some();
 
         // 1. Folders List with nested feeds (Akregator style + Drag & Drop Target)
         for folder in &self.folders {
@@ -2810,7 +2903,26 @@ impl RssApp {
                 .into()
                 };
 
+                let is_this_folder_dragged = self.dragging_folder == Some(folder.id);
+                // Drag grip, like the feeds have, for reordering folders
+                let grip = mouse_area(
+                    container(grip_icon(is_this_folder_dragged))
+                        .padding([4, 6])
+                        .style(if is_this_folder_dragged {
+                            container::bordered_box
+                        } else {
+                            container::transparent
+                        }),
+                )
+                .on_press(Message::DragFolderStarted(folder.id))
+                .interaction(if is_this_folder_dragged {
+                    mouse::Interaction::Grabbing
+                } else {
+                    mouse::Interaction::Grab
+                });
+
                 let folder_header_row = row![
+                    Element::from(grip),
                     Element::from(toggle_btn),
                     folder_btn,
                 ]
@@ -2821,8 +2933,29 @@ impl RssApp {
                     .width(Length::Fill)
                     .style(drop_zone_style(is_dragging, is_drop_hovered));
 
-                let mut folder_drop_area = mouse_area(folder_header);
-                if is_dragging {
+                // Insertion line while another folder is dragged over this one,
+                // as an overlay so it never shifts the rows
+                let insert_line: Element<'_, Message> = match self.folder_insert_edge(folder.id) {
+                    Some(edge) => container(
+                        container(Space::new(Length::Fill, Length::Fixed(2.0))).style(|theme: &Theme| {
+                            container::Style {
+                                background: Some(theme.extended_palette().primary.strong.color.into()),
+                                ..Default::default()
+                            }
+                        }),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_y(match edge {
+                        InsertEdge::Top => iced::alignment::Vertical::Top,
+                        InsertEdge::Bottom => iced::alignment::Vertical::Bottom,
+                    })
+                    .into(),
+                    None => Space::new(Length::Shrink, Length::Shrink).into(),
+                };
+
+                let mut folder_drop_area = mouse_area(stack![folder_header, insert_line].width(Length::Fill));
+                if is_dragging || (is_dragging_folder && !is_this_folder_dragged) {
                     folder_drop_area = folder_drop_area
                         .on_enter(Message::DragOverTarget(DropTarget::Folder(Some(folder.id))))
                         .on_exit(Message::DragLeaveTarget(DropTarget::Folder(Some(folder.id))))
@@ -2832,14 +2965,14 @@ impl RssApp {
 
                 let menu = self
                     .folder_menu
-                    .filter(|m| m.folder_id == folder.id && !is_dragging)
+                    .filter(|m| m.folder_id == folder.id && !is_dragging && !is_dragging_folder)
                     .map(|m| self.folder_menu_view(folder, m.confirm_delete));
 
                 let mut header_with_menu = context_menu(folder_drop_area)
                     .menu(menu)
                     .on_dismiss(Message::CloseFolderMenu)
                     .on_escape(Message::EscapePressed);
-                if !is_dragging {
+                if !is_dragging && !is_dragging_folder {
                     header_with_menu =
                         header_with_menu.on_right_press(Message::OpenFolderMenu(folder.id));
                 }

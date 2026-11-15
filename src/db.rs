@@ -151,6 +151,9 @@ impl Database {
         // Migration: user-defined feed order within a folder (NULL = not yet
         // arranged; those sort alphabetically after arranged feeds)
         let _ = conn.execute("ALTER TABLE feeds ADD COLUMN sort_order INTEGER", []);
+        // Migration: user-defined folder order (NULL = not yet arranged; those
+        // sort alphabetically after arranged folders)
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER", []);
 
         // 3. Full-Text Search (FTS5) for instant offline search across entire story history
         conn.execute_batch(
@@ -291,6 +294,20 @@ impl Database {
         Ok(())
     }
 
+    /// Puts the folders in exactly this order (drag-and-drop in the sidebar).
+    pub fn order_folders(&self, ordered_folder_ids: &[i64]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE folders SET sort_order = ?1 WHERE id = ?2")?;
+            for (position, folder_id) in ordered_folder_ids.iter().enumerate() {
+                stmt.execute(params![position as i64, folder_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_folders(&self) -> Result<Vec<Folder>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -304,7 +321,7 @@ impl Database {
             LEFT JOIN feeds fe ON fe.folder_id = fo.id
             LEFT JOIN articles a ON a.feed_id = fe.id
             GROUP BY fo.id, fo.name
-            ORDER BY fo.name COLLATE NOCASE ASC
+            ORDER BY fo.sort_order IS NULL, fo.sort_order, fo.name COLLATE NOCASE ASC
             "#,
         )?;
 
@@ -918,6 +935,22 @@ mod tests {
         let search_results = db.get_articles(&filter).unwrap();
         assert_eq!(search_results.len(), 1);
         assert_eq!(search_results[0].title, "First Story");
+    }
+
+    #[test]
+    fn test_order_folders() {
+        let db = Database::open_in_memory().unwrap();
+        let b = db.create_folder("Bravo").unwrap();
+        let a = db.create_folder("alpha").unwrap();
+        let c = db.create_folder("Charlie").unwrap();
+        let names = |db: &Database| db.get_folders().unwrap().into_iter().map(|f| f.id).collect::<Vec<_>>();
+        // Unarranged: alphabetical, ignoring case
+        assert_eq!(names(&db), vec![a, b, c]);
+        db.order_folders(&[c, a, b]).unwrap();
+        assert_eq!(names(&db), vec![c, a, b]);
+        // A folder created later goes after the arranged ones
+        let d = db.create_folder("Aardvark").unwrap();
+        assert_eq!(names(&db), vec![c, a, b, d]);
     }
 
     #[test]
