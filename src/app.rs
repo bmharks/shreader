@@ -6,7 +6,7 @@ use iced::widget::{
     button, checkbox, column, container, horizontal_rule, horizontal_space, mouse_area, pick_list, row,
     scrollable, stack, text, text_editor, text_input, vertical_rule, Space,
 };
-use iced::{Alignment, Element, Length, Subscription, Task, Theme, Vector};
+use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme, Vector};
 
 use crate::db::Database;
 use crate::opml;
@@ -3021,11 +3021,7 @@ impl RssApp {
 
                 let card_title = text(&article.title)
                     .size(13)
-                    .style(if !article.is_read {
-                        text::primary
-                    } else {
-                        text::secondary
-                    });
+                    .color(if article.is_read { READ_TITLE } else { UNREAD_TITLE });
 
                 let meta_row = row![
                     text(feed_name).size(11).style(text::secondary),
@@ -3039,11 +3035,7 @@ impl RssApp {
                 let item_btn = button(row![star_btn, card_content].spacing(6).align_y(Alignment::Center))
                     .width(Length::Fill)
                     .padding(8)
-                    .style(if is_selected {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
+                    .style(move |theme, status| story_card(theme, status, is_selected))
                     .on_press(Message::SelectArticle(article.id));
 
                 let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
@@ -3076,6 +3068,8 @@ impl RssApp {
             }
         }
 
+        // Room for the scrollbar, so it doesn't cover the cards' right outline
+        let article_items = article_items.padding(iced::Padding { right: 12.0, ..iced::Padding::ZERO });
         let scroll_list = scrollable(article_items).width(Length::Fill).height(Length::Fill);
 
         container(
@@ -3514,5 +3508,35 @@ fn release_memory() {
     // SAFETY: malloc_trim only releases free heap pages; no pointers are affected
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Title color of a story that hasn't been read yet.
+const UNREAD_TITLE: Color = Color::from_rgb(0.36, 0.84, 0.49);
+/// Title color of a read story.
+const READ_TITLE: Color = Color::WHITE;
+
+/// A story in the list: the page background with a grey outline, so the
+/// colored titles stay readable. Hovering brightens the outline; the open
+/// story gets a thicker accent outline instead of a filled background.
+fn story_card(theme: &Theme, status: button::Status, selected: bool) -> button::Style {
+    let palette = theme.extended_palette();
+    let (color, width) = if selected {
+        (palette.primary.base.color, 2.0)
+    } else {
+        match status {
+            button::Status::Hovered | button::Status::Pressed => (palette.background.strong.text.scale_alpha(0.6), 1.0),
+            _ => (palette.background.strong.color, 1.0),
+        }
+    };
+    button::Style {
+        background: Some(palette.background.base.color.into()),
+        text_color: palette.background.base.text,
+        border: iced::Border {
+            color,
+            width,
+            radius: 4.0.into(),
+        },
+        ..button::Style::default()
     }
 }
