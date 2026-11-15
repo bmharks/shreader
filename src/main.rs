@@ -21,8 +21,26 @@ use app::RssApp;
 use db::Database;
 use opml::{export_opml_from_db, import_opml_into_db};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Draw on the high-performance GPU. iced otherwise asks for the
+    // low-power one, which on a desktop with both an integrated and a
+    // discrete GPU is the integrated GPU even when the monitors are on the
+    // discrete card; the compositor then has to bring every frame across
+    // from the other GPU, which can make the window and its title bar
+    // flicker or show through. Setting WGPU_POWER_PREF yourself overrides
+    // this (e.g. WGPU_POWER_PREF=low on a laptop).
+    if env::var_os("WGPU_POWER_PREF").is_none() {
+        // SAFETY: no other threads exist yet; the async runtime starts below
+        unsafe { env::set_var("WGPU_POWER_PREF", "high") };
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     // Initialize tracing/logging for background operations
     tracing_subscriber::fmt::init();
 
