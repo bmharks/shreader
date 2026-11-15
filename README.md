@@ -1,8 +1,8 @@
-# RSS Archive Reader (Linux / Rust)
+# Shreader RSS Reader (Linux / Rust)
 
 A modern, high-performance RSS/Atom feed reader built in Rust for Linux, designed around one core principle: **you should never lose a story**.
 
-Most RSS readers mirror the current state of a feed, which means when a publisher trims their feed to the newest 10–20 posts, older stories quietly vanish. **RSS Archive Reader** implements an append-only SQLite storage engine with full-text search, keeping every story you ever receive permanently archived locally.
+Most RSS readers mirror the current state of a feed, which means when a publisher trims their feed to the newest 10–20 posts, older stories quietly vanish. **Shreader RSS Reader** implements an append-only SQLite storage engine with full-text search, keeping every story you ever receive permanently archived locally.
 
 ---
 

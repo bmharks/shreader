@@ -215,7 +215,7 @@ pub fn export_opml_from_db(db: &Database) -> Result<String> {
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str("<opml version=\"2.0\">\n");
     out.push_str("  <head>\n");
-    out.push_str("    <title>RSS Reader Subscriptions</title>\n");
+    out.push_str("    <title>Shreader RSS Reader Subscriptions</title>\n");
     out.push_str("  </head>\n");
     out.push_str("  <body>\n");
 

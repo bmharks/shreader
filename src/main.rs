@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     }
 
     // Launch Desktop GUI (Iced)
-    let settings = iced::application("RSS Archive Reader", RssApp::update, RssApp::view)
+    let settings = iced::application("Shreader RSS Reader", RssApp::update, RssApp::view)
         .subscription(RssApp::subscription)
         .theme(RssApp::theme)
         .window(iced::window::Settings {
@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
 fn print_help() {
     println!(
         r#"
-RSS Archive Reader (Linux)
+Shreader RSS Reader (Linux)
 A permanent-archive RSS reader backed by SQLite with Akregator-style folder grouping.
 
 USAGE:

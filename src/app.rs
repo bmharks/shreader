@@ -53,6 +53,31 @@ const ARTICLE_LIST_WIDTH_SETTING: &str = "article_list_width";
 /// Settings key: comma-separated ids of folders the user collapsed. Collapsed
 /// rather than expanded ones are stored, so new folders start out open.
 const COLLAPSED_FOLDERS_SETTING: &str = "collapsed_folders";
+/// Settings keys for automatic refreshing: on/off, and the interval in minutes.
+const AUTO_REFRESH_SETTING: &str = "auto_refresh";
+const AUTO_REFRESH_MINUTES_SETTING: &str = "auto_refresh_minutes";
+/// Akregator's defaults: "Use interval fetching" on, every 30 minutes.
+const DEFAULT_AUTO_REFRESH_MINUTES: u32 = 30;
+/// Intervals offered in Settings, in minutes.
+const AUTO_REFRESH_CHOICES: [u32; 10] = [5, 10, 15, 30, 60, 120, 240, 360, 720, 1440];
+
+/// An automatic refresh interval, shown as "30 minutes", "2 hours"...
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshInterval(u32);
+
+impl std::fmt::Display for RefreshInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let m = self.0;
+        let (n, unit) = if m % 1440 == 0 {
+            (m / 1440, "day")
+        } else if m % 60 == 0 {
+            (m / 60, "hour")
+        } else {
+            (m, "minute")
+        };
+        write!(f, "{} {}{}", n, unit, if n == 1 { "" } else { "s" })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveFilter {
@@ -95,6 +120,9 @@ pub struct RssApp {
     // Drag-and-drop state
     dragging_feed: Option<i64>,                 // feed_id being dragged
     dragging_folder: Option<i64>,               // folder_id being dragged
+    /// Refresh all feeds every `auto_refresh_minutes` (Settings)
+    auto_refresh: bool,
+    auto_refresh_minutes: u32,
 
     // Feed context menu (right click) and in-place rename
     feed_menu: Option<FeedMenu>,
@@ -237,6 +265,10 @@ pub enum Message {
     FeedAdded(Result<(i64, String), String>),
     RefreshClicked,
     SyncFinished(Result<Vec<FeedSyncSummary>, String>),
+    /// The automatic refresh timer fired
+    AutoRefreshTick,
+    SetAutoRefresh(bool),
+    SetAutoRefreshInterval(RefreshInterval),
     SearchChanged(String),
     ToggleStar(i64),
     ToggleRead(i64),
@@ -385,6 +417,8 @@ impl RssApp {
             stats: (0, 0, 0),
             dragging_feed: None,
             dragging_folder: None,
+            auto_refresh: true,
+            auto_refresh_minutes: DEFAULT_AUTO_REFRESH_MINUTES,
             feed_menu: None,
             renaming_feed: None,
             editing_feed: None,
@@ -408,6 +442,20 @@ impl RssApp {
             .filter(|w| w.is_finite())
         {
             app.article_list_width = width;
+        }
+
+        if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
+            app.auto_refresh = on != "false";
+        }
+        if let Some(minutes) = app
+            .db
+            .get_setting(AUTO_REFRESH_MINUTES_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|m| m.parse::<u32>().ok())
+            .filter(|&m| m > 0)
+        {
+            app.auto_refresh_minutes = minutes;
         }
 
         // Folders open as they were left: all expanded except those the user
@@ -459,7 +507,15 @@ impl RssApp {
         // the floating badge (follow_cursor.rs); Esc for context menus from the
         // menu overlay (context_menu.rs), and for the rename fields and dialogs
         // from `on_escape` wrappers.
-        Subscription::none()
+        //
+        // The refresh timer is fine: it ticks once per interval. Changing the
+        // interval makes a new subscription, which restarts the countdown.
+        if self.auto_refresh && self.auto_refresh_minutes > 0 {
+            iced::time::every(std::time::Duration::from_secs(u64::from(self.auto_refresh_minutes) * 60))
+                .map(|_| Message::AutoRefreshTick)
+        } else {
+            Subscription::none()
+        }
     }
 
     fn reload_data(&mut self) {
@@ -1070,6 +1126,23 @@ impl RssApp {
                     },
                     Message::SyncFinished,
                 )
+            }
+            Message::AutoRefreshTick => {
+                // Skipped if a refresh is already running; the next tick catches up
+                if self.feeds.is_empty() {
+                    return Task::none();
+                }
+                self.update(Message::RefreshClicked)
+            }
+            Message::SetAutoRefresh(on) => {
+                self.auto_refresh = on;
+                let _ = self.db.set_setting(AUTO_REFRESH_SETTING, if on { "true" } else { "false" });
+                Task::none()
+            }
+            Message::SetAutoRefreshInterval(RefreshInterval(minutes)) => {
+                self.auto_refresh_minutes = minutes;
+                let _ = self.db.set_setting(AUTO_REFRESH_MINUTES_SETTING, &minutes.to_string());
+                Task::none()
             }
             Message::SyncFinished(result) => {
                 self.is_syncing = false;
@@ -2219,6 +2292,36 @@ impl RssApp {
             );
         }
 
+        // Automatic refresh
+        let mut interval_choices: Vec<RefreshInterval> =
+            AUTO_REFRESH_CHOICES.iter().copied().map(RefreshInterval).collect();
+        if !AUTO_REFRESH_CHOICES.contains(&self.auto_refresh_minutes) {
+            interval_choices.push(RefreshInterval(self.auto_refresh_minutes));
+            interval_choices.sort_by_key(|i| i.0);
+        }
+        let refresh_section = column![
+            text("Automatic refresh").size(14),
+            row![
+                checkbox("Refresh all feeds every", self.auto_refresh)
+                    .on_toggle(Message::SetAutoRefresh)
+                    .size(14)
+                    .text_size(12),
+                pick_list(
+                    interval_choices,
+                    Some(RefreshInterval(self.auto_refresh_minutes)),
+                    Message::SetAutoRefreshInterval,
+                )
+                .text_size(12)
+                .padding([3, 8]),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            text("Feeds are also refreshed when the app starts.")
+                .size(12)
+                .style(text::secondary),
+        ]
+        .spacing(6);
+
         // Export to OPML
         let mut export_section = column![row![
             column![
@@ -2310,6 +2413,8 @@ impl RssApp {
 
         let form = column![
             text("Settings").size(16),
+            horizontal_rule(1),
+            refresh_section,
             horizontal_rule(1),
             import_section,
             horizontal_rule(1),
@@ -2717,7 +2822,7 @@ impl RssApp {
         // App Header
         let title_bar = row![
             column![
-                text("RSS Archive Reader").size(18),
+                text("Shreader RSS Reader").size(18),
                 text("Permanent SQL Archive")
                     .size(11)
                     .style(text::secondary),
@@ -3051,14 +3156,9 @@ impl RssApp {
         // Reserve a gutter so the scrollbar sits beside rows instead of overlapping their right edge
         let tree_scroll = scrollable(tree_items).spacing(4).height(Length::Fill);
 
-        // Bottom Storage & SQLite Archival Status
+        // Bottom: archive totals
         let db_status = column![
             horizontal_rule(1),
-            row![
-                text("SQLite:").size(11).style(text::secondary),
-                text("WAL Mode (Safe)").size(11).style(text::success),
-            ]
-            .spacing(4),
             text(format!(
                 "{} folders | {} feeds | {} stories",
                 self.folders.len(), total_feeds, total_articles
@@ -3296,14 +3396,6 @@ impl RssApp {
                     text("Select an article from the list to view its contents.")
                         .size(13)
                         .style(text::secondary),
-                    Space::with_height(10),
-                    row![
-                        icon(Icon::Lock, 12.0, Tint::Secondary),
-                        text("Archival Guarantee: Every story fetched is stored in SQLite and will remain accessible even if the source feed removes it.")
-                            .size(12)
-                            .style(text::secondary),
-                    ]
-                    .spacing(6),
                 ]
                 .spacing(6)
                 .align_x(Alignment::Center),
@@ -3751,4 +3843,21 @@ fn article_list_scroll_id() -> scrollable::Id {
 /// The open story's card in the list.
 fn selected_story_id() -> container::Id {
     container::Id::new("selected-story")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefreshInterval;
+
+    #[test]
+    fn refresh_interval_labels() {
+        let label = |m| RefreshInterval(m).to_string();
+        assert_eq!(label(1), "1 minute");
+        assert_eq!(label(30), "30 minutes");
+        assert_eq!(label(60), "1 hour");
+        assert_eq!(label(90), "90 minutes");
+        assert_eq!(label(720), "12 hours");
+        assert_eq!(label(1440), "1 day");
+        assert_eq!(label(2880), "2 days");
+    }
 }
