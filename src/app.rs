@@ -262,6 +262,8 @@ pub enum Message {
     /// Left/Right arrow: open the previous (`false`) or next (`true`) story
     /// in the list
     SelectAdjacentStory(bool),
+    /// Up/Down arrow: scroll the open story by this many pixels
+    ScrollReader(f32),
     FeedAdded(Result<(i64, String), String>),
     RefreshClicked,
     SyncFinished(Result<Vec<FeedSyncSummary>, String>),
@@ -619,11 +621,21 @@ impl RssApp {
                     .collect();
                 self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
+                // A new story starts at its top (the reader's scroll position
+                // otherwise carries over from the previous one)
+                let to_top = scrollable::snap_to(reader_scroll_id(), scrollable::RelativeOffset::START);
                 if had_images {
-                    release_memory_soon()
+                    Task::batch([to_top, release_memory_soon()])
                 } else {
-                    Task::none()
+                    to_top
                 }
+            }
+            Message::ScrollReader(dy) => {
+                // Not while a dialog is up: it covers the reader
+                if self.settings.is_some() || self.add_feed.is_some() || self.editing_feed.is_some() {
+                    return Task::none();
+                }
+                scrollable::scroll_by(reader_scroll_id(), scrollable::AbsoluteOffset { x: 0.0, y: dy })
             }
             Message::SelectAdjacentStory(forward) => {
                 // Not while a dialog or rename field is up: the arrows belong there
@@ -1827,11 +1839,15 @@ impl RssApp {
     ) -> Element<'a, Message> {
         let editor = text_editor(content)
             .on_action(move |action| Message::ReaderTextAction(index, action))
-            // Plain Left/Right switch stories even after clicking into the
-            // text (Shift+arrows still extend a selection)
+            // Plain arrows switch stories (Left/Right) and scroll the story
+            // (Up/Down) even after clicking into the text; Shift+arrows still
+            // extend a selection
             .key_binding(|key_press| match key_press.key.as_ref() {
                 iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::ArrowLeft | iced::keyboard::key::Named::ArrowRight,
+                    iced::keyboard::key::Named::ArrowLeft
+                    | iced::keyboard::key::Named::ArrowRight
+                    | iced::keyboard::key::Named::ArrowUp
+                    | iced::keyboard::key::Named::ArrowDown,
                 ) if key_press.modifiers.is_empty() => None,
                 _ => text_editor::Binding::from_key_press(key_press),
             })
@@ -2716,8 +2732,9 @@ impl RssApp {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        // Left/Right arrows step through the story list. Only keys nothing
-        // else used: a focused search or rename field keeps its arrows.
+        // Left/Right arrows step through the story list, Up/Down scroll the
+        // open story. Only keys nothing else used: a focused search or rename
+        // field keeps its arrows.
         let content = on_key_press(content, |key, modifiers| {
             use iced::keyboard::key::Named;
             if !modifiers.is_empty() {
@@ -2726,6 +2743,8 @@ impl RssApp {
             match key.as_ref() {
                 iced::keyboard::Key::Named(Named::ArrowLeft) => Some(Message::SelectAdjacentStory(false)),
                 iced::keyboard::Key::Named(Named::ArrowRight) => Some(Message::SelectAdjacentStory(true)),
+                iced::keyboard::Key::Named(Named::ArrowUp) => Some(Message::ScrollReader(-READER_ARROW_STEP)),
+                iced::keyboard::Key::Named(Named::ArrowDown) => Some(Message::ScrollReader(READER_ARROW_STEP)),
                 _ => None,
             }
         });
@@ -3522,6 +3541,7 @@ impl RssApp {
                 let body_scroll = scrollable(reading_column(
                     column![body].spacing(10).padding([10, 0]),
                 ))
+                .id(reader_scroll_id())
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .direction(scrollable::Direction::Vertical(
@@ -3862,6 +3882,15 @@ fn story_card(theme: &Theme, status: button::Status, selected: bool) -> button::
 fn article_list_scroll_id() -> scrollable::Id {
     scrollable::Id::new("article-list")
 }
+
+/// The open story's reader.
+fn reader_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("reader")
+}
+
+/// How far one Up/Down arrow press scrolls the open story, in pixels
+/// (about three lines; holding the key repeats it).
+const READER_ARROW_STEP: f32 = 60.0;
 
 /// The open story's card in the list.
 fn selected_story_id() -> container::Id {
