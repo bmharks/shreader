@@ -17,6 +17,7 @@ pub enum Icon {
     Refresh,
     Lock,
     ExternalLink,
+    Settings,
 }
 
 // 24x24 outline icons, stroke-based. The stroke color is irrelevant: the
@@ -26,6 +27,8 @@ const STAR_PATH: &str = "M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123
 const REFRESH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>"#;
 const LOCK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"#;
 const EXTERNAL_LINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>"#;
+
+const SETTINGS: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 
 fn star(filled: bool) -> String {
     format!(
@@ -42,6 +45,7 @@ static STAR_H: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory
 static STAR_FILLED_H: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(star(true).into_bytes()));
 static REFRESH_H: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(REFRESH.as_bytes()));
 static LOCK_H: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(LOCK.as_bytes()));
+static SETTINGS_H: LazyLock<svg::Handle> = LazyLock::new(|| svg::Handle::from_memory(SETTINGS.as_bytes()));
 static EXTERNAL_LINK_H: LazyLock<svg::Handle> =
     LazyLock::new(|| svg::Handle::from_memory(EXTERNAL_LINK.as_bytes()));
 
@@ -92,6 +96,7 @@ pub(crate) fn handle(icon: Icon) -> svg::Handle {
         Icon::Refresh => &*REFRESH_H,
         Icon::Lock => &*LOCK_H,
         Icon::ExternalLink => &*EXTERNAL_LINK_H,
+        Icon::Settings => &*SETTINGS_H,
     };
     handle.clone()
 }

@@ -492,6 +492,42 @@ impl Database {
         Ok(())
     }
 
+    /// Number of starred stories.
+    pub fn starred_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row("SELECT COUNT(*) FROM articles WHERE is_starred = 1", [], |r| r.get(0))?)
+    }
+
+    /// Deletes archived stories (all, or all but the starred ones), keeping
+    /// feeds and folders. Returns how many were deleted.
+    ///
+    /// Feeds' HTTP caching info is reset so the next refresh downloads each
+    /// feed in full: otherwise an unchanged feed answers "304 Not Modified"
+    /// and its current stories wouldn't come back until it next posts.
+    pub fn clear_stories(&self, keep_starred: bool) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // The delete trigger also removes each story from the search index
+        let deleted = if keep_starred {
+            tx.execute("DELETE FROM articles WHERE is_starred = 0", [])?
+        } else {
+            tx.execute("DELETE FROM articles", [])?
+        };
+        tx.execute(
+            "UPDATE feeds SET etag = NULL, last_modified = NULL, last_fetched_at = NULL",
+            [],
+        )?;
+        // FTS5 records deletions as markers instead of freeing their space
+        // (~30 MB for a few thousand stories); rebuild it from what's left
+        tx.execute("INSERT INTO articles_fts(articles_fts) VALUES('rebuild')", [])?;
+        tx.commit()?;
+        // Outside the transaction: VACUUM can't run inside one. In WAL mode the
+        // compacted pages land in the -wal file, so checkpoint and truncate it
+        // too; otherwise neither file shrinks until a clean shutdown.
+        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(deleted)
+    }
+
     pub fn delete_feed(&self, feed_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])?;
@@ -882,6 +918,49 @@ mod tests {
         let search_results = db.get_articles(&filter).unwrap();
         assert_eq!(search_results.len(), 1);
         assert_eq!(search_results[0].title, "First Story");
+    }
+
+    #[test]
+    fn test_clear_stories() {
+        let db = Database::open_in_memory().unwrap();
+        let folder_id = db.create_folder("News").unwrap();
+        let feed_id = db
+            .add_or_update_feed("https://example.com/feed", "Example", None, None, Some(folder_id))
+            .unwrap();
+        db.update_feed_http_meta(feed_id, Some("etag-1"), None, Utc::now()).unwrap();
+        for (guid, title, text) in [("g1", "Plain Story", "needle one"), ("g2", "Starred Story", "needle two")] {
+            db.upsert_article(
+                feed_id, Some(guid), guid, title, None, None,
+                None, None, Some(text), Some(Utc::now()), None,
+            )
+            .unwrap();
+        }
+        let starred = db
+            .get_articles(&ArticleFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|a| a.title == "Starred Story")
+            .unwrap();
+        db.toggle_article_starred(starred.id).unwrap();
+        let search = ArticleFilter { search_query: Some("needle".into()), ..Default::default() };
+
+        // Keeping starred: only the plain story goes, from the list and from search
+        assert_eq!(db.clear_stories(true).unwrap(), 1);
+        let left = db.get_articles(&ArticleFilter::default()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "Starred Story");
+        assert_eq!(db.get_articles(&search).unwrap().len(), 1);
+
+        // Feeds and folders stay; caching info is reset so a refresh refetches
+        let feed = db.get_feed(feed_id).unwrap().unwrap();
+        assert_eq!(feed.folder_id, Some(folder_id));
+        assert!(feed.etag.is_none());
+
+        // Everything
+        assert_eq!(db.clear_stories(false).unwrap(), 1);
+        assert!(db.get_articles(&ArticleFilter::default()).unwrap().is_empty());
+        assert!(db.get_articles(&search).unwrap().is_empty());
+        assert_eq!(db.get_feeds().unwrap().len(), 1);
     }
 
     #[test]

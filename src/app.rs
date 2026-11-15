@@ -3,12 +3,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use iced::mouse;
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, mouse_area, pick_list, row,
+    button, checkbox, column, container, horizontal_rule, horizontal_space, mouse_area, pick_list, row,
     scrollable, stack, text, text_editor, text_input, vertical_rule, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme, Vector};
 
 use crate::db::Database;
+use crate::opml;
 use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
 use crate::story_content::{self, Block};
 use crate::context_menu::context_menu;
@@ -96,6 +97,8 @@ pub struct RssApp {
     editing_feed: Option<EditFeedDialog>,
 
     add_feed: Option<AddFeedDialog>,
+    /// The Settings window, while open
+    settings: Option<SettingsState>,
     /// Story whose right-click menu is open
     article_menu: Option<i64>,
     article_list_width: f32,
@@ -156,6 +159,21 @@ enum ImageState {
     Raster(iced::widget::image::Handle),
     Svg(iced::widget::svg::Handle),
     Failed,
+}
+
+/// State of the Settings window.
+#[derive(Debug, Clone)]
+struct SettingsState {
+    /// "Keep starred stories" when clearing
+    keep_starred: bool,
+    /// While asking to confirm clearing: (stories to delete, starred kept)
+    confirm_clear: Option<(i64, i64)>,
+    /// A file chooser (import or export) is open
+    choosing_file: bool,
+    /// Outcome of the last import: (message, is_error)
+    import_result: Option<(String, bool)>,
+    /// Outcome of the last export: (message, is_error)
+    export_result: Option<(String, bool)>,
 }
 
 /// State of the "Add feed" dialog.
@@ -236,6 +254,23 @@ pub enum Message {
     // Divider between the story list and the reader
     ArticleListResized(f32),
     ArticleListResizeEnded,
+
+    // Settings window
+    OpenSettings,
+    CloseSettings,
+    SetKeepStarred(bool),
+    AskClearStories,
+    CancelClearStories,
+    ClearStories,
+    ImportOpml,
+    /// The OPML file chooser closed: `None` if cancelled, else (file name, contents)
+    OpmlFilePicked(Option<Result<(String, String), String>>),
+    ExportOpml,
+    /// The export file chooser closed: `None` if cancelled, else the saved
+    /// file's name and how many feeds it holds, or an error
+    OpmlExported(Option<Result<(String, usize), String>>),
+    /// Give memory freed by a closed story's images back to the system
+    ReleaseMemory,
 
     // Add feed dialog
     OpenAddFeed,
@@ -344,6 +379,7 @@ impl RssApp {
             renaming_feed: None,
             editing_feed: None,
             add_feed: None,
+            settings: None,
             article_menu: None,
             article_list_width: ARTICLE_LIST_DEFAULT_WIDTH,
             folder_menu: None,
@@ -494,6 +530,7 @@ impl RssApp {
                     .flatten()
                     .map(|article| reader_blocks(&article))
                     .unwrap_or_default();
+                let had_images = !self.story_images.is_empty();
                 self.prune_story_images(&blocks);
                 self.reader_texts = blocks
                     .iter()
@@ -504,7 +541,11 @@ impl RssApp {
                     .collect();
                 self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
-                Task::none()
+                if had_images {
+                    release_memory_soon()
+                } else {
+                    Task::none()
+                }
             }
             Message::LoadStoryImage(url) => {
                 if self.story_images.contains_key(&url) {
@@ -600,6 +641,229 @@ impl RssApp {
                 let _ = self
                     .db
                     .set_setting(ARTICLE_LIST_WIDTH_SETTING, &self.article_list_width.to_string());
+                Task::none()
+            }
+            Message::OpenSettings => {
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = None;
+                self.reader_text_menu = None;
+                self.settings = Some(SettingsState {
+                    keep_starred: true,
+                    confirm_clear: None,
+                    choosing_file: false,
+                    import_result: None,
+                    export_result: None,
+                });
+                Task::none()
+            }
+            Message::CloseSettings => {
+                self.settings = None;
+                Task::none()
+            }
+            Message::SetKeepStarred(keep) => {
+                if let Some(settings) = &mut self.settings {
+                    settings.keep_starred = keep;
+                }
+                Task::none()
+            }
+            Message::AskClearStories => {
+                let total = self.stats.1;
+                let starred = self.db.starred_count().unwrap_or(0);
+                if let Some(settings) = &mut self.settings {
+                    let to_delete = if settings.keep_starred { total - starred } else { total };
+                    settings.confirm_clear = Some((to_delete.max(0), starred));
+                }
+                Task::none()
+            }
+            Message::CancelClearStories => {
+                if let Some(settings) = &mut self.settings {
+                    settings.confirm_clear = None;
+                }
+                Task::none()
+            }
+            Message::ClearStories => {
+                // A refresh in progress would immediately add stories back
+                if self.is_syncing {
+                    return Task::none();
+                }
+                let keep_starred = self.settings.as_ref().is_none_or(|s| s.keep_starred);
+                self.settings = None;
+                match self.db.clear_stories(keep_starred) {
+                    Ok(deleted) => {
+                        self.status_message = Some((
+                            format!(
+                                "Deleted {} archived {}",
+                                deleted,
+                                if deleted == 1 { "story" } else { "stories" }
+                            ),
+                            false,
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Failed to clear stories: {}", e), true));
+                    }
+                }
+                // The open story may be gone
+                self.selected_article_id = None;
+                self.reader_body = None;
+                self.reader_texts.clear();
+                self.story_images.clear();
+                self.article_render_limit = ARTICLE_PAGE_SIZE;
+                self.reload_data();
+                release_memory_soon()
+            }
+            Message::ImportOpml => {
+                if let Some(settings) = &mut self.settings {
+                    settings.choosing_file = true;
+                    settings.import_result = None;
+                }
+                Task::perform(
+                    async {
+                        let file = rfd::AsyncFileDialog::new()
+                            .set_title("Import feeds from OPML")
+                            .add_filter("OPML files", &["opml", "xml"])
+                            .add_filter("All files", &["*"])
+                            .pick_file()
+                            .await?;
+                        let name = file.file_name();
+                        let contents = String::from_utf8(file.read().await)
+                            .map_err(|_| format!("{} isn't a text file", name));
+                        Some(contents.map(|contents| (name, contents)))
+                    },
+                    Message::OpmlFilePicked,
+                )
+            }
+            Message::OpmlFilePicked(picked) => {
+                if let Some(settings) = &mut self.settings {
+                    settings.choosing_file = false;
+                }
+                let Some(picked) = picked else {
+                    return Task::none(); // cancelled
+                };
+                let mut fetch = Task::none();
+                let outcome = match picked {
+                    Err(e) => (e, true),
+                    Ok((name, contents)) => match opml::import_new_feeds(&contents, &self.db) {
+                        Err(e) => (format!("Couldn't import {}: {}", name, e), true),
+                        Ok(import) => {
+                            self.reload_data();
+                            // Show where the new feeds went
+                            self.expanded_folders.extend(self.folders.iter().map(|f| f.id));
+                            let added = import.added.len();
+                            let plural = |n: usize, one: &str, many: &str| {
+                                format!("{} {}", n, if n == 1 { one } else { many })
+                            };
+                            let mut message = if added == 0 && import.skipped == 0 {
+                                format!("No feeds found in {}.", name)
+                            } else if added == 0 {
+                                format!(
+                                    "Nothing new in {}: you're already subscribed to all {}.",
+                                    name,
+                                    plural(import.skipped, "feed", "feeds")
+                                )
+                            } else {
+                                let mut m = format!("Added {}", plural(added, "feed", "feeds"));
+                                if import.folders_created > 0 {
+                                    m += &format!(
+                                        " and {}",
+                                        plural(import.folders_created, "folder", "folders")
+                                    );
+                                }
+                                m += &format!(" from {}.", name);
+                                if import.skipped > 0 {
+                                    m += &format!(
+                                        " Skipped {} you already have.",
+                                        plural(import.skipped, "feed", "feeds")
+                                    );
+                                }
+                                m
+                            };
+                            if added > 0 {
+                                if self.is_syncing {
+                                    message += " Their stories will download on the next refresh.";
+                                } else {
+                                    message += " Downloading their stories…";
+                                    fetch = self.refresh_feeds("the imported feeds".to_string(), import.added);
+                                }
+                            }
+                            (message, false)
+                        }
+                    },
+                };
+                match &mut self.settings {
+                    Some(settings) => settings.import_result = Some(outcome),
+                    // Settings closed while the file chooser was open
+                    None => self.status_message = Some(outcome),
+                }
+                fetch
+            }
+            Message::ExportOpml => {
+                // Snapshot the subscriptions now, so the file matches what was
+                // on screen when the button was pressed
+                let (opml_text, feed_count) = match opml::export_opml_from_db(&self.db) {
+                    Ok(text) => (text, self.feeds.len()),
+                    Err(e) => {
+                        if let Some(settings) = &mut self.settings {
+                            settings.export_result = Some((format!("Couldn't export: {}", e), true));
+                        }
+                        return Task::none();
+                    }
+                };
+                if let Some(settings) = &mut self.settings {
+                    settings.choosing_file = true;
+                    settings.export_result = None;
+                }
+                let file_name = format!(
+                    "rss-reader-feeds-{}.opml",
+                    chrono::Local::now().format("%Y-%m-%d")
+                );
+                Task::perform(
+                    async move {
+                        let file = rfd::AsyncFileDialog::new()
+                            .set_title("Export feeds to OPML")
+                            .set_file_name(&file_name)
+                            .add_filter("OPML files", &["opml"])
+                            .save_file()
+                            .await?;
+                        let name = file.file_name();
+                        Some(
+                            file.write(opml_text.as_bytes())
+                                .await
+                                .map(|()| (name.clone(), feed_count))
+                                .map_err(|e| format!("Couldn't save {}: {}", name, e)),
+                        )
+                    },
+                    Message::OpmlExported,
+                )
+            }
+            Message::OpmlExported(saved) => {
+                if let Some(settings) = &mut self.settings {
+                    settings.choosing_file = false;
+                }
+                let Some(saved) = saved else {
+                    return Task::none(); // cancelled
+                };
+                let outcome = match saved {
+                    Ok((name, feeds)) => (
+                        format!(
+                            "Saved {} {} to {}.",
+                            feeds,
+                            if feeds == 1 { "feed" } else { "feeds" },
+                            name
+                        ),
+                        false,
+                    ),
+                    Err(e) => (e, true),
+                };
+                match &mut self.settings {
+                    Some(settings) => settings.export_result = Some(outcome),
+                    None => self.status_message = Some(outcome),
+                }
+                Task::none()
+            }
+            Message::ReleaseMemory => {
+                release_memory();
                 Task::none()
             }
             Message::OpenAddFeed => {
@@ -1796,6 +2060,159 @@ impl RssApp {
         modal(form, Message::CancelEditFeed)
     }
 
+    /// The Settings window: import/export feeds as OPML, clear archived stories
+    /// (asks for confirmation first, inside the same window).
+    fn settings_view<'a>(&'a self, settings: &'a SettingsState) -> Element<'a, Message> {
+        let plural = |n: i64, one: &str, many: &str| {
+            format!("{} {}", n, if n == 1 { one } else { many })
+        };
+
+        // Import from OPML
+        let mut import_section = column![row![
+            column![
+                text("Import from OPML").size(14),
+                text("Add feeds and folders exported from another reader. Feeds you already have are left as they are.")
+                    .size(12)
+                    .style(text::secondary),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            button(text("Import…").size(13))
+                .padding([5, 12])
+                .style(button::secondary)
+                .on_press_maybe((!settings.choosing_file).then_some(Message::ImportOpml)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)]
+        .spacing(6);
+        if let Some((message, is_error)) = &settings.import_result {
+            import_section = import_section.push(
+                text(message)
+                    .size(12)
+                    .style(if *is_error { text::danger } else { text::success }),
+            );
+        }
+
+        // Export to OPML
+        let mut export_section = column![row![
+            column![
+                text("Export to OPML").size(14),
+                text("Save your feeds and folders to a file, as a backup or to use in another reader. Stories aren't included.")
+                    .size(12)
+                    .style(text::secondary),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            button(text("Export…").size(13))
+                .padding([5, 12])
+                .style(button::secondary)
+                .on_press_maybe(
+                    (!settings.choosing_file && !self.feeds.is_empty()).then_some(Message::ExportOpml)
+                ),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)]
+        .spacing(6);
+        if let Some((message, is_error)) = &settings.export_result {
+            export_section = export_section.push(
+                text(message)
+                    .size(12)
+                    .style(if *is_error { text::danger } else { text::success }),
+            );
+        }
+
+        // Clear archived stories
+        let clear_section: Element<'a, Message> = if let Some((to_delete, starred)) = settings.confirm_clear {
+            let mut details = String::new();
+            if settings.keep_starred && starred > 0 {
+                details += &format!("Your {} will be kept. ", plural(starred, "starred story", "starred stories"));
+            }
+            details += "Feeds and folders stay. Stories your feeds still list will download again on the next refresh. This can't be undone.";
+            column![
+                text(format!("Delete {}?", plural(to_delete, "archived story", "archived stories"))).size(14),
+                text(details).size(12).style(text::secondary),
+                row![
+                    horizontal_space(),
+                    button(text("Cancel").size(13))
+                        .padding([5, 12])
+                        .style(button::text)
+                        .on_press(Message::CancelClearStories),
+                    button(text("Delete stories").size(13))
+                        .padding([5, 12])
+                        .style(button::danger)
+                        .on_press_maybe((!self.is_syncing && to_delete > 0).then_some(Message::ClearStories)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            column![
+                row![
+                    column![
+                        text("Clear archived stories").size(14),
+                        text("Delete stored stories. Your feeds and folders are kept.")
+                            .size(12)
+                            .style(text::secondary),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text("Clear…").size(13))
+                        .padding([5, 12])
+                        .style(button::danger)
+                        .on_press_maybe((!self.is_syncing).then_some(Message::AskClearStories)),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                checkbox("Keep starred stories", settings.keep_starred)
+                    .on_toggle(Message::SetKeepStarred)
+                    .size(14)
+                    .text_size(12),
+            ]
+            .spacing(8)
+            .into()
+        };
+
+        let note: Element<'a, Message> = if self.is_syncing {
+            text("Wait for the current refresh to finish before clearing stories.")
+                .size(11)
+                .style(text::secondary)
+                .into()
+        } else {
+            Space::with_height(0).into()
+        };
+
+        let form = column![
+            text("Settings").size(16),
+            horizontal_rule(1),
+            import_section,
+            horizontal_rule(1),
+            export_section,
+            horizontal_rule(1),
+            clear_section,
+            note,
+            horizontal_rule(1),
+            row![
+                horizontal_space(),
+                button(text("Close").size(13))
+                    .padding([5, 14])
+                    .style(button::secondary)
+                    .on_press(Message::CloseSettings),
+            ],
+        ]
+        .spacing(12);
+
+        // Esc steps back out of the confirmation first, then closes
+        modal(
+            form,
+            if settings.confirm_clear.is_some() {
+                Message::CancelClearStories
+            } else {
+                Message::CloseSettings
+            },
+        )
+    }
+
     /// Modal "Add feed" dialog. The name fills in from the feed once the URL
     /// has been looked up, and stays editable.
     fn add_feed_dialog_view<'a>(&'a self, dialog: &'a AddFeedDialog) -> Element<'a, Message> {
@@ -2099,6 +2516,9 @@ impl RssApp {
         if let Some(dialog) = &self.add_feed {
             layers.push(self.add_feed_dialog_view(dialog));
         }
+        if let Some(settings) = &self.settings {
+            layers.push(self.settings_view(settings));
+        }
 
         if let Some(feed_id) = self.dragging_feed {
             let feed_title = self
@@ -2142,13 +2562,21 @@ impl RssApp {
 
     fn view_sidebar(&self) -> Element<'_, Message> {
         // App Header
-        let title_bar = column![
-            text("RSS Archive Reader").size(18),
-            text("Permanent SQL Archive")
-                .size(11)
-                .style(text::secondary),
+        let title_bar = row![
+            column![
+                text("RSS Archive Reader").size(18),
+                text("Permanent SQL Archive")
+                    .size(11)
+                    .style(text::secondary),
+            ]
+            .spacing(2),
+            horizontal_space(),
+            button(icon(Icon::Settings, 18.0, Tint::Text))
+                .padding(6)
+                .style(button::text)
+                .on_press(Message::OpenSettings),
         ]
-        .spacing(2);
+        .align_y(Alignment::Center);
 
         // Refresh Button
         let refresh_label: Element<'_, Message> = if self.is_syncing {
@@ -3066,4 +3494,25 @@ fn article_menu_view(article: &Article) -> Element<'_, Message> {
     ]
     .spacing(2);
     menu_card(body, 170.0)
+}
+
+/// Schedules `release_memory` shortly after a story with images is closed:
+/// iced's renderer drops the images when it next draws without them, so
+/// trimming right away would find nothing to give back.
+fn release_memory_soon() -> Task<Message> {
+    Task::perform(tokio::time::sleep(std::time::Duration::from_secs(2)), |_| {
+        Message::ReleaseMemory
+    })
+}
+
+/// Hands memory the allocator is holding on to back to the OS.
+///
+/// glibc keeps freed memory for reuse, so after viewing an image-heavy story
+/// the process stayed hundreds of MB larger even though the images were gone.
+fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only releases free heap pages; no pointers are affected
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }

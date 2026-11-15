@@ -31,7 +31,11 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
 
                     for attr in e.attributes().flatten() {
                         let key = attr.key.as_ref();
-                        let value = String::from_utf8_lossy(&attr.value).to_string();
+                        // Decode entities: a URL like "?a=1&amp;b=2" must become "?a=1&b=2"
+                        let value = attr
+                            .decode_and_unescape_value(&reader)
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).to_string());
 
                         if key.eq_ignore_ascii_case(b"xmlurl") {
                             xml_url = Some(value);
@@ -75,7 +79,11 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
 
                     for attr in e.attributes().flatten() {
                         let key = attr.key.as_ref();
-                        let value = String::from_utf8_lossy(&attr.value).to_string();
+                        // Decode entities: a URL like "?a=1&amp;b=2" must become "?a=1&b=2"
+                        let value = attr
+                            .decode_and_unescape_value(&reader)
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).to_string());
 
                         if key.eq_ignore_ascii_case(b"xmlurl") {
                             xml_url = Some(value);
@@ -150,6 +158,54 @@ pub fn import_opml_into_db(opml_content: &str, db: &Database) -> Result<usize> {
     Ok(count)
 }
 
+/// What an OPML import changed.
+#[derive(Debug, Clone, Default)]
+pub struct OpmlImport {
+    /// Ids of the feeds that were added (to fetch their stories)
+    pub added: Vec<i64>,
+    /// Feeds skipped because they were already subscribed (or listed twice)
+    pub skipped: usize,
+    pub folders_created: usize,
+}
+
+/// Imports feeds from OPML, leaving feeds that are already subscribed alone
+/// (their names and folders stay as the user set them). Folders are matched
+/// by name, case-insensitively, and created when missing.
+pub fn import_new_feeds(opml_content: &str, db: &Database) -> Result<OpmlImport> {
+    let outlines = parse_opml(opml_content)?;
+    let mut known_urls: std::collections::HashSet<String> =
+        db.get_feeds()?.into_iter().map(|f| f.url).collect();
+    let folders_before = db.get_folders()?.len();
+    let mut result = OpmlImport::default();
+
+    for outline in outlines {
+        let url = outline.xml_url.trim().to_string();
+        if url.is_empty() {
+            continue;
+        }
+        if !known_urls.insert(url.clone()) {
+            result.skipped += 1;
+            continue;
+        }
+        let folder_id = match outline.folder.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => Some(db.get_or_create_folder(name)?),
+            _ => None,
+        };
+        let title = outline.title.trim();
+        let id = db.add_or_update_feed(
+            &url,
+            if title.is_empty() { &url } else { title },
+            None,
+            outline.html_url.as_deref(),
+            folder_id,
+        )?;
+        result.added.push(id);
+    }
+
+    result.folders_created = db.get_folders()?.len().saturating_sub(folders_before);
+    Ok(result)
+}
+
 /// Exports all subscribed feeds from the database to an OPML 2.0 XML string with folder outlines.
 pub fn export_opml_from_db(db: &Database) -> Result<String> {
     let folders = db.get_folders().context("Failed to get folders for OPML export")?;
@@ -172,14 +228,7 @@ pub fn export_opml_from_db(db: &Database) -> Result<String> {
         ));
 
         for feed in feeds.iter().filter(|f| f.folder_id == Some(folder.id)) {
-            let safe_title = escape_xml(&feed.title);
-            let safe_xml_url = escape_xml(&feed.url);
-            let safe_html_url = feed.site_url.as_deref().map(escape_xml).unwrap_or_default();
-
-            out.push_str(&format!(
-                "      <outline text=\"{}\" title=\"{}\" type=\"rss\" xmlUrl=\"{}\" htmlUrl=\"{}\" />\n",
-                safe_title, safe_title, safe_xml_url, safe_html_url
-            ));
+            out.push_str(&feed_outline(feed, "      "));
         }
 
         out.push_str("    </outline>\n");
@@ -187,20 +236,28 @@ pub fn export_opml_from_db(db: &Database) -> Result<String> {
 
     // 2. Export uncategorized / root feeds
     for feed in feeds.iter().filter(|f| f.folder_id.is_none()) {
-        let safe_title = escape_xml(&feed.title);
-        let safe_xml_url = escape_xml(&feed.url);
-        let safe_html_url = feed.site_url.as_deref().map(escape_xml).unwrap_or_default();
-
-        out.push_str(&format!(
-            "    <outline text=\"{}\" title=\"{}\" type=\"rss\" xmlUrl=\"{}\" htmlUrl=\"{}\" />\n",
-            safe_title, safe_title, safe_xml_url, safe_html_url
-        ));
+        out.push_str(&feed_outline(feed, "    "));
     }
 
     out.push_str("  </body>\n");
     out.push_str("</opml>\n");
 
     Ok(out)
+}
+
+/// One feed's `<outline>` line. `htmlUrl` is left out when unknown rather
+/// than written empty.
+fn feed_outline(feed: &crate::models::Feed, indent: &str) -> String {
+    let title = escape_xml(&feed.title);
+    let mut line = format!(
+        "{indent}<outline text=\"{title}\" title=\"{title}\" type=\"rss\" xmlUrl=\"{}\"",
+        escape_xml(&feed.url)
+    );
+    if let Some(site) = feed.site_url.as_deref().filter(|s| !s.is_empty()) {
+        line += &format!(" htmlUrl=\"{}\"", escape_xml(site));
+    }
+    line += " />\n";
+    line
 }
 
 fn escape_xml(input: &str) -> String {
@@ -257,5 +314,69 @@ mod tests {
         assert!(exported.contains("<outline text=\"Technology\""));
         assert!(exported.contains("https://blog.rust-lang.org/feed.xml"));
         assert!(exported.contains("https://news.ycombinator.com/rss"));
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn imports_new_feeds_and_skips_existing() {
+        let db = Database::open_in_memory().unwrap();
+        let existing = db
+            .add_or_update_feed("https://a.com/feed", "My Renamed A", None, None, None)
+            .unwrap();
+        let opml = r#"<?xml version="1.0"?>
+            <opml version="2.0"><body>
+              <outline text="Tech">
+                <outline text="A" xmlUrl="https://a.com/feed"/>
+                <outline text="B" xmlUrl="https://b.com/rss?x=1&amp;y=2"/>
+              </outline>
+              <outline text="C" xmlUrl="https://c.com/atom"/>
+              <outline text="C again" xmlUrl="https://c.com/atom"/>
+            </body></opml>"#;
+
+        let result = import_new_feeds(opml, &db).unwrap();
+        assert_eq!(result.added.len(), 2);
+        assert_eq!(result.skipped, 2);
+        assert_eq!(result.folders_created, 1);
+
+        let feeds = db.get_feeds().unwrap();
+        // Existing feed untouched (name, no folder)
+        let a = feeds.iter().find(|f| f.id == existing).unwrap();
+        assert_eq!(a.title, "My Renamed A");
+        assert_eq!(a.folder_id, None);
+        // Entities in URLs decoded; folder applied
+        let b = feeds.iter().find(|f| f.title == "B").unwrap();
+        assert_eq!(b.url, "https://b.com/rss?x=1&y=2");
+        assert!(b.folder_id.is_some());
+    }
+
+    #[test]
+    fn export_round_trips_through_import() {
+        let db = Database::open_in_memory().unwrap();
+        let folder = db.create_folder("News & Views").unwrap();
+        let feed = db
+            .add_or_update_feed("https://a.com/feed?x=1&y=2", "A <Blog>", None, None, None)
+            .unwrap();
+        db.set_feed_folder(feed, Some(folder)).unwrap();
+        db.add_or_update_feed("https://b.com/rss", "B \"quoted\"", None, None, None)
+            .unwrap();
+
+        let exported = export_opml_from_db(&db).unwrap();
+        assert!(!exported.contains("htmlUrl=\"\""));
+
+        let copy = Database::open_in_memory().unwrap();
+        let import = import_new_feeds(&exported, &copy).unwrap();
+        assert_eq!(import.added.len(), 2);
+        let feeds = copy.get_feeds().unwrap();
+        let a = feeds.iter().find(|f| f.url == "https://a.com/feed?x=1&y=2").unwrap();
+        assert_eq!(a.title, "A <Blog>");
+        let folders = copy.get_folders().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name, "News & Views");
+        assert_eq!(a.folder_id, Some(folders[0].id));
+        assert!(feeds.iter().any(|f| f.title == "B \"quoted\""));
     }
 }

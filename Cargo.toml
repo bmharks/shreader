@@ -37,6 +37,8 @@ tracing-subscriber = "0.3"
 iced = { version = "0.13", features = ["tokio", "svg", "image", "advanced"] }
 # Same version iced uses; story images are decoded in the background with it
 image = "0.24"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+libc = "0.2"
 
 # Optimise dependencies even in debug builds. Image decoding, HTML conversion,
 # text layout and SQLite are 10-50x slower unoptimised, which made the UI
