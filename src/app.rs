@@ -1145,13 +1145,32 @@ impl RssApp {
                     Ok(summaries) => {
                         let total_inserted: usize = summaries.iter().map(|s| s.articles_inserted).sum();
                         let total_updated: usize = summaries.iter().map(|s| s.articles_updated).sum();
-                        self.status_message = Some((
-                            format!(
-                                "Sync complete: {} new stories archived, {} updated.",
-                                total_inserted, total_updated
-                            ),
-                            false,
-                        ));
+                        let mut failed: Vec<&str> = summaries
+                            .iter()
+                            .filter(|s| s.error.is_some())
+                            .map(|s| s.feed_title.as_str())
+                            .collect();
+                        failed.sort_unstable_by_key(|t| t.to_lowercase());
+                        let mut message = format!(
+                            "Sync complete: {} new {} archived, {} updated.",
+                            total_inserted,
+                            if total_inserted == 1 { "story" } else { "stories" },
+                            total_updated
+                        );
+                        if !failed.is_empty() {
+                            const NAMED: usize = 5;
+                            let mut names = failed.iter().take(NAMED).copied().collect::<Vec<_>>().join(", ");
+                            if failed.len() > NAMED {
+                                names += &format!(" and {} more", failed.len() - NAMED);
+                            }
+                            message += &format!(
+                                " {} feed{} couldn't be refreshed: {}.",
+                                failed.len(),
+                                if failed.len() == 1 { "" } else { "s" },
+                                names
+                            );
+                        }
+                        self.status_message = Some((message, !failed.is_empty()));
                         self.reload_data();
                     }
                     Err(e) => {
@@ -1700,10 +1719,7 @@ impl RssApp {
                     .add_or_update_feed(&url, &title, None, None, folder_id)
                     .map_err(|e| format!("Database error: {}", e))?;
 
-                let summary = fetcher
-                    .fetch_and_sync(&db, feed_id)
-                    .await
-                    .map_err(|e| format!("Feed fetch error: {}", e))?;
+                let summary = fetcher.fetch_and_sync(&db, feed_id).await;
                 if let Some(error) = summary.error {
                     return Err(format!("Added '{}', but fetching it failed: {}", title, error));
                 }
@@ -1729,18 +1745,7 @@ impl RssApp {
         let db = self.db.clone();
         let fetcher = self.fetcher.clone();
         Task::perform(
-            async move {
-                let mut summaries = Vec::with_capacity(feed_ids.len());
-                for feed_id in feed_ids {
-                    summaries.push(
-                        fetcher
-                            .fetch_and_sync(&db, feed_id)
-                            .await
-                            .map_err(|e| e.to_string())?,
-                    );
-                }
-                Ok(summaries)
-            },
+            async move { Ok(fetcher.sync_feeds(&db, feed_ids).await) },
             move |result| Message::PartialRefreshFinished(name.clone(), result),
         )
     }
@@ -2746,7 +2751,20 @@ impl RssApp {
             )
             .padding([8, 12])
             .max_width(460)
-            .style(container::bordered_box);
+            // Dark like the story cards: red error text is hard to read on
+            // the grey of `bordered_box`
+            .style(|theme: &Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    background: Some(palette.background.base.color.into()),
+                    border: iced::Border {
+                        color: palette.background.strong.color,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..container::Style::default()
+                }
+            });
 
             layers.push(
                 container(toast)

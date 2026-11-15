@@ -192,7 +192,12 @@ impl Database {
                 VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS trg_articles_au AFTER UPDATE ON articles BEGIN
+            -- Only text changes touch the search index; marking stories read
+            -- or starred mustn't re-index them. Recreated on every start so
+            -- databases made with the older any-column trigger get this one.
+            DROP TRIGGER IF EXISTS trg_articles_au;
+            CREATE TRIGGER trg_articles_au
+            AFTER UPDATE OF title, summary, content_text, author ON articles BEGIN
                 INSERT INTO articles_fts(articles_fts, rowid, title, summary, content_text, author)
                 VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
                 INSERT INTO articles_fts(rowid, title, summary, content_text, author)
@@ -387,6 +392,35 @@ impl Database {
         )?;
 
         Ok(id)
+    }
+
+    /// Stores what a refresh learned about a feed, without touching what the
+    /// user controls (folder, order, and a title they chose). The title is
+    /// only filled in while it's still the URL placeholder or empty. Returns
+    /// the feed's title, or `None` if the feed no longer exists.
+    pub fn update_feed_from_fetch(
+        &self,
+        feed_id: i64,
+        parsed_title: Option<&str>,
+        description: Option<&str>,
+        site_url: Option<&str>,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            r#"
+            UPDATE feeds SET
+                title = CASE WHEN (title = '' OR title = url) AND ?1 IS NOT NULL THEN ?1 ELSE title END,
+                description = COALESCE(?2, description),
+                site_url = COALESCE(?3, site_url)
+            WHERE id = ?4
+            "#,
+            params![parsed_title, description, site_url, feed_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let title = conn.query_row("SELECT title FROM feeds WHERE id = ?1", params![feed_id], |row| row.get(0))?;
+        Ok(Some(title))
     }
 
     pub fn update_feed_http_meta(
@@ -590,9 +624,16 @@ impl Database {
         let fetched_now = Utc::now().to_rfc3339();
 
         // Check if article already exists
-        let existing: Option<(i64, Option<String>, Option<String>)> = conn.query_row(
-            "SELECT id, title, summary FROM articles WHERE feed_id = ?1 AND guid_hash = ?2",
-            params![feed_id, guid_hash],
+        // Whether the text differs is worked out by SQLite, so stored bodies
+        // aren't copied out just to be compared
+        let existing: Option<(i64, bool, Option<String>)> = conn.query_row(
+            r#"
+            SELECT id,
+                   NOT (title IS ?3 AND summary IS ?4 AND (?5 IS NULL OR content_html IS ?5)),
+                   updated_at
+            FROM articles WHERE feed_id = ?1 AND guid_hash = ?2
+            "#,
+            params![feed_id, guid_hash, title, summary, content_html],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
 
@@ -615,11 +656,21 @@ impl Database {
                 )?;
                 Ok(IngestionResult::Inserted)
             }
-            Some((article_id, old_title, old_summary)) => {
-                let title_changed = old_title.as_deref() != Some(title);
-                let summary_changed = old_summary.as_deref() != summary;
-
-                if title_changed || summary_changed || updated_at.is_some() {
+            Some((article_id, text_changed, old_updated)) => {
+                // Only a change in the text counts. Some feeds stamp every
+                // story with the time the feed was generated, so a new
+                // "updated" date alone means nothing; it's stored without
+                // rewriting the story or its search index.
+                if !text_changed {
+                    if upd_str.is_some() && upd_str != old_updated {
+                        conn.execute(
+                            "UPDATE articles SET updated_at = ?1 WHERE id = ?2",
+                            params![upd_str, article_id],
+                        )?;
+                    }
+                    return Ok(IngestionResult::Unchanged);
+                }
+                {
                     // Update content while carefully preserving read & starred statuses
                     conn.execute(
                         r#"
@@ -638,8 +689,6 @@ impl Database {
                         ],
                     )?;
                     Ok(IngestionResult::Updated)
-                } else {
-                    Ok(IngestionResult::Unchanged)
                 }
             }
         }
@@ -943,6 +992,90 @@ mod tests {
         let search_results = db.get_articles(&filter).unwrap();
         assert_eq!(search_results.len(), 1);
         assert_eq!(search_results[0].title, "First Story");
+    }
+
+    #[test]
+    fn refresh_keeps_user_changes_and_deleted_feeds_gone() {
+        let db = Database::open_in_memory().unwrap();
+        let folder = db.create_folder("News").unwrap();
+        // Still the URL placeholder: a refresh fills in the real title
+        let placeholder = db
+            .add_or_update_feed("https://a.com/feed", "https://a.com/feed", None, None, None)
+            .unwrap();
+        assert_eq!(
+            db.update_feed_from_fetch(placeholder, Some("A Blog"), None, Some("https://a.com"))
+                .unwrap()
+                .as_deref(),
+            Some("A Blog")
+        );
+        // Renamed and moved by the user: a refresh leaves both alone
+        let renamed = db
+            .add_or_update_feed("https://b.com/feed", "My name for B", None, None, Some(folder))
+            .unwrap();
+        db.update_feed_from_fetch(renamed, Some("B's own title"), Some("about B"), None)
+            .unwrap();
+        let b = db.get_feed(renamed).unwrap().unwrap();
+        assert_eq!(b.title, "My name for B");
+        assert_eq!(b.folder_id, Some(folder));
+        // Deleted while downloading: not brought back
+        db.delete_feed(renamed).unwrap();
+        assert_eq!(db.update_feed_from_fetch(renamed, Some("B"), None, None).unwrap(), None);
+        assert!(db.get_feeds().unwrap().iter().all(|f| f.url != "https://b.com/feed"));
+    }
+
+    #[test]
+    fn only_text_changes_count_as_updates() {
+        let db = Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://a.com/feed", "A", None, None, None).unwrap();
+        let date = Utc::now();
+        let later = date + chrono::Duration::hours(1);
+        let upsert = |title: &str, html: Option<&str>, updated| {
+            db.upsert_article(feed, Some("g1"), "h1", title, None, None, Some("s"), html, Some("text"), None, Some(updated))
+                .unwrap()
+        };
+        assert!(matches!(upsert("Title", Some("<p>a</p>"), date), IngestionResult::Inserted));
+        assert!(matches!(upsert("Title", Some("<p>a</p>"), date), IngestionResult::Unchanged));
+        // A new date alone (feeds that stamp the generation time): unchanged,
+        // but the date is kept
+        assert!(matches!(upsert("Title", Some("<p>a</p>"), later), IngestionResult::Unchanged));
+        let stored: Option<String> = db.conn.lock().unwrap()
+            .query_row("SELECT updated_at FROM articles", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, Some(later.to_rfc3339()));
+        // Real edits
+        assert!(matches!(upsert("New title", Some("<p>a</p>"), later), IngestionResult::Updated));
+        assert!(matches!(upsert("New title", Some("<p>edited</p>"), later), IngestionResult::Updated));
+        // A fetch without the full content doesn't erase or "change" it
+        assert!(matches!(upsert("New title", None, later), IngestionResult::Unchanged));
+    }
+
+    #[test]
+    fn read_and_star_changes_leave_search_index_alone() {
+        let db = Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://a.com/feed", "A", None, None, None).unwrap();
+        db.upsert_article(feed, Some("g1"), "h1", "Needle story", None, None, None, None, Some("body"), None, None)
+            .unwrap();
+        let id = db.get_articles(&ArticleFilter::default()).unwrap()[0].id;
+        let index_changes = |db: &Database, f: &dyn Fn()| {
+            let conn = db.conn.lock().unwrap();
+            let before = conn.query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0)).unwrap();
+            drop(conn);
+            f();
+            let conn = db.conn.lock().unwrap();
+            conn.query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0)).unwrap() - before
+        };
+        // One row changed, and nothing else (no index delete + insert)
+        assert_eq!(index_changes(&db, &|| db.set_article_read(id, true).unwrap()), 1);
+        assert_eq!(index_changes(&db, &|| { db.toggle_article_starred(id).unwrap(); }), 1);
+        // A title change is still re-indexed
+        db.upsert_article(feed, Some("g1"), "h1", "Haystack story", None, None, None, None, Some("body"), None, None)
+            .unwrap();
+        let search = |q: &str| {
+            db.get_articles(&ArticleFilter { search_query: Some(q.into()), ..Default::default() })
+                .unwrap()
+                .len()
+        };
+        assert_eq!(search("haystack"), 1);
+        assert_eq!(search("needle"), 0);
     }
 
     #[test]

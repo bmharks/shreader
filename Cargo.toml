@@ -36,6 +36,8 @@ iced = { version = "0.13", features = ["tokio", "svg", "image", "advanced"] }
 image = "0.24"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 libc = "0.2"
+# Downloads several feeds at once during a refresh
+futures = "0.3"
 
 # Optimise dependencies even in debug builds. Image decoding, HTML conversion,
 # text layout and SQLite are 10-50x slower unoptimised, which made the UI

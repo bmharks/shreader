@@ -3754,6 +3754,7 @@ dependencies = [
  "chrono",
  "directories",
  "feed-rs",
+ "futures",
  "hex",
  "html2text",
  "iced",

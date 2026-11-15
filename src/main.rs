@@ -88,7 +88,10 @@ async fn main() -> Result<()> {
                 // Fetch immediately
                 let fetcher = feed::FeedFetcher::new();
                 println!("Syncing feed...");
-                let summary = fetcher.fetch_and_sync(&db, id).await?;
+                let summary = fetcher.fetch_and_sync(&db, id).await;
+                if let Some(error) = &summary.error {
+                    eprintln!("Fetching the feed failed: {}", error);
+                }
                 println!(
                     "Sync finished: {} new, {} updated, {} unchanged.",
                     summary.articles_inserted, summary.articles_updated, summary.articles_unchanged
