@@ -3769,6 +3769,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "usvg",
 ]
 
 [[package]]

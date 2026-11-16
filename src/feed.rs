@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -48,6 +50,102 @@ fn decode_image(bytes: &[u8]) -> Result<StoryImage, String> {
         height: rgba.height(),
         pixels: rgba.into_raw(),
     })
+}
+
+/// Fonts for SVG text: a cleaned SVG has its text turned into shapes, which
+/// needs the fonts. Loaded once, on first use (off the UI thread).
+static SVG_FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+    let mut fonts = usvg::fontdb::Database::new();
+    fonts.load_system_fonts();
+    Arc::new(fonts)
+});
+
+/// Makes a story's SVG safe to display.
+///
+/// iced draws SVGs with the SVG library's default settings, which load any
+/// local file an `<image>` element names, on the UI thread. A feed could use
+/// that to freeze the app (a named pipe), exhaust memory (`/dev/zero`) or
+/// show files from the disk. So the SVG is parsed here first with file
+/// loading off (images embedded as data still work), and iced gets the
+/// re-written result, which contains no file references at all.
+fn clean_svg(bytes: &[u8]) -> Result<StoryImage, String> {
+    let mut options = usvg::Options {
+        fontdb: SVG_FONTS.clone(),
+        ..usvg::Options::default()
+    };
+    options.image_href_resolver = usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
+    };
+    let tree = usvg::Tree::from_data(bytes, &options).map_err(|e| format!("unusable SVG: {}", e))?;
+    Ok(StoryImage::Svg(tree.to_string(&usvg::WriteOptions::default()).into_bytes()))
+}
+
+/// Whether `ip` is on the public internet, as opposed to this machine, the
+/// local network or other special ranges.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()            // 127/8
+                || v4.is_private()        // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()     // 169.254/16 (incl. cloud metadata)
+                || v4.is_unspecified()    // 0.0.0.0
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || a == 0                 // 0/8 "this network"
+                || (a == 100 && (64..128).contains(&b)) // 100.64/10 shared (CGNAT, Tailscale)
+                || (a == 198 && (18..20).contains(&b))  // 198.18/15 benchmarking
+                || a >= 240)              // reserved
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00  // fc00::/7 unique local
+                || (first & 0xffc0) == 0xfe80  // fe80::/10 link-local
+                || (first & 0xffc0) == 0xfec0) // fec0::/10 site-local (deprecated)
+        }
+    }
+}
+
+/// Whether a story image may be downloaded from `url`: web addresses only,
+/// and not a numeric address on this machine or the local network. (Names
+/// are checked when they're looked up; see `PublicOnlyResolver`.)
+fn image_url_allowed(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && match url.host() {
+            Some(url::Host::Ipv4(ip)) => is_public_ip(IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => is_public_ip(IpAddr::V6(ip)),
+            Some(url::Host::Domain(_)) => true,
+            None => false,
+        }
+}
+
+/// Looks up names for story image downloads, keeping only public addresses.
+/// Checking at lookup time (rather than before the request) means a name
+/// can't pass a check and then point somewhere local when connecting.
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|addr| is_public_ip(addr.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!("{} isn't a public internet address", host).into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// How the app identifies itself to feed servers.
@@ -113,6 +211,12 @@ pub struct FeedPreview {
 
 pub struct FeedFetcher {
     client: reqwest::Client,
+    /// For images inside stories: only reaches public internet addresses.
+    /// A story's `<img>` pointing at a router or a local service would
+    /// otherwise make the app send it a request when scrolled into view.
+    /// (Feeds use `client`, so subscribing to a feed on the local network
+    /// still works.)
+    image_client: reqwest::Client,
 }
 
 impl Default for FeedFetcher {
@@ -130,7 +234,24 @@ impl FeedFetcher {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        Self { client }
+        let image_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(20))
+            .dns_resolver(Arc::new(PublicOnlyResolver))
+            // Redirects to numeric addresses skip the name lookup; check them
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    attempt.error("too many redirects")
+                } else if !image_url_allowed(attempt.url()) {
+                    attempt.error("redirected to a local or non-web address")
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .build()
+            .expect("the image download client's settings are valid");
+
+        Self { client, image_client }
     }
 
     /// Fetches and ingests a feed into the database, preserving all existing
@@ -388,9 +509,13 @@ impl FeedFetcher {
     /// Downloads an image from a story. Refuses web pages and anything over
     /// `MAX_IMAGE_BYTES`.
     pub async fn fetch_image(&self, url: &str) -> Result<StoryImage, String> {
+        let parsed = Url::parse(url).map_err(|e| format!("bad URL: {}", e))?;
+        if !image_url_allowed(&parsed) {
+            return Err("not a public web address".to_string());
+        }
         let resp = self
-            .client
-            .get(url)
+            .image_client
+            .get(parsed)
             .send()
             .await
             .map_err(|e| format!("request failed: {}", e))?;
@@ -406,14 +531,15 @@ impl FeedFetcher {
         if content_type.starts_with("text/html") {
             return Err("not an image".to_string());
         }
+        // The server's stated type wins: image CDNs often serve a PNG
+        // version of a link ending in .svg. The extension only decides when
+        // the type says nothing useful.
         let is_svg = content_type.starts_with("image/svg")
-            || Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(".svg"));
+            || (!content_type.starts_with("image/")
+                && Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(".svg")));
 
         let bytes = read_limited(resp, MAX_IMAGE_BYTES).await?;
-        if is_svg {
-            return Ok(StoryImage::Svg(bytes));
-        }
-        tokio::task::spawn_blocking(move || decode_image(&bytes))
+        tokio::task::spawn_blocking(move || if is_svg { clean_svg(&bytes) } else { decode_image(&bytes) })
             .await
             .map_err(|e| format!("decoding failed: {}", e))?
     }
@@ -549,6 +675,125 @@ mod tests {
             feed_rs::parser::parse(&feed[..]).unwrap().entries[0].id,
             feed_rs::parser::parse(&feed[..]).unwrap().entries[0].id
         );
+    }
+
+    fn svg_text(image: &StoryImage) -> String {
+        match image {
+            StoryImage::Svg(bytes) => String::from_utf8(bytes.clone()).unwrap(),
+            other => panic!("expected an SVG, got {:?}", other),
+        }
+    }
+
+    /// A story SVG can't pull in local files; embedded images still work.
+    #[test]
+    fn story_svgs_cant_read_local_files() {
+        let dir = std::env::temp_dir().join(format!("shreader-svg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("local.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).save(&png_path).unwrap();
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png)
+            .unwrap();
+        use base64_free::encode;
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+                <image href="{}" width="10" height="10"/>
+                <image x="10" href="data:image/png;base64,{}" width="10" height="10"/>
+            </svg>"#,
+            png_path.display(),
+            encode(&png_bytes)
+        );
+
+        // What iced would do with it unchecked: the local file is loaded
+        let unchecked = usvg::Tree::from_data(svg.as_bytes(), &usvg::Options::default()).unwrap();
+        let unchecked = unchecked.to_string(&usvg::WriteOptions::default());
+        assert_eq!(unchecked.matches("data:image/png").count(), 2);
+
+        // Cleaned: only the embedded image is left
+        let cleaned = svg_text(&clean_svg(svg.as_bytes()).unwrap());
+        assert_eq!(cleaned.matches("data:image/png").count(), 1, "{}", cleaned);
+        assert!(!cleaned.contains("local.png"));
+        // And the result is itself a valid SVG
+        usvg::Tree::from_data(cleaned.as_bytes(), &usvg::Options::default()).unwrap();
+
+        // A named pipe would block the reader forever; cleaning doesn't touch it
+        let pipe = dir.join("pipe");
+        let c_path = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        // SAFETY: plain libc call with a valid NUL-terminated path
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/><image href="{}" width="10" height="10"/></svg>"#,
+            pipe.display()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(clean_svg(svg.as_bytes()).is_ok());
+        });
+        let finished = rx.recv_timeout(Duration::from_secs(5));
+        if finished.is_err() {
+            // Unblock the stuck thread before failing
+            let _ = std::fs::OpenOptions::new().write(true).open(&pipe);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(finished, Ok(true), "cleaning an SVG that names a pipe must not hang");
+    }
+
+    /// Tiny base64 encoder for the test above (no extra dependency).
+    mod base64_free {
+        pub fn encode(bytes: &[u8]) -> String {
+            const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+                let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn public_and_local_addresses() {
+        let public = ["93.184.215.14", "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "100.128.0.1"];
+        let local = [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254",
+            "0.0.0.0", "100.64.0.1", "100.127.255.255", "255.255.255.255", "224.0.0.1",
+            "::1", "::", "fe80::1", "fd12:3456::1", "::ffff:192.168.1.1", "::ffff:127.0.0.1",
+        ];
+        for ip in public {
+            assert!(is_public_ip(ip.parse().unwrap()), "{} should be public", ip);
+        }
+        for ip in local {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{} should be local", ip);
+        }
+        let allowed = |u: &str| image_url_allowed(&Url::parse(u).unwrap());
+        assert!(allowed("https://example.com/a.png"));
+        assert!(allowed("http://8.8.8.8/a.png"));
+        assert!(!allowed("http://192.168.1.1/reboot"));
+        assert!(!allowed("http://[::1]:8080/a.png"));
+        assert!(!allowed("file:///etc/passwd"));
+    }
+
+    /// Story images aren't downloaded from this machine, whether the address
+    /// is numeric or a name that resolves to it; feeds still are.
+    #[tokio::test]
+    async fn story_images_stay_off_the_local_network() {
+        let base = test_server().await; // http://127.0.0.1:PORT
+        let fetcher = FeedFetcher::new();
+        let numeric = fetcher.fetch_image(&format!("{}/good", base)).await;
+        assert!(numeric.is_err());
+        let named = fetcher.fetch_image(&base.replace("127.0.0.1", "localhost")).await;
+        let error = named.unwrap_err();
+        assert!(error.contains("request failed"), "{}", error);
+        // The feed client is unaffected
+        assert!(fetcher.preview(&format!("{}/good", base)).await.is_ok());
     }
 
     /// A tiny HTTP server for tests. Paths:
