@@ -19,6 +19,10 @@ pub struct ContextMenu<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     menu: Option<Element<'a, Message, Theme, Renderer>>,
     on_right_press: Option<Message>,
+    /// Like `on_right_press`, given where the click landed (relative to the
+    /// content's top left)
+    on_right_press_at: Option<Box<dyn Fn(Point) -> Message + 'a>>,
+    on_left_release: Option<Message>,
     on_dismiss: Option<Message>,
     on_escape: Option<Message>,
     focus_on_right_press: bool,
@@ -31,6 +35,8 @@ pub fn context_menu<'a, Message, Theme, Renderer>(
         content: content.into(),
         menu: None,
         on_right_press: None,
+        on_right_press_at: None,
+        on_left_release: None,
         on_dismiss: None,
         on_escape: None,
         focus_on_right_press: false,
@@ -46,6 +52,20 @@ impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer> {
 
     pub fn on_right_press(mut self, message: Message) -> Self {
         self.on_right_press = Some(message);
+        self
+    }
+
+    /// Like `on_right_press`, but the message gets the click's position
+    /// relative to the content's top left.
+    pub fn on_right_press_at(mut self, message: impl Fn(Point) -> Message + 'a) -> Self {
+        self.on_right_press_at = Some(Box::new(message));
+        self
+    }
+
+    /// Published when the left button is released over the content, even if
+    /// the content handled the click itself (as a text editor does).
+    pub fn on_left_release(mut self, message: Message) -> Self {
+        self.on_left_release = Some(message);
         self
     }
 
@@ -144,7 +164,7 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) -> event::Status {
-        if let event::Status::Captured = self.content.as_widget_mut().on_event(
+        let status = self.content.as_widget_mut().on_event(
             &mut tree.children[0],
             event.clone(),
             layout,
@@ -153,25 +173,38 @@ where
             clipboard,
             shell,
             viewport,
-        ) {
+        );
+        if let (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), Some(message)) =
+            (&event, &self.on_left_release)
+        {
+            if cursor.is_over(layout.bounds()) {
+                shell.publish(message.clone());
+            }
+        }
+        if let event::Status::Captured = status {
             return event::Status::Captured;
         }
 
         if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
-            if let (Some(message), Some(position)) =
-                (&self.on_right_press, cursor.position_over(layout.bounds()))
-            {
-                tree.state.downcast_mut::<State>().position = Some(position);
-                if self.focus_on_right_press {
-                    self.content.as_widget().operate(
-                        &mut tree.children[0],
-                        layout,
-                        renderer,
-                        &mut FocusAll,
-                    );
+            let bounds = layout.bounds();
+            if let Some(position) = cursor.position_over(bounds) {
+                let message = match &self.on_right_press_at {
+                    Some(at) => Some(at(Point::new(position.x - bounds.x, position.y - bounds.y))),
+                    None => self.on_right_press.clone(),
+                };
+                if let Some(message) = message {
+                    tree.state.downcast_mut::<State>().position = Some(position);
+                    if self.focus_on_right_press {
+                        self.content.as_widget().operate(
+                            &mut tree.children[0],
+                            layout,
+                            renderer,
+                            &mut FocusAll,
+                        );
+                    }
+                    shell.publish(message);
+                    return event::Status::Captured;
                 }
-                shell.publish(message.clone());
-                return event::Status::Captured;
             }
         }
 

@@ -9,9 +9,20 @@ use html2text::render::{TaggedLine, TextDecorator};
 /// One piece of a story, in reading order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    Text(String),
+    /// Text, one paragraph per line, and the links in it
+    Text { text: String, links: Vec<LinkSpan> },
     /// An image to download; `src` is an absolute http(s) URL
     Image { src: String },
+}
+
+/// A link in a text block: bytes `start..end` of line `line` lead to `url`
+/// (absolute; http, https or mailto).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkSpan {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
 }
 
 /// Splits `html` into text and image blocks. Relative image URLs are resolved
@@ -31,33 +42,86 @@ pub fn blocks(html: &str, base_url: Option<&str>) -> Vec<Block> {
         let Some(src) = image_source(tag, base.as_ref()) else {
             continue; // tracking pixel, data: URI, …: leave it out of the text too
         };
-        push_text(&mut blocks, &html[text_start..tag_start]);
+        push_text(&mut blocks, &html[text_start..tag_start], base.as_ref());
         text_start = tag_end;
         // Lazy-loading pages often repeat each image in a <noscript> fallback
         if seen_images.insert(src.clone()) {
             blocks.push(Block::Image { src });
         }
     }
-    push_text(&mut blocks, &html[text_start..]);
+    push_text(&mut blocks, &html[text_start..], base.as_ref());
     blocks
 }
 
-fn push_text(blocks: &mut Vec<Block>, html: &str) {
-    let text = html_to_text(html);
+fn push_text(blocks: &mut Vec<Block>, html: &str, base: Option<&url::Url>) {
+    let (text, links) = text_with_links(html, base);
     if !text.is_empty() {
-        blocks.push(Block::Text(text));
+        blocks.push(Block::Text { text, links });
     }
 }
 
 /// Plain text with each paragraph on one line (the reader wraps it to the
-/// column width). Links become just their text: footnote markers like "[3]"
-/// would be noise, and would restart in every chunk between images.
-pub fn html_to_text(html: &str) -> String {
+/// column width), and where its links are. A link shows as just its text:
+/// footnote markers like "[3]" would be noise, and would restart in every
+/// chunk between images.
+fn text_with_links(html: &str, base: Option<&url::Url>) -> (String, Vec<LinkSpan>) {
     // Wide enough that html2text never wraps a paragraph itself
     const NO_WRAP: usize = 100_000;
-    html2text::from_read_with_decorator(html.as_bytes(), NO_WRAP, ReaderDecorator)
-        .map(|text| text.trim().to_string())
-        .unwrap_or_default()
+    let Ok(lines) = html2text::config::with_decorator(ReaderDecorator).lines_from_read(html.as_bytes(), NO_WRAP)
+    else {
+        return (String::new(), Vec::new());
+    };
+
+    let mut text_lines: Vec<String> = Vec::new();
+    let mut links: Vec<LinkSpan> = Vec::new();
+    for line in &lines {
+        let line_number = text_lines.len();
+        let mut text = String::new();
+        for piece in line.tagged_strings() {
+            let start = text.len();
+            text.push_str(&piece.s);
+            // The innermost link, if the piece is inside one
+            let Some(url) = piece.tag.iter().rev().find_map(|tag| tag.as_deref()) else {
+                continue;
+            };
+            let Some(url) = resolve_link(url, base) else { continue };
+            match links.last_mut() {
+                // A link split into pieces (e.g. by <em> inside it)
+                Some(last) if last.line == line_number && last.end == start && last.url == url => {
+                    last.end = text.len();
+                }
+                _ => links.push(LinkSpan { line: line_number, start, end: text.len(), url }),
+            }
+        }
+        text_lines.push(text);
+    }
+
+    // Leave out blank lines at the start and end
+    let first = text_lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(text_lines.len());
+    let last = text_lines.iter().rposition(|l| !l.trim().is_empty()).map_or(first, |i| i + 1);
+    let links = links
+        .into_iter()
+        .filter(|link| (first..last).contains(&link.line))
+        .map(|link| LinkSpan { line: link.line - first, ..link })
+        .collect();
+    (text_lines[first..last].join("\n"), links)
+}
+
+/// A link's address made absolute, if it's one worth offering: web pages
+/// (relative ones resolved against the story's address) and email.
+fn resolve_link(href: &str, base: Option<&url::Url>) -> Option<String> {
+    let href = href.trim();
+    let url = match base {
+        Some(base) => base.join(href).ok()?,
+        None => url::Url::parse(href).ok()?,
+    };
+    matches!(url.scheme(), "http" | "https" | "mailto").then(|| url.to_string())
+}
+
+/// The story's text alone (for tests)
+#[cfg(test)]
+fn html_to_text(html: &str) -> String {
+    text_with_links(html, None).0
 }
 
 /// Deepest tag nesting converted to text as is. Real pages stay far below
@@ -355,43 +419,48 @@ fn best_srcset_candidate(srcset: &str) -> Option<&str> {
 struct ReaderDecorator;
 
 impl TextDecorator for ReaderDecorator {
-    type Annotation = ();
+    /// The address of the link a piece of text is in
+    type Annotation = Option<String>;
 
-    fn decorate_link_start(&mut self, _url: &str) -> (String, ()) {
-        (String::new(), ())
+    fn decorate_link_start(&mut self, url: &str) -> (String, Option<String>) {
+        (String::new(), Some(url.to_string()))
     }
     fn decorate_link_end(&mut self) -> String {
         String::new()
     }
-    fn decorate_em_start(&self) -> (String, ()) {
-        (String::new(), ())
+    fn decorate_em_start(&self) -> (String, Option<String>) {
+        (String::new(), None)
     }
     fn decorate_em_end(&self) -> String {
         String::new()
     }
-    fn decorate_strong_start(&self) -> (String, ()) {
-        (String::new(), ())
+    fn decorate_strong_start(&self) -> (String, Option<String>) {
+        (String::new(), None)
     }
     fn decorate_strong_end(&self) -> String {
         String::new()
     }
-    fn decorate_strikeout_start(&self) -> (String, ()) {
-        (String::new(), ())
+    fn decorate_strikeout_start(&self) -> (String, Option<String>) {
+        (String::new(), None)
     }
     fn decorate_strikeout_end(&self) -> String {
         String::new()
     }
-    fn decorate_code_start(&self) -> (String, ()) {
-        (String::new(), ())
+    fn decorate_code_start(&self) -> (String, Option<String>) {
+        (String::new(), None)
     }
     fn decorate_code_end(&self) -> String {
         String::new()
     }
-    fn decorate_preformat_first(&self) {}
-    fn decorate_preformat_cont(&self) {}
-    fn decorate_image(&mut self, _src: &str, _title: &str) -> (String, ()) {
+    fn decorate_preformat_first(&self) -> Option<String> {
+        None
+    }
+    fn decorate_preformat_cont(&self) -> Option<String> {
+        None
+    }
+    fn decorate_image(&mut self, _src: &str, _title: &str) -> (String, Option<String>) {
         // Images are shown as real images (or deliberately skipped)
-        (String::new(), ())
+        (String::new(), None)
     }
     fn header_prefix(&self, _level: usize) -> String {
         String::new()
@@ -412,7 +481,7 @@ impl TextDecorator for ReaderDecorator {
     fn make_subblock_decorator(&self) -> Self {
         *self
     }
-    fn finalise(&mut self, _links: Vec<String>) -> Vec<TaggedLine<()>> {
+    fn finalise(&mut self, _links: Vec<String>) -> Vec<TaggedLine<Option<String>>> {
         Vec::new()
     }
 }
@@ -459,9 +528,9 @@ mod tests {
         assert_eq!(
             blocks(html, None),
             vec![
-                Block::Text("Before".into()),
+                Block::Text { text: "Before".into(), links: vec![] },
                 Block::Image { src: "https://x.com/a.jpg".into() },
-                Block::Text("After".into()),
+                Block::Text { text: "After".into(), links: vec![] },
             ]
         );
     }
@@ -530,5 +599,28 @@ mod tests {
     fn links_have_no_footnotes() {
         let text = html_to_text(r#"<p>See <a href="https://x.com">this</a>.</p><ul><li>One</li></ul>"#);
         assert_eq!(text, "See this.\n\n- One");
+    }
+
+    /// Links are found with their position in the text, relative addresses
+    /// resolved; ones that aren't web or email links are plain text.
+    #[test]
+    fn links_are_located() {
+        let html = r#"<p>Read <a href="/2026/11/post">the <em>full</em> post</a> or
+            <a href="https://other.example/x?a=1&amp;b=2">this</a>.</p>
+            <p>Mail <a href="mailto:me@example.com">me</a>, not <a href="javascript:alert(1)">this</a>.</p>"#;
+        let (text, links) = text_with_links(html, url::Url::parse("https://pluralistic.net/2026/11/15/").ok().as_ref());
+        let lines: Vec<&str> = text.lines().collect();
+        let found: Vec<(&str, &str)> = links
+            .iter()
+            .map(|l| (&lines[l.line][l.start..l.end], l.url.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("the full post", "https://pluralistic.net/2026/11/post"),
+                ("this", "https://other.example/x?a=1&b=2"),
+                ("me", "mailto:me@example.com"),
+            ]
+        );
     }
 }

@@ -5,6 +5,7 @@ pub mod feed;
 pub mod follow_cursor;
 pub mod key_press;
 pub mod lazy_load;
+pub mod link_hover;
 pub mod icons;
 pub mod image_space;
 pub mod models;

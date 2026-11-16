@@ -11,12 +11,13 @@ use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme, Vector}
 use crate::db::Database;
 use crate::opml;
 use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
-use crate::story_content::{self, Block};
+use crate::story_content::{self, Block, LinkSpan};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
 use crate::key_press::{on_key_press, scroll_into_view};
 use crate::lazy_load::on_visible;
 use crate::image_space::image_space;
+use crate::link_hover::link_hover;
 use crate::icons::{icon, Icon, Tint};
 use crate::spinner::spinner;
 use crate::split::split;
@@ -135,6 +136,13 @@ pub struct RssApp {
     /// The open story's text blocks as read-only editors, so text can be
     /// selected and copied (iced's plain `text` can't be selected)
     reader_texts: Vec<text_editor::Content>,
+    /// The links in each of `reader_texts`
+    reader_links: Vec<std::sync::Arc<Vec<LinkSpan>>>,
+    /// A link pressed in the story text: opened when the button is released,
+    /// unless the press turned into a drag (selecting text)
+    pressed_link: Option<String>,
+    /// The link under the right click that opened the story text's menu
+    menu_link: Option<String>,
     /// Text block whose right-click (Copy / Select all) menu is open
     reader_text_menu: Option<usize>,
     search_query: String,
@@ -323,7 +331,11 @@ pub enum Message {
 
     /// Selecting text etc. in story text block `.0` (edits are ignored)
     ReaderTextAction(usize, text_editor::Action),
-    OpenReaderTextMenu(usize),
+    /// Right click in story text block `usize`, at this point in it
+    OpenReaderTextMenu(usize, iced::Point),
+    /// The left button was released over the story text
+    ReaderMouseReleased,
+    CopyLink(String),
     CloseReaderTextMenu,
     CopyReaderSelection(usize),
     SelectAllReaderText(usize),
@@ -445,6 +457,9 @@ impl RssApp {
             image_downloads: HashMap::new(),
             load_images: true,
             reader_texts: Vec::new(),
+            reader_links: Vec::new(),
+            pressed_link: None,
+            menu_link: None,
             reader_text_menu: None,
             search_query: String::new(),
             new_folder_input: String::new(),
@@ -658,13 +673,18 @@ impl RssApp {
                     .unwrap_or_default();
                 let had_images = !self.story_images.is_empty();
                 self.prune_story_images(&blocks);
-                self.reader_texts = blocks
+                (self.reader_texts, self.reader_links) = blocks
                     .iter()
                     .filter_map(|block| match block {
-                        Block::Text(body) => Some(text_editor::Content::with_text(body)),
+                        Block::Text { text, links } => Some((
+                            text_editor::Content::with_text(text),
+                            std::sync::Arc::new(links.clone()),
+                        )),
                         Block::Image { .. } => None,
                     })
-                    .collect();
+                    .unzip();
+                self.pressed_link = None;
+                self.menu_link = None;
                 self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
                 // A new story starts at its top (the reader's scroll position
@@ -740,18 +760,45 @@ impl RssApp {
             Message::ReaderTextAction(index, action) => {
                 // Read-only: allow selecting, moving, clicking, but never editing
                 if !action.is_edit() {
+                    let is_click = matches!(action, text_editor::Action::Click(_));
                     if let Some(content) = self.reader_texts.get_mut(index) {
                         content.perform(action);
+                    }
+                    // A click on a link opens it on release; any other
+                    // action (a drag to select, keys) cancels that
+                    self.pressed_link = if is_click { self.link_at_cursor(index) } else { None };
+                }
+                Task::none()
+            }
+            Message::ReaderMouseReleased => {
+                if let Some(url) = self.pressed_link.take() {
+                    if let Err(e) = open_in_browser(&url) {
+                        self.status_message = Some((e, true));
                     }
                 }
                 Task::none()
             }
-            Message::OpenReaderTextMenu(index) => {
+            Message::OpenReaderTextMenu(index, position) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = Some(index);
+                self.pressed_link = None;
+                // Whether the right click is on a link. Finding out moves the
+                // text cursor there, so not while text is selected (the menu's
+                // Copy is for the selection then).
+                self.menu_link = None;
+                if let Some(content) = self.reader_texts.get_mut(index) {
+                    if content.selection().is_none() {
+                        content.perform(text_editor::Action::Click(position));
+                        self.menu_link = self.link_at_cursor(index);
+                    }
+                }
                 Task::none()
+            }
+            Message::CopyLink(url) => {
+                self.reader_text_menu = None;
+                iced::clipboard::write(url)
             }
             Message::CloseReaderTextMenu => {
                 self.reader_text_menu = None;
@@ -1558,6 +1605,7 @@ impl RssApp {
                 Task::none()
             }
             Message::OpenUrl(url) => {
+                self.reader_text_menu = None;
                 if let Err(e) = open_in_browser(&url) {
                     self.status_message = Some((e, true));
                 }
@@ -1889,7 +1937,7 @@ impl RssApp {
             .iter()
             .filter_map(|block| match block {
                 Block::Image { src } => Some(src.as_str()),
-                Block::Text(_) => None,
+                Block::Text { .. } => None,
             })
             .collect();
         // Keep what this story still uses (e.g. reopening the same story); retry failures
@@ -1899,6 +1947,23 @@ impl RssApp {
         // handle aborts them), and ones not yet started are forgotten
         self.image_downloads.retain(|url, _| self.story_images.contains_key(url));
         self.image_queue.retain(|url| self.story_images.contains_key(url));
+    }
+
+    /// The link at the text cursor in story text block `index`, if any.
+    fn link_at_cursor(&self, index: usize) -> Option<String> {
+        let content = self.reader_texts.get(index)?;
+        let (line, column) = content.cursor_position();
+        let line_len = content.line(line).map_or(0, |text| text.len());
+        self.reader_links.get(index)?.iter().find_map(|link| {
+            // The cursor lands before or after the clicked character,
+            // whichever half was clicked. Right after a link's last character
+            // still counts, unless that's the end of the line (a click in
+            // the empty space beyond it).
+            let inside = link.line == line
+                && link.start <= column
+                && (column < link.end || (column == link.end && link.end < line_len));
+            inside.then(|| link.url.clone())
+        })
     }
 
     /// Starts queued image downloads, up to `MAX_IMAGE_DOWNLOADS` at once.
@@ -1963,17 +2028,17 @@ impl RssApp {
     ///
     /// With `selectable`, text blocks are the read-only editors in
     /// `reader_texts` (one per text block, in order) so they can be copied.
-    fn story_body<'a>(&'a self, blocks: &[Block], selectable: bool) -> Element<'a, Message> {
+    fn story_body<'a>(&'a self, blocks: &'a [Block], selectable: bool) -> Element<'a, Message> {
         let mut body = column![].spacing(14).width(Length::Fill);
         let mut text_index = 0;
         for block in blocks {
             body = body.push(match block {
-                Block::Text(text_block) => {
+                Block::Text { text: body_text, links } => {
                     let index = text_index;
                     text_index += 1;
                     match self.reader_texts.get(index).filter(|_| selectable) {
-                        Some(content) => self.selectable_text(index, content),
-                        None => text(text_block.clone()).size(14).width(Length::Fill).into(),
+                        Some(content) => self.selectable_text(index, content, body_text, links),
+                        None => text(body_text.clone()).size(14).width(Length::Fill).into(),
                     }
                 }
                 Block::Image { src } => self.story_image(src),
@@ -1988,8 +2053,15 @@ impl RssApp {
         &'a self,
         index: usize,
         content: &'a text_editor::Content,
+        block_text: &'a str,
+        block_links: &'a [LinkSpan],
     ) -> Element<'a, Message> {
+        let links = self.reader_links.get(index).cloned().unwrap_or_default();
         let editor = text_editor(content)
+            .highlight_with::<LinkHighlighter>(links, |_, _| iced::advanced::text::highlighter::Format {
+                color: Some(LINK_COLOR),
+                font: None,
+            })
             .on_action(move |action| Message::ReaderTextAction(index, action))
             // Plain arrows switch stories (Left/Right) and scroll the story
             // (Up/Down) even after clicking into the text; Shift+arrows still
@@ -2003,9 +2075,9 @@ impl RssApp {
                 ) if key_press.modifiers.is_empty() => None,
                 _ => text_editor::Binding::from_key_press(key_press),
             })
-            .size(14)
+            .size(READER_TEXT_SIZE)
             .padding(0)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .wrapping(READER_TEXT_WRAPPING)
             .style(|theme: &Theme, _status| {
                 let palette = theme.extended_palette();
                 text_editor::Style {
@@ -2027,20 +2099,27 @@ impl RssApp {
                     .style(button::text)
                     .on_press_maybe(message)
             };
-            menu_card(
-                column![
-                    menu_item("Copy", has_selection.then_some(Message::CopyReaderSelection(index))),
-                    menu_item("Select all", Some(Message::SelectAllReaderText(index))),
-                ]
-                .spacing(2),
-                150.0,
-            )
+            let mut items = column![].spacing(2);
+            if let Some(url) = &self.menu_link {
+                items = items
+                    .push(menu_item("Open link", Some(Message::OpenUrl(url.clone()))))
+                    .push(menu_item("Copy link address", Some(Message::CopyLink(url.clone()))))
+                    .push(horizontal_rule(1));
+            }
+            items = items
+                .push(menu_item("Copy", has_selection.then_some(Message::CopyReaderSelection(index))))
+                .push(menu_item("Select all", Some(Message::SelectAllReaderText(index))));
+            menu_card(items, 170.0)
         });
+
+        // The hand pointer over links (the editor itself only has the I-beam)
+        let editor = link_hover(editor, block_text, block_links, READER_TEXT_SIZE, READER_TEXT_WRAPPING);
 
         context_menu(editor)
             .menu(menu)
             .focus_on_right_press()
-            .on_right_press(Message::OpenReaderTextMenu(index))
+            .on_right_press_at(move |position| Message::OpenReaderTextMenu(index, position))
+            .on_left_release(Message::ReaderMouseReleased)
             .on_dismiss(Message::CloseReaderTextMenu)
             .into()
     }
@@ -3961,12 +4040,13 @@ fn reader_blocks(article: &Article) -> Vec<Block> {
     if !blocks.is_empty() {
         return blocks;
     }
-    vec![Block::Text(
-        article
+    vec![Block::Text {
+        text: article
             .content_text
             .clone()
             .unwrap_or_else(|| "No content available for this story.".to_string()),
-    )]
+        links: Vec::new(),
+    }]
 }
 
 /// Leaves room on the right matching the story's scrollbar (see `READER_SCROLLBAR_GUTTER`).
@@ -4062,6 +4142,55 @@ fn release_memory() {
     // SAFETY: malloc_trim only releases free heap pages; no pointers are affected
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Story text size, and how it wraps (shared with `link_hover`, whose
+/// layout has to match the text editor's exactly)
+const READER_TEXT_SIZE: f32 = 14.0;
+const READER_TEXT_WRAPPING: iced::widget::text::Wrapping = iced::widget::text::Wrapping::WordOrGlyph;
+
+/// Color of links in story text
+const LINK_COLOR: Color = Color::from_rgb(0.45, 0.70, 1.0);
+
+/// Colors the links in a story text block (the text editor's highlighter
+/// hook): given each block's links, it marks their ranges line by line.
+struct LinkHighlighter {
+    links: std::sync::Arc<Vec<LinkSpan>>,
+    line: usize,
+}
+
+impl iced::advanced::text::Highlighter for LinkHighlighter {
+    type Settings = std::sync::Arc<Vec<LinkSpan>>;
+    type Highlight = ();
+    type Iterator<'a> = std::vec::IntoIter<(std::ops::Range<usize>, ())>;
+
+    fn new(links: &Self::Settings) -> Self {
+        Self { links: links.clone(), line: 0 }
+    }
+
+    fn update(&mut self, links: &Self::Settings) {
+        self.links = links.clone();
+        self.line = 0;
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
+    fn highlight_line(&mut self, _text: &str) -> Self::Iterator<'_> {
+        let line = self.line;
+        self.line += 1;
+        self.links
+            .iter()
+            .filter(|link| link.line == line)
+            .map(|link| (link.start..link.end, ()))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
     }
 }
 
