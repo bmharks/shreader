@@ -21,6 +21,10 @@ refresh_menus() {
     # Let the desktop notice the change (both are optional)
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" || true
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$DATA_HOME/icons/hicolor" 2>/dev/null || true
+    # KDE Plasma keeps icons it looked up in memory, including "not found";
+    # without this, the menu and taskbar show no icon until you log out
+    command -v dbus-send >/dev/null 2>&1 &&
+        dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 2>/dev/null || true
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
