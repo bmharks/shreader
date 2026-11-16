@@ -16,6 +16,7 @@ use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
 use crate::key_press::{on_key_press, scroll_into_view};
 use crate::lazy_load::on_visible;
+use crate::image_space::image_space;
 use crate::icons::{icon, Icon, Tint};
 use crate::spinner::spinner;
 use crate::split::split;
@@ -39,6 +40,16 @@ const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Story images start downloading once they're within this distance of the
 /// visible part of the reader (about a screen ahead)
 const IMAGE_PRELOAD_MARGIN: f32 = 1000.0;
+
+/// Memory the open story's images may use once decoded. Each can take up to
+/// ~30 MB (1600x4800), and a story can hold hundreds; past this, the images
+/// loaded longest ago (normally those farthest from where you're reading)
+/// are released and reload if scrolled back to.
+const STORY_IMAGE_MEMORY: u64 = 400 * 1024 * 1024;
+
+/// Setting: download story images as they scroll into view (default), or
+/// only when clicked
+const LOAD_IMAGES_SETTING: &str = "load_images";
 
 /// Story list column width: default, limits, and where it's saved
 const ARTICLE_LIST_DEFAULT_WIDTH: f32 = 360.0;
@@ -109,6 +120,10 @@ pub struct RssApp {
     reader_body: Option<(i64, Vec<Block>)>,
     /// Images of the open story, by URL
     story_images: HashMap<String, ImageState>,
+    /// Counts image loads, for `ImageState::Raster::order`
+    image_loads: u64,
+    /// Whether story images load automatically (`LOAD_IMAGES_SETTING`)
+    load_images: bool,
     /// The open story's text blocks as read-only editors, so text can be
     /// selected and copied (iced's plain `text` can't be selected)
     reader_texts: Vec<text_editor::Content>,
@@ -198,8 +213,14 @@ struct EditFeedDialog {
 #[derive(Debug, Clone)]
 enum ImageState {
     Loading,
-    /// Photos, and SVGs drawn into pixels in the background
-    Raster(iced::widget::image::Handle),
+    /// Photos, and SVGs drawn into pixels in the background. `order` says
+    /// when it loaded, so the oldest are released first.
+    Raster { handle: iced::widget::image::Handle, width: u32, height: u32, order: u64 },
+    /// Released to keep memory in check (`STORY_IMAGE_MEMORY`). Its space is
+    /// kept, and it loads again when scrolled near.
+    Released { width: u32, height: u32 },
+    /// Released, and downloading again
+    Reloading { width: u32, height: u32 },
     Failed,
 }
 
@@ -279,6 +300,7 @@ pub enum Message {
     /// The automatic refresh timer fired
     AutoRefreshTick,
     SetAutoRefresh(bool),
+    SetLoadImages(bool),
     SetAutoRefreshInterval(RefreshInterval),
     SearchChanged(String),
     ToggleStar(i64),
@@ -410,6 +432,8 @@ impl RssApp {
             selected_article_id: None,
             reader_body: None,
             story_images: HashMap::new(),
+            image_loads: 0,
+            load_images: true,
             reader_texts: Vec::new(),
             reader_text_menu: None,
             search_query: String::new(),
@@ -448,6 +472,9 @@ impl RssApp {
             app.article_list_width = width;
         }
 
+        if let Ok(Some(on)) = app.db.get_setting(LOAD_IMAGES_SETTING) {
+            app.load_images = on != "false";
+        }
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
         }
@@ -688,10 +715,15 @@ impl RssApp {
                 ])
             }
             Message::LoadStoryImage(url) => {
-                if self.story_images.contains_key(&url) {
-                    return Task::none(); // already requested
+                match self.story_images.get(&url) {
+                    None => {
+                        self.story_images.insert(url.clone(), ImageState::Loading);
+                    }
+                    Some(&ImageState::Released { width, height }) => {
+                        self.story_images.insert(url.clone(), ImageState::Reloading { width, height });
+                    }
+                    Some(_) => return Task::none(), // already loaded or loading
                 }
-                self.story_images.insert(url.clone(), ImageState::Loading);
                 let fetcher = self.fetcher.clone();
                 Task::perform(
                     {
@@ -738,15 +770,22 @@ impl RssApp {
             Message::StoryImageLoaded(url, result) => {
                 // Ignore downloads for a story that's no longer open
                 if let Some(state) = self.story_images.get_mut(&url) {
+                    self.image_loads += 1;
                     *state = match result {
-                        Ok(StoryImage::Raster { width, height, pixels }) => ImageState::Raster(
-                            iced::widget::image::Handle::from_rgba(width, height, pixels),
-                        ),
+                        Ok(StoryImage::Raster { width, height, pixels }) => ImageState::Raster {
+                            handle: iced::widget::image::Handle::from_rgba(width, height, pixels),
+                            width,
+                            height,
+                            order: self.image_loads,
+                        },
                         Err(e) => {
                             tracing::debug!("Story image {} failed: {}", url, e);
                             ImageState::Failed
                         }
                     };
+                    if self.release_story_images_over_budget(&url) {
+                        return release_memory_soon();
+                    }
                 }
                 Task::none()
             }
@@ -1147,6 +1186,11 @@ impl RssApp {
                     return Task::none();
                 }
                 self.update(Message::RefreshClicked)
+            }
+            Message::SetLoadImages(on) => {
+                self.load_images = on;
+                let _ = self.db.set_setting(LOAD_IMAGES_SETTING, if on { "true" } else { "false" });
+                Task::none()
             }
             Message::SetAutoRefresh(on) => {
                 self.auto_refresh = on;
@@ -1845,6 +1889,41 @@ impl RssApp {
             .retain(|url, state| urls.contains(url.as_str()) && !matches!(state, ImageState::Failed));
     }
 
+    /// Keeps the open story's decoded images within `STORY_IMAGE_MEMORY` by
+    /// releasing the ones loaded longest ago (never `keep`, the one that just
+    /// arrived). Returns whether any were released.
+    fn release_story_images_over_budget(&mut self, keep: &str) -> bool {
+        let bytes = |width: u32, height: u32| u64::from(width) * u64::from(height) * 4;
+        let mut used: u64 = self
+            .story_images
+            .values()
+            .map(|state| match state {
+                ImageState::Raster { width, height, .. } => bytes(*width, *height),
+                _ => 0,
+            })
+            .sum();
+        let mut released = false;
+        while used > STORY_IMAGE_MEMORY {
+            let oldest = self
+                .story_images
+                .iter()
+                .filter_map(|(url, state)| match state {
+                    ImageState::Raster { order, .. } if url != keep => Some((*order, url.clone())),
+                    _ => None,
+                })
+                .min();
+            let Some((_, url)) = oldest else { break };
+            if let Some(state) = self.story_images.get_mut(&url) {
+                if let ImageState::Raster { width, height, .. } = *state {
+                    used -= bytes(width, height);
+                    *state = ImageState::Released { width, height };
+                    released = true;
+                }
+            }
+        }
+        released
+    }
+
     /// The story body: text paragraphs with the story's images in between.
     ///
     /// With `selectable`, text blocks are the read-only editors in
@@ -1937,13 +2016,28 @@ impl RssApp {
         let content: Element<'a, Message> = match self.story_images.get(src) {
             // Shrink-sized: small images stay at their own size, large ones are
             // scaled down to the column width (keeping their proportions)
-            Some(ImageState::Raster(handle)) => mouse_area(iced::widget::image(handle.clone()))
+            Some(ImageState::Raster { handle, .. }) => mouse_area(iced::widget::image(handle.clone()))
                 .on_press(open)
                 .interaction(mouse::Interaction::Pointer)
                 .into(),
+            // Released to save memory: same-sized space, reloaded when near
+            Some(&ImageState::Released { width, height }) => on_visible(
+                image_space(width, height),
+                Message::LoadStoryImage(src.to_string()),
+                IMAGE_PRELOAD_MARGIN,
+            )
+            .into(),
+            Some(&ImageState::Reloading { width, height }) => image_space(width, height).into(),
             Some(ImageState::Loading) => {
                 text("Loading image…").size(11).style(text::secondary).into()
             }
+            // Automatic loading off: only on request (an image can tell its
+            // sender that the story was opened)
+            None if !self.load_images => button(text("Show image").size(11))
+                .padding([2, 6])
+                .style(button::text)
+                .on_press(Message::LoadStoryImage(src.to_string()))
+                .into(),
             // Not requested yet: ask for it once it's near the visible area
             None => on_visible(
                 text("Loading image…").size(11).style(text::secondary),
@@ -2368,6 +2462,19 @@ impl RssApp {
         ]
         .spacing(6);
 
+        // Images
+        let images_section = column![
+            text("Images").size(14),
+            checkbox("Load images in stories automatically", self.load_images)
+                .on_toggle(Message::SetLoadImages)
+                .size(14)
+                .text_size(12),
+            text("Loading an image can let the sender see that you opened the story. When this is off, each image has a button to load it.")
+                .size(12)
+                .style(text::secondary),
+        ]
+        .spacing(6);
+
         // Export to OPML
         let mut export_section = column![row![
             column![
@@ -2471,6 +2578,8 @@ impl RssApp {
             text("Settings").size(16),
             horizontal_rule(1),
             refresh_section,
+            horizontal_rule(1),
+            images_section,
             horizontal_rule(1),
             import_section,
             horizontal_rule(1),
@@ -3972,7 +4081,35 @@ fn selected_story_id() -> container::Id {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_size, open_in_browser, RefreshInterval};
+    use super::{format_size, open_in_browser, ImageState, RefreshInterval, RssApp};
+
+    /// Past the memory budget, the images loaded longest ago are released
+    /// (keeping their size for the layout); the newest is never released.
+    #[test]
+    fn story_images_stay_within_memory_budget() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let (mut app, _) = RssApp::new(db);
+        // 20 images of 1600x4800 (~30 MB each, ~614 MB in all). The handles
+        // are 1x1: the budget goes by the recorded size.
+        for n in 1..=20u64 {
+            app.story_images.insert(
+                format!("img{}", n),
+                ImageState::Raster {
+                    handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0; 4]),
+                    width: 1600,
+                    height: 4800,
+                    order: n,
+                },
+            );
+        }
+        assert!(app.release_story_images_over_budget("img20"));
+        let released: Vec<u64> = (1..=20)
+            .filter(|n| matches!(app.story_images[&format!("img{}", n)], ImageState::Released { width: 1600, height: 4800 }))
+            .collect();
+        assert_eq!(released, (1..=7).collect::<Vec<_>>());
+        // Within budget now: nothing more to release
+        assert!(!app.release_story_images_over_budget("img20"));
+    }
 
     #[test]
     fn only_web_links_are_opened() {

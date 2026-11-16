@@ -6,6 +6,7 @@ pub mod follow_cursor;
 pub mod key_press;
 pub mod lazy_load;
 pub mod icons;
+pub mod image_space;
 pub mod models;
 pub mod on_escape;
 pub mod opml;

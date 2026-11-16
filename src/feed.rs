@@ -289,15 +289,27 @@ const MAX_NEW_PER_DAY: u64 = 3000;
 const MAX_BYTES_PER_DAY: u64 = 100 * 1024 * 1024;
 
 /// One line of text from a feed (a title, an author): control characters
-/// (newlines, terminal escape codes) become spaces, and it's cut to
-/// `max_chars` characters.
+/// (newlines, terminal escape codes) become spaces, invisible text-direction
+/// overrides are removed (they can make a title display as something else),
+/// and it's cut to `max_chars` characters.
 fn clean_line(text: &str, max_chars: usize) -> String {
-    let cleaned: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let cleaned: String = text
+        .chars()
+        .filter(|c| !is_direction_control(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let trimmed = cleaned.trim();
     match trimmed.char_indices().nth(max_chars) {
         Some((cut, _)) => format!("{}…", &trimmed[..cut]),
         None => trimmed.to_string(),
     }
+}
+
+/// Unicode's invisible bidirectional formatting characters: marks,
+/// embeddings, overrides and isolates. Right-to-left text displays
+/// correctly without them.
+fn is_direction_control(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// A story body or summary, cut to `MAX_STORY_BYTES` with a note saying so.
@@ -1094,6 +1106,11 @@ mod tests {
     #[test]
     fn oversized_text_is_cut() {
         assert_eq!(clean_line("A\ntitle\u{1b}[31m red", 100), "A title [31m red");
+        // "Invoice for exe.pdf" shown reversed by an override; removed. Real
+        // right-to-left text is untouched.
+        assert_eq!(clean_line("Invoice for \u{202E}fdp.exe", 100), "Invoice for fdp.exe");
+        assert_eq!(clean_line("\u{2067}שלום\u{2069} world", 100), "שלום world");
+        assert_eq!(clean_line("مرحبا بالعالم", 100), "مرحبا بالعالم");
         let long = "é".repeat(2000);
         let cut = clean_line(&long, MAX_TITLE_CHARS);
         assert_eq!(cut.chars().count(), MAX_TITLE_CHARS + 1); // plus "…"
