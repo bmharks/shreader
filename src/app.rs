@@ -56,6 +56,9 @@ const MAX_IMAGE_DOWNLOADS: usize = 4;
 /// only when clicked
 const LOAD_IMAGES_SETTING: &str = "load_images";
 
+/// Setting: show messages in the corner of the window (default), or none
+const NOTIFICATIONS_SETTING: &str = "notifications";
+
 /// Story list column width: default, limits, and where it's saved
 const ARTICLE_LIST_DEFAULT_WIDTH: f32 = 360.0;
 const ARTICLE_LIST_MIN_WIDTH: f32 = 260.0;
@@ -133,6 +136,8 @@ pub struct RssApp {
     image_downloads: HashMap<String, iced::task::Handle>,
     /// Whether story images load automatically (`LOAD_IMAGES_SETTING`)
     load_images: bool,
+    /// Whether messages pop up in the corner (`NOTIFICATIONS_SETTING`)
+    notifications: bool,
     /// The open story's text blocks as read-only editors, so text can be
     /// selected and copied (iced's plain `text` can't be selected)
     reader_texts: Vec<text_editor::Content>,
@@ -317,6 +322,7 @@ pub enum Message {
     AutoRefreshTick,
     SetAutoRefresh(bool),
     SetLoadImages(bool),
+    SetNotifications(bool),
     SetAutoRefreshInterval(RefreshInterval),
     SearchChanged(String),
     ToggleStar(i64),
@@ -456,6 +462,7 @@ impl RssApp {
             image_queue: VecDeque::new(),
             image_downloads: HashMap::new(),
             load_images: true,
+            notifications: true,
             reader_texts: Vec::new(),
             reader_links: Vec::new(),
             pressed_link: None,
@@ -499,6 +506,9 @@ impl RssApp {
 
         if let Ok(Some(on)) = app.db.get_setting(LOAD_IMAGES_SETTING) {
             app.load_images = on != "false";
+        }
+        if let Ok(Some(on)) = app.db.get_setting(NOTIFICATIONS_SETTING) {
+            app.notifications = on != "false";
         }
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
@@ -636,6 +646,11 @@ impl RssApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let previous_status = self.status_message.clone();
         let task = self.handle_message(message);
+
+        // Notifications off: every message is dropped here, wherever it came from
+        if !self.notifications {
+            self.status_message = None;
+        }
 
         // Any new status message starts its own auto-dismiss timer. The timer only
         // clears the message it was started for, so a newer message gets its own
@@ -1239,6 +1254,11 @@ impl RssApp {
                     return Task::none();
                 }
                 self.update(Message::RefreshClicked)
+            }
+            Message::SetNotifications(on) => {
+                self.notifications = on;
+                let _ = self.db.set_setting(NOTIFICATIONS_SETTING, if on { "true" } else { "false" });
+                Task::none()
             }
             Message::SetLoadImages(on) => {
                 self.load_images = on;
@@ -2589,6 +2609,19 @@ impl RssApp {
         ]
         .spacing(6);
 
+        // Notifications
+        let notifications_section = column![
+            text("Notifications").size(14),
+            checkbox("Show notifications", self.notifications)
+                .on_toggle(Message::SetNotifications)
+                .size(14)
+                .text_size(12),
+            text("Messages in the corner of the window, after refreshes and other actions. When this is off, none appear, including ones about problems.")
+                .size(12)
+                .style(text::secondary),
+        ]
+        .spacing(6);
+
         // Export to OPML
         let mut export_section = column![row![
             column![
@@ -2688,27 +2721,42 @@ impl RssApp {
             Space::with_height(0).into()
         };
 
+        // The sections scroll when the window is too short to show them all
+        let sections = scrollable(
+            column![
+                refresh_section,
+                horizontal_rule(1),
+                images_section,
+                horizontal_rule(1),
+                notifications_section,
+                horizontal_rule(1),
+                import_section,
+                horizontal_rule(1),
+                export_section,
+                horizontal_rule(1),
+                clear_section,
+                note,
+            ]
+            .spacing(12),
+        )
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new().width(6).scroller_width(6).spacing(6),
+        ));
+
+        // Close sits beside the title: the sections come last, so they get
+        // whatever height is left and scroll if it isn't enough
         let form = column![
-            text("Settings").size(16),
-            horizontal_rule(1),
-            refresh_section,
-            horizontal_rule(1),
-            images_section,
-            horizontal_rule(1),
-            import_section,
-            horizontal_rule(1),
-            export_section,
-            horizontal_rule(1),
-            clear_section,
-            note,
-            horizontal_rule(1),
             row![
+                text("Settings").size(16),
                 horizontal_space(),
                 button(text("Close").size(13))
                     .padding([5, 14])
                     .style(button::secondary)
                     .on_press(Message::CloseSettings),
-            ],
+            ]
+            .align_y(Alignment::Center),
+            horizontal_rule(1),
+            sections,
         ]
         .spacing(12);
 
@@ -4246,6 +4294,20 @@ fn selected_story_id() -> container::Id {
 #[cfg(test)]
 mod tests {
     use super::{format_size, open_in_browser, ImageState, RefreshInterval, RssApp};
+
+    /// With notifications off, no message pops up; turning them back on
+    /// shows the next one.
+    #[tokio::test]
+    async fn notifications_can_be_silenced() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let (mut app, _) = RssApp::new(db);
+        let _ = app.update(super::Message::SetNotifications(false));
+        let _ = app.update(super::Message::OpenUrl("file:///etc/passwd".into())); // refused: an error message
+        assert_eq!(app.status_message, None);
+        let _ = app.update(super::Message::SetNotifications(true));
+        let _ = app.update(super::Message::OpenUrl("file:///etc/passwd".into()));
+        assert!(app.status_message.is_some());
+    }
 
     /// Story images download a few at a time, in order; switching stories
     /// cancels downloads and queued images the new story doesn't show.
