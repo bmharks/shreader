@@ -17,6 +17,9 @@ use crate::icons::{handle, Icon, Tint};
 /// Seconds per full turn
 const PERIOD: f32 = 1.0;
 
+/// Time between animation frames (60 per second)
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
+
 pub struct Spinner {
     icon: Icon,
     size: f32,
@@ -70,7 +73,10 @@ where
             let started = *state.started.get_or_insert(now);
             let turns = now.duration_since(started).as_secs_f32() / PERIOD;
             state.rotation = turns.fract() * std::f32::consts::TAU;
-            shell.request_redraw(window::RedrawRequest::NextFrame);
+            // At most 60 frames a second, rather than every frame the display
+            // takes: with mailbox presentation (see main.rs) nothing else
+            // limits the rate, and the spinner alone kept a CPU core busy
+            shell.request_redraw(window::RedrawRequest::At(now + FRAME_INTERVAL));
         }
         event::Status::Ignored
     }

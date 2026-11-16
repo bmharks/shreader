@@ -35,10 +35,46 @@ fn main() -> Result<()> {
         unsafe { env::set_var("WGPU_POWER_PREF", "high") };
     }
 
+    // Only the desktop app draws anything (command-line options don't)
+    if env::args().len() == 1 && env::var_os("ICED_PRESENT_MODE").is_none() && supports_mailbox() {
+        // SAFETY: as above, still single-threaded
+        unsafe { env::set_var("ICED_PRESENT_MODE", "mailbox") };
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run())
+}
+
+/// Whether frames can be presented in "mailbox" mode, which keeps resizing
+/// smooth on Wayland. iced's default waits for each display refresh before
+/// it can draw the next frame, and during an interactive resize those waits
+/// pile up (sluggish resizing, "Timeout when presenting surface").
+///
+/// iced only takes the mode from `ICED_PRESENT_MODE`, before the window
+/// exists, and fails to start if the driver lacks the mode. So: only when a
+/// real GPU has a Vulkan driver, which wgpu then uses, and whose window
+/// systems all offer mailbox (Mesa's AMD and Intel drivers, NVIDIA's). The
+/// OpenGL fallback doesn't, and keeps the default. Setting
+/// ICED_PRESENT_MODE yourself (e.g. to "vsync") overrides this.
+fn supports_mailbox() -> bool {
+    // A backend chosen by the user that isn't Vulkan
+    if let Some(backends) = wgpu::util::backend_bits_from_env() {
+        if !backends.contains(wgpu::Backends::VULKAN) {
+            return false;
+        }
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..Default::default()
+    });
+    instance.enumerate_adapters(wgpu::Backends::VULKAN).iter().any(|adapter| {
+        matches!(
+            adapter.get_info().device_type,
+            wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::VirtualGpu
+        )
+    })
 }
 
 async fn run() -> Result<()> {

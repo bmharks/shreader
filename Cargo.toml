@@ -43,6 +43,8 @@ tracing-subscriber = "0.3"
 iced = { version = "0.13", features = ["tokio", "svg", "image", "advanced"] }
 # Same version iced uses; story images are decoded in the background with it
 image = "0.24"
+# To check for a Vulkan GPU at startup (same version iced uses)
+wgpu = "0.19"
 # Draws story SVGs into images in the background (same version and features
 # iced uses, so nothing extra is compiled)
 resvg = { version = "0.42", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
