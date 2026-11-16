@@ -14,7 +14,7 @@ pub struct OpmlOutline {
 /// Parses an OPML XML string and extracts all feed URLs, titles, and their parent folder names.
 pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
     let mut reader = Reader::from_str(opml_content);
-    reader.trim_text(true);
+    reader.config_mut().trim_text(true);
 
     let mut outlines = Vec::new();
     let mut folder_stack: Vec<String> = Vec::new();
@@ -33,7 +33,7 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
                         let key = attr.key.as_ref();
                         // Decode entities: a URL like "?a=1&amp;b=2" must become "?a=1&b=2"
                         let value = attr
-                            .decode_and_unescape_value(&reader)
+                            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
                             .map(|v| v.into_owned())
                             .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).to_string());
 
@@ -81,7 +81,7 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
                         let key = attr.key.as_ref();
                         // Decode entities: a URL like "?a=1&amp;b=2" must become "?a=1&b=2"
                         let value = attr
-                            .decode_and_unescape_value(&reader)
+                            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
                             .map(|v| v.into_owned())
                             .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).to_string());
 

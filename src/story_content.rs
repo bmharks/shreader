@@ -1,6 +1,7 @@
 //! Turns a story's HTML into what the reader shows: text paragraphs with the
 //! story's images in between, in their original order.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use html2text::render::{TaggedLine, TextDecorator};
@@ -16,6 +17,7 @@ pub enum Block {
 /// Splits `html` into text and image blocks. Relative image URLs are resolved
 /// against `base_url` (the story's own link).
 pub fn blocks(html: &str, base_url: Option<&str>) -> Vec<Block> {
+    let html = &*limit_nesting(html);
     let base = base_url.and_then(|u| url::Url::parse(u).ok());
     let mut blocks = Vec::new();
     let mut seen_images = HashSet::new();
@@ -56,6 +58,141 @@ pub fn html_to_text(html: &str) -> String {
     html2text::from_read_with_decorator(html.as_bytes(), NO_WRAP, ReaderDecorator)
         .map(|text| text.trim().to_string())
         .unwrap_or_default()
+}
+
+/// Deepest tag nesting converted to text as is. Real pages stay far below
+/// this (a few dozen levels); converting gets quadratically slower with
+/// depth (100,000 nested `<div>`s, 1 MB of HTML, took 21 seconds).
+const MAX_HTML_DEPTH: usize = 256;
+
+/// `html`, unless its tags nest deeper than `MAX_HTML_DEPTH`: then the same
+/// text and images with every other tag removed, so converting it stays fast.
+/// Formatting is lost only for such (hostile or broken) HTML.
+pub fn limit_nesting(html: &str) -> Cow<'_, str> {
+    if !nests_deeper_than(html, MAX_HTML_DEPTH) {
+        return Cow::Borrowed(html);
+    }
+    let mut flat = String::with_capacity(html.len() / 2);
+    let mut last = 0;
+    for (start, end, name, _) in tags(html) {
+        flat.push_str(&html[last..start]);
+        if name.eq_ignore_ascii_case("img") {
+            flat.push_str(&html[start..end]);
+        } else {
+            flat.push(' ');
+        }
+        last = end;
+    }
+    flat.push_str(&html[last..]);
+    Cow::Owned(flat)
+}
+
+/// Whether open tags nest more than `max` deep. Approximate, but never
+/// overcounts real HTML: elements that close themselves or are routinely
+/// left unclosed (`<br>`, `<p>`, `<li>`, …) aren't counted.
+fn nests_deeper_than(html: &str, max: usize) -> bool {
+    const UNCOUNTED: &[&str] = &[
+        // Void elements
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr",
+        // End tags often omitted
+        "p", "li", "dt", "dd", "tr", "td", "th", "thead", "tbody", "tfoot", "option", "optgroup",
+        "colgroup", "rt", "rp", "caption",
+    ];
+    let mut depth: usize = 0;
+    for (_, _, name, kind) in tags(html) {
+        if UNCOUNTED.iter().any(|u| name.eq_ignore_ascii_case(u)) {
+            continue;
+        }
+        match kind {
+            TagKind::Open => {
+                depth += 1;
+                if depth > max {
+                    return true;
+                }
+            }
+            TagKind::Close => depth = depth.saturating_sub(1),
+            TagKind::SelfClosing => {}
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TagKind {
+    Open,
+    Close,
+    SelfClosing,
+}
+
+/// The tags in `html`, as (start, end, name, kind); comments and
+/// declarations (`<!…>`, `<?…>`) are skipped. A simple linear scan.
+fn tags(html: &str) -> impl Iterator<Item = (usize, usize, &str, TagKind)> {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            let Some(offset) = bytes[i..].iter().position(|&b| b == b'<') else {
+                i = bytes.len();
+                return None;
+            };
+            let start = i + offset;
+            let rest = &bytes[start..];
+            if rest.starts_with(b"<!--") {
+                i = match find(rest, b"-->") {
+                    Some(end) => start + end + 3,
+                    None => bytes.len(),
+                };
+                continue;
+            }
+            let closing = rest.get(1) == Some(&b'/');
+            let name_start = start + 1 + closing as usize;
+            let name_len = bytes[name_start.min(bytes.len())..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric())
+                .count();
+            if name_len == 0 {
+                // "<!DOCTYPE", "<?xml", or a stray "<" in text
+                i = start + 1;
+                if matches!(rest.get(1), Some(b'!' | b'?')) {
+                    i = find(rest, b">").map_or(bytes.len(), |end| start + end + 1);
+                }
+                continue;
+            }
+            // The closing '>' that isn't inside a quoted attribute value
+            let mut quote = None;
+            let mut end = None;
+            for (j, &c) in bytes[name_start + name_len..].iter().enumerate() {
+                match (quote, c) {
+                    (None, b'"' | b'\'') => quote = Some(c),
+                    (Some(q), c) if c == q => quote = None,
+                    (None, b'>') => {
+                        end = Some(name_start + name_len + j + 1);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                i = bytes.len(); // unterminated: the rest is text
+                return None;
+            };
+            i = end;
+            let kind = if closing {
+                TagKind::Close
+            } else if bytes[end - 2] == b'/' {
+                TagKind::SelfClosing
+            } else {
+                TagKind::Open
+            };
+            return Some((start, end, &html[name_start..name_start + name_len], kind));
+        }
+        None
+    })
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Byte range of the next `<img …>` tag at or after `from`.
@@ -282,6 +419,28 @@ impl TextDecorator for ReaderDecorator {
 
 #[cfg(test)]
 mod tests {
+
+    /// Deeply nested HTML is flattened (fast, text and images kept); normal
+    /// HTML, including the usual unclosed <p> and <li>, is left alone.
+    #[test]
+    fn deep_nesting_is_flattened() {
+        let deep = format!("{}Hello <img src=\"https://e.com/a.png\"> world{}", "<div>".repeat(100_000), "</div>".repeat(100_000));
+        let start = std::time::Instant::now();
+        let flat = limit_nesting(&deep);
+        assert!(matches!(flat, Cow::Owned(_)));
+        assert!(flat.contains("Hello") && flat.contains("<img src=\"https://e.com/a.png\">") && !flat.contains("<div>"));
+        let blocks = blocks(&deep, None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert_eq!(blocks.len(), 3, "{:?}", blocks);
+
+        let normal = format!(
+            "<!DOCTYPE html><html><body><div><ul>{}</ul>{}<!-- <div><div> --></div></body></html>",
+            "<li>item".repeat(1000),
+            "<p>para<br>".repeat(1000)
+        );
+        assert!(matches!(limit_nesting(&normal), Cow::Borrowed(_)));
+    }
+
     use super::*;
 
     fn images(blocks: &[Block]) -> Vec<&str> {

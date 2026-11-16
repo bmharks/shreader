@@ -198,8 +198,8 @@ struct EditFeedDialog {
 #[derive(Debug, Clone)]
 enum ImageState {
     Loading,
+    /// Photos, and SVGs drawn into pixels in the background
     Raster(iced::widget::image::Handle),
-    Svg(iced::widget::svg::Handle),
     Failed,
 }
 
@@ -742,9 +742,6 @@ impl RssApp {
                         Ok(StoryImage::Raster { width, height, pixels }) => ImageState::Raster(
                             iced::widget::image::Handle::from_rgba(width, height, pixels),
                         ),
-                        Ok(StoryImage::Svg(bytes)) => {
-                            ImageState::Svg(iced::widget::svg::Handle::from_memory(bytes))
-                        }
                         Err(e) => {
                             tracing::debug!("Story image {} failed: {}", url, e);
                             ImageState::Failed
@@ -1192,6 +1189,7 @@ impl RssApp {
                                 names
                             );
                         }
+                        message += &held_back_note(&summaries);
                         self.status_message = Some((message, !failed.is_empty()));
                         self.reload_data();
                     }
@@ -1295,8 +1293,9 @@ impl RssApp {
                             1 => "1 new story".to_string(),
                             n => format!("{} new stories", n),
                         };
+                        let held_back = held_back_note(&summaries);
                         match (failed.len(), summaries.len()) {
-                            (0, _) => (format!("Refreshed {}: {}", name, new_stories), false),
+                            (0, _) => (format!("Refreshed {}: {}.{}", name, new_stories, held_back), false),
                             // A single feed: say why it failed
                             (_, 1) => (
                                 format!(
@@ -1308,12 +1307,13 @@ impl RssApp {
                             ),
                             (n, _) => (
                                 format!(
-                                    "Refreshed {}: {}. {} feed{} failed: {}",
+                                    "Refreshed {}: {}. {} feed{} failed: {}.{}",
                                     name,
                                     new_stories,
                                     n,
                                     if n == 1 { "" } else { "s" },
-                                    failed.join(", ")
+                                    failed.join(", "),
+                                    held_back
                                 ),
                                 true,
                             ),
@@ -1941,14 +1941,6 @@ impl RssApp {
                 .on_press(open)
                 .interaction(mouse::Interaction::Pointer)
                 .into(),
-            Some(ImageState::Svg(handle)) => mouse_area(
-                iced::widget::svg(handle.clone())
-                    .width(Length::Shrink)
-                    .height(Length::Shrink),
-            )
-            .on_press(open)
-            .interaction(mouse::Interaction::Pointer)
-            .into(),
             Some(ImageState::Loading) => {
                 text("Loading image…").size(11).style(text::secondary).into()
             }
@@ -3810,12 +3802,18 @@ fn reading_column<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, M
 /// Built from the HTML rather than the stored `content_text`: that one is
 /// hard-wrapped at 80 columns (it's made for search) and has no images.
 fn reader_blocks(article: &Article) -> Vec<Block> {
-    let blocks = article
-        .content_html
-        .as_deref()
-        .or(article.summary.as_deref())
-        .map(|html| story_content::blocks(html, article.url.as_deref()))
-        .unwrap_or_default();
+    // Runs on the UI thread: a panic in the HTML conversion (a library bug
+    // hit by odd story content) would close the app. Fall back to the plain
+    // text stored for the story instead.
+    let blocks = std::panic::catch_unwind(|| {
+        article
+            .content_html
+            .as_deref()
+            .or(article.summary.as_deref())
+            .map(|html| story_content::blocks(html, article.url.as_deref()))
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
     if !blocks.is_empty() {
         return blocks;
     }
@@ -3861,6 +3859,25 @@ fn article_menu_view(article: &Article) -> Element<'_, Message> {
     ]
     .spacing(2);
     menu_card(body, 170.0)
+}
+
+/// " Held back some new stories from …" for feeds that sent more than they
+/// may add at once (empty if none did).
+fn held_back_note(summaries: &[crate::models::FeedSyncSummary]) -> String {
+    let mut limited: Vec<&str> = summaries.iter().filter(|s| s.limited).map(|s| s.feed_title.as_str()).collect();
+    if limited.is_empty() {
+        return String::new();
+    }
+    limited.sort_unstable_by_key(|t| t.to_lowercase());
+    const NAMED: usize = 5;
+    let mut names = limited.iter().take(NAMED).copied().collect::<Vec<_>>().join(", ");
+    if limited.len() > NAMED {
+        names += &format!(" and {} more", limited.len() - NAMED);
+    }
+    format!(
+        " Held back some new stories from {} (more than a feed may add at once); later refreshes pick them up if the feed still lists them.",
+        names
+    )
 }
 
 /// Opens a web link in the default browser.

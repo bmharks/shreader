@@ -114,6 +114,11 @@ async fn run() -> Result<()> {
                     "Sync finished: {} new, {} updated, {} unchanged.",
                     summary.articles_inserted, summary.articles_updated, summary.articles_unchanged
                 );
+                if summary.limited {
+                    println!(
+                        "Held back some new stories (more than a feed may add at once); later refreshes pick them up if the feed still lists them."
+                    );
+                }
                 return Ok(());
             }
             "--move-feed" => {

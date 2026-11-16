@@ -1,15 +1,20 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use resvg::usvg;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::db::Database;
+use crate::db::StoredState;
 use crate::models::{FeedSyncSummary, IngestionResult};
 
 /// A downloaded story image, ready to draw.
@@ -18,8 +23,8 @@ pub enum StoryImage {
     /// Decoded RGBA pixels. Decoding happens on a background thread: iced
     /// would otherwise decode on the UI thread during layout, for every image
     /// in the story at once, freezing the window on image-heavy stories.
+    /// (SVGs are drawn into pixels too: see `render_svg`.)
     Raster { width: u32, height: u32, pixels: Vec<u8> },
-    Svg(Vec<u8>),
 }
 
 // Hand-written so a message holding megabytes of pixels isn't dumped in full
@@ -27,7 +32,6 @@ impl std::fmt::Debug for StoryImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoryImage::Raster { width, height, .. } => write!(f, "Raster({}x{})", width, height),
-            StoryImage::Svg(bytes) => write!(f, "Svg({} bytes)", bytes.len()),
         }
     }
 }
@@ -38,9 +42,37 @@ impl std::fmt::Debug for StoryImage {
 const MAX_IMAGE_WIDTH: u32 = 1600;
 const MAX_IMAGE_HEIGHT: u32 = 4800;
 
+/// Largest image decoded, in pixels: a 50-megapixel camera photo, about
+/// 200 MB while decoding. A small file can declare a far larger image
+/// ("decompression bomb"); those are refused before decoding.
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
+/// Memory a single decode may use (a backstop; not every format honours it).
+const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Images decoded at once, so a story full of large images can't stack up
+/// several gigabytes of decoding at the same moment.
+static DECODE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Decodes (and if needed shrinks) an image. CPU-heavy: run it off the UI thread.
 fn decode_image(bytes: &[u8]) -> Result<StoryImage, String> {
-    let mut image = image::load_from_memory(bytes).map_err(|e| format!("can't decode: {}", e))?;
+    let reader = || {
+        image::io::Reader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("can't read: {}", e))
+    };
+    // The header alone gives the size: check it before allocating anything
+    let (width, height) = reader()?.into_dimensions().map_err(|e| format!("can't decode: {}", e))?;
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(format!("too large ({}x{})", width, height));
+    }
+    let mut limits = image::io::Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    let mut decoder = reader()?;
+    decoder.limits(limits);
+    let mut image = decoder.decode().map_err(|e| format!("can't decode: {}", e))?;
     if image.width() > MAX_IMAGE_WIDTH || image.height() > MAX_IMAGE_HEIGHT {
         image = image.resize(MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT, image::imageops::FilterType::Triangle);
     }
@@ -52,33 +84,64 @@ fn decode_image(bytes: &[u8]) -> Result<StoryImage, String> {
     })
 }
 
-/// Fonts for SVG text: a cleaned SVG has its text turned into shapes, which
-/// needs the fonts. Loaded once, on first use (off the UI thread).
+/// Fonts for text in story SVGs. Loaded once, on first use (off the UI thread).
 static SVG_FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
     let mut fonts = usvg::fontdb::Database::new();
     fonts.load_system_fonts();
     Arc::new(fonts)
 });
 
-/// Makes a story's SVG safe to display.
+/// Draws a story's SVG into an ordinary image, off the UI thread.
 ///
-/// iced draws SVGs with the SVG library's default settings, which load any
-/// local file an `<image>` element names, on the UI thread. A feed could use
-/// that to freeze the app (a named pipe), exhaust memory (`/dev/zero`) or
-/// show files from the disk. So the SVG is parsed here first with file
-/// loading off (images embedded as data still work), and iced gets the
-/// re-written result, which contains no file references at all.
-fn clean_svg(bytes: &[u8]) -> Result<StoryImage, String> {
+/// Story SVGs never reach iced as SVGs. iced draws them with the SVG
+/// library's default settings, which load any local file an `<image>`
+/// element names, on the UI thread: a feed could freeze the app (a named
+/// pipe), exhaust memory (`/dev/zero`) or show files from the disk. Parsing
+/// and drawing can also simply take long (thousands of text labels: seconds;
+/// `<use>` chains that expand a 1 KB file into 100,000 shapes). Here file
+/// loading is off, embedded images get the same size check as photos, and the
+/// work happens in the background; the reader gets pixels.
+fn render_svg(bytes: &[u8]) -> Result<StoryImage, String> {
     let mut options = usvg::Options {
         fontdb: SVG_FONTS.clone(),
         ..usvg::Options::default()
     };
+    let embedded = usvg::ImageHrefResolver::default_data_resolver();
     options.image_href_resolver = usvg::ImageHrefResolver {
-        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        // Images embedded as data: refuse decompression bombs
+        resolve_data: Box::new(move |mime, data, opts| {
+            let too_big = image::io::Reader::new(std::io::Cursor::new(data.as_slice()))
+                .with_guessed_format()
+                .ok()
+                .and_then(|reader| reader.into_dimensions().ok())
+                .is_some_and(|(w, h)| u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS);
+            if too_big { None } else { embedded(mime, data, opts) }
+        }),
+        // Anything else is a file path (or an unsupported URL): never loaded
         resolve_string: Box::new(|_, _| None),
     };
     let tree = usvg::Tree::from_data(bytes, &options).map_err(|e| format!("unusable SVG: {}", e))?;
-    Ok(StoryImage::Svg(tree.to_string(&usvg::WriteOptions::default()).into_bytes()))
+
+    // Its own size, shrunk to the same limits as photos
+    let size = tree.size();
+    let scale = (MAX_IMAGE_WIDTH as f32 / size.width())
+        .min(MAX_IMAGE_HEIGHT as f32 / size.height())
+        .min(1.0);
+    let width = ((size.width() * scale).ceil() as u32).max(1);
+    let height = ((size.height() * scale).ceil() as u32).max(1);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or("empty SVG")?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+
+    // tiny-skia stores premultiplied alpha; iced expects straight RGBA
+    let pixels = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    Ok(StoryImage::Raster { width, height, pixels })
 }
 
 /// Whether `ip` is on the public internet, as opposed to this machine, the
@@ -114,10 +177,11 @@ fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether a story image may be downloaded from `url`: web addresses only,
-/// and not a numeric address on this machine or the local network. (Names
+/// Whether a public download (a story image, a public feed, a redirect) may
+/// go to `url`: web addresses only, and not a numeric address on this
+/// machine or the local network. (Names
 /// are checked when they're looked up; see `PublicOnlyResolver`.)
-fn image_url_allowed(url: &Url) -> bool {
+fn public_url_allowed(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && match url.host() {
             Some(url::Host::Ipv4(ip)) => is_public_ip(IpAddr::V4(ip)),
@@ -127,7 +191,56 @@ fn image_url_allowed(url: &Url) -> bool {
         }
 }
 
-/// Looks up names for story image downloads, keeping only public addresses.
+/// Whether `url` names this machine or the local network directly: a
+/// non-public IP address, `localhost`, a one-word name like `nas`, or a name
+/// under a suffix reserved for local networks.
+fn is_local_address(url: &Url) -> bool {
+    const LOCAL_SUFFIXES: &[&str] = &[
+        ".localhost", ".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain",
+        ".intranet", ".corp", ".private",
+    ];
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => !is_public_ip(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => !is_public_ip(IpAddr::V6(ip)),
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || !name.contains('.') || LOCAL_SUFFIXES.iter().any(|s| name.ends_with(s))
+        }
+        None => false,
+    }
+}
+
+/// Whether downloads go through a proxy (reqwest reads these variables).
+fn proxy_configured() -> bool {
+    ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
+}
+
+/// A client that only reaches public internet addresses: names are checked
+/// when looked up (`PublicOnlyResolver`, unless `check_names` is off), and
+/// redirects to numeric local addresses are refused.
+fn public_client(check_names: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(20))
+        // Redirects to numeric addresses skip the name lookup; check them
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if !public_url_allowed(attempt.url()) {
+                attempt.error("redirected to a local or non-web address")
+            } else {
+                attempt.follow()
+            }
+        }));
+    if check_names {
+        builder = builder.dns_resolver(Arc::new(PublicOnlyResolver));
+    }
+    builder.build().expect("the download client's settings are valid")
+}
+
+/// Looks up names for downloads, keeping only public addresses.
 /// Checking at lookup time (rather than before the request) means a name
 /// can't pass a check and then point somewhere local when connecting.
 struct PublicOnlyResolver;
@@ -157,6 +270,51 @@ const MAX_FEED_BYTES: usize = 25 * 1024 * 1024;
 
 /// Largest story image downloaded.
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// Longest story title stored, in characters
+const MAX_TITLE_CHARS: usize = 500;
+/// Longest author line stored, in characters
+const MAX_AUTHOR_CHARS: usize = 300;
+/// Largest story body (and summary) stored. The largest real story seen was
+/// 175 KB; anything bigger is cut, with a note.
+const MAX_STORY_BYTES: usize = 512 * 1024;
+/// Longest link kept
+const MAX_URL_BYTES: usize = 8 * 1024;
+/// New stories one feed may add in one refresh. A feed is a few MB at most,
+/// but that can hold 200,000 tiny stories; with fresh ids each time, the
+/// permanent archive would keep them all. The rest wait for later refreshes.
+pub const MAX_NEW_PER_REFRESH: usize = 1000;
+/// New stories, and bytes of them, one feed may add per day (UTC)
+const MAX_NEW_PER_DAY: u64 = 3000;
+const MAX_BYTES_PER_DAY: u64 = 100 * 1024 * 1024;
+
+/// One line of text from a feed (a title, an author): control characters
+/// (newlines, terminal escape codes) become spaces, and it's cut to
+/// `max_chars` characters.
+fn clean_line(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let trimmed = cleaned.trim();
+    match trimmed.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}…", &trimmed[..cut]),
+        None => trimmed.to_string(),
+    }
+}
+
+/// A story body or summary, cut to `MAX_STORY_BYTES` with a note saying so.
+fn cap_story(html: String) -> String {
+    if html.len() <= MAX_STORY_BYTES {
+        return html;
+    }
+    let mut cut = MAX_STORY_BYTES;
+    while !html.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}<p><em>[Shortened: this story is larger than Shreader stores ({} MB). Open it in the browser for the rest.]</em></p>",
+        &html[..cut],
+        MAX_STORY_BYTES / (1024 * 1024)
+    )
+}
 
 /// How many feeds are downloaded at once during a refresh (Akregator's
 /// default "Concurrent Fetches").
@@ -210,7 +368,13 @@ pub struct FeedPreview {
 }
 
 pub struct FeedFetcher {
+    /// For feeds: only reaches public internet addresses, so a public feed
+    /// can't redirect (or point its name) to a router or a service on this
+    /// machine and have the app request it on every refresh.
     client: reqwest::Client,
+    /// For feeds whose own address is local (`is_local_address`), which the
+    /// user subscribed to on purpose
+    local_client: reqwest::Client,
     /// For images inside stories: only reaches public internet addresses.
     /// A story's `<img>` pointing at a router or a local service would
     /// otherwise make the app send it a request when scrolled into view.
@@ -227,38 +391,47 @@ impl Default for FeedFetcher {
 
 impl FeedFetcher {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        // A configured proxy looks names up itself, and is often on this
+        // machine, so the address check can't apply; redirects are still
+        // checked.
+        let check_addresses = !proxy_configured();
+        if !check_addresses {
+            tracing::info!("A proxy is set: public-address checks apply to redirects only");
+        }
+        Self {
+            client: public_client(check_addresses),
+            local_client: reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .timeout(Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .expect("the local feed client's settings are valid"),
+            image_client: public_client(check_addresses),
+        }
+    }
 
-        let image_client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(20))
-            .dns_resolver(Arc::new(PublicOnlyResolver))
-            // Redirects to numeric addresses skip the name lookup; check them
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    attempt.error("too many redirects")
-                } else if !image_url_allowed(attempt.url()) {
-                    attempt.error("redirected to a local or non-web address")
-                } else {
-                    attempt.follow()
-                }
-            }))
-            .build()
-            .expect("the image download client's settings are valid");
-
-        Self { client, image_client }
+    /// The client for downloading the feed at `url`.
+    fn feed_client(&self, url: &str) -> &reqwest::Client {
+        if Url::parse(url).is_ok_and(|u| is_local_address(&u)) {
+            &self.local_client
+        } else {
+            &self.client
+        }
     }
 
     /// Fetches and ingests a feed into the database, preserving all existing
     /// articles. Never fails as a whole: any problem is reported in the
     /// summary's `error`, so one bad feed can't stop a refresh of many.
+    ///
+    /// That includes a panic (a bug, possibly in a library, triggered by odd
+    /// feed content): otherwise the whole refresh would never report back,
+    /// leaving the app stuck "syncing" with refreshes disabled.
     pub async fn fetch_and_sync(&self, db: &Database, feed_id: i64) -> FeedSyncSummary {
-        match self.try_fetch_and_sync(db, feed_id).await {
+        let outcome = AssertUnwindSafe(self.try_fetch_and_sync(db, feed_id))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error while processing this feed")));
+        match outcome {
             Ok(summary) => summary,
             Err(e) => FeedSyncSummary {
                 feed_title: db
@@ -271,6 +444,7 @@ impl FeedFetcher {
                 articles_updated: 0,
                 articles_unchanged: 0,
                 error: Some(format!("{:#}", e)),
+                limited: false,
             },
         }
     }
@@ -290,7 +464,7 @@ impl FeedFetcher {
             .get_feed(feed_id)?
             .with_context(|| format!("Feed with ID {} not found", feed_id))?;
 
-        let mut req = self.client.get(&feed.url);
+        let mut req = self.feed_client(&feed.url).get(&feed.url);
 
         if let Some(ref etag) = feed.etag {
             req = req.header(IF_NONE_MATCH, etag);
@@ -308,6 +482,7 @@ impl FeedFetcher {
                     articles_updated: 0,
                     articles_unchanged: 0,
                     error: Some(format!("HTTP Request Failed: {}", e)),
+                    limited: false,
                 });
             }
         };
@@ -323,6 +498,7 @@ impl FeedFetcher {
                 articles_updated: 0,
                 articles_unchanged: 0,
                 error: None,
+                limited: false,
             });
         }
 
@@ -333,6 +509,7 @@ impl FeedFetcher {
                 articles_updated: 0,
                 articles_unchanged: 0,
                 error: Some(format!("HTTP Error {}", status)),
+                limited: false,
             });
         }
 
@@ -349,6 +526,7 @@ impl FeedFetcher {
                     articles_updated: 0,
                     articles_unchanged: 0,
                     error: Some(format!("Download failed: {}", e)),
+                    limited: false,
                 });
             }
         };
@@ -363,6 +541,7 @@ impl FeedFetcher {
                     articles_updated: 0,
                     articles_unchanged: 0,
                     error: Some(format!("Feed Parse Error: {}", e)),
+                    limited: false,
                 });
             }
         };
@@ -370,13 +549,13 @@ impl FeedFetcher {
         // Update feed metadata if available. Only the fields a refresh owns
         // are written, against the feed's current row: the user may have
         // renamed, moved or deleted it while it was downloading.
-        let site_url = parsed_feed.links.first().map(|l| l.href.clone());
+        let site_url = parsed_feed.links.first().map(|l| l.href.clone()).filter(|u| u.len() <= MAX_URL_BYTES);
         let parsed_title = parsed_feed
             .title
             .as_ref()
-            .map(|t| t.content.split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|t| clean_line(&t.content.split_whitespace().collect::<Vec<_>>().join(" "), MAX_TITLE_CHARS))
             .filter(|t| !t.is_empty());
-        let description = parsed_feed.description.as_ref().map(|d| d.content.clone());
+        let description = parsed_feed.description.as_ref().map(|d| clean_line(&d.content, 10_000));
         let Some(feed_title) = db.update_feed_from_fetch(
             feed_id,
             parsed_title.as_deref(),
@@ -391,6 +570,7 @@ impl FeedFetcher {
                 articles_updated: 0,
                 articles_unchanged: 0,
                 error: None,
+                limited: false,
             });
         };
         db.update_feed_http_meta(feed_id, new_etag.as_deref(), new_last_mod.as_deref(), Utc::now())?;
@@ -399,8 +579,16 @@ impl FeedFetcher {
         let mut updated = 0;
         let mut unchanged = 0;
 
+        // What this feed may still add today, and in this refresh
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let (used_stories, used_bytes) = db.intake(feed_id, &today)?;
+        let mut stories_left = MAX_NEW_PER_DAY.saturating_sub(used_stories);
+        let mut bytes_left = MAX_BYTES_PER_DAY.saturating_sub(used_bytes);
+        let mut new_bytes: u64 = 0;
+        let mut limited = false;
+
         for entry in parsed_feed.entries {
-            let title = entry.title.map(|t| t.content).unwrap_or_else(|| "Untitled".to_string());
+            let raw_title = entry.title.map(|t| t.content).unwrap_or_else(|| "Untitled".to_string());
             let link = entry.links.first().map(|l| clean_tracking_params(&l.href));
             let guid = if entry.id.trim().is_empty() {
                 None
@@ -410,24 +598,42 @@ impl FeedFetcher {
 
             // Generate canonical deduplication hash to guarantee no stories are lost or duplicated
             let guid_hash =
-                generate_guid_hash(feed_id, guid.as_deref(), link.as_deref(), &title, entry.published);
+                generate_guid_hash(feed_id, guid.as_deref(), link.as_deref(), &raw_title, entry.published);
 
+            // Stored within sane sizes: an enormous title or story makes the
+            // list and reader unusable (a 5 MB story: 2 s per click)
+            let title = clean_line(&raw_title, MAX_TITLE_CHARS);
+            let link = link.filter(|l| l.len() <= MAX_URL_BYTES);
             let author = if !entry.authors.is_empty() {
-                Some(entry.authors.into_iter().map(|a| a.name).collect::<Vec<_>>().join(", "))
+                let names = entry.authors.into_iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
+                Some(clean_line(&names, MAX_AUTHOR_CHARS))
             } else {
                 None
             };
+            let summary = entry.summary.map(|s| cap_story(s.content));
+            let content_html = entry.content.and_then(|c| c.body).map(cap_story);
 
-            let summary = entry.summary.map(|s| s.content);
-            let content_html = entry.content.and_then(|c| c.body);
+            let state = db.stored_state(feed_id, &guid_hash, &title, summary.as_deref(), content_html.as_deref())?;
+            let size = (title.len()
+                + summary.as_ref().map_or(0, String::len)
+                + content_html.as_ref().map_or(0, String::len)) as u64;
+            if state == StoredState::New
+                && (inserted >= MAX_NEW_PER_REFRESH || stories_left == 0 || size > bytes_left)
+            {
+                // Over the allowance: held back. A later refresh picks it up
+                // if the feed still lists it.
+                limited = true;
+                continue;
+            }
 
-            // Plain text conversion for reading and search
-            let content_text = if let Some(ref html) = content_html {
-                html2text::from_read(html.as_bytes(), 80).ok()
-            } else if let Some(ref summ) = summary {
-                html2text::from_read(summ.as_bytes(), 80).ok()
-            } else {
+            // Plain text for reading and search; not needed (and skipped,
+            // since converting is the slow part) when nothing changed
+            let content_text = if state == StoredState::Unchanged {
                 None
+            } else {
+                content_html.as_deref().or(summary.as_deref()).and_then(|html| {
+                    html2text::from_read(crate::story_content::limit_nesting(html).as_bytes(), 80).ok()
+                })
             };
 
             let published_at = entry.published;
@@ -446,13 +652,21 @@ impl FeedFetcher {
                 published_at,
                 updated_at,
             ) {
-                Ok(IngestionResult::Inserted) => inserted += 1,
+                Ok(IngestionResult::Inserted) => {
+                    inserted += 1;
+                    stories_left = stories_left.saturating_sub(1);
+                    bytes_left = bytes_left.saturating_sub(size);
+                    new_bytes += size;
+                }
                 Ok(IngestionResult::Updated) => updated += 1,
                 Ok(IngestionResult::Unchanged) => unchanged += 1,
                 Err(e) => {
                     tracing::error!("Failed to upsert article '{}': {:?}", title, e);
                 }
             }
+        }
+        if inserted > 0 {
+            db.add_intake(feed_id, &today, inserted as u64, new_bytes)?;
         }
 
         Ok(FeedSyncSummary {
@@ -461,14 +675,22 @@ impl FeedFetcher {
             articles_updated: updated,
             articles_unchanged: unchanged,
             error: None,
+            limited,
         })
     }
 
     /// Downloads and parses `url` without storing anything, so the Add Feed
     /// dialog can show the feed's title before subscribing.
     pub async fn preview(&self, url: &str) -> Result<FeedPreview, String> {
+        AssertUnwindSafe(self.try_preview(url))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err("Something went wrong reading that feed.".to_string()))
+    }
+
+    async fn try_preview(&self, url: &str) -> Result<FeedPreview, String> {
         let resp = self
-            .client
+            .feed_client(url)
             .get(url)
             .send()
             .await
@@ -497,7 +719,7 @@ impl FeedFetcher {
 
         let title = parsed
             .title
-            .map(|t| t.content.split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|t| clean_line(&t.content.split_whitespace().collect::<Vec<_>>().join(" "), MAX_TITLE_CHARS))
             .filter(|t| !t.is_empty());
 
         Ok(FeedPreview {
@@ -510,7 +732,7 @@ impl FeedFetcher {
     /// `MAX_IMAGE_BYTES`.
     pub async fn fetch_image(&self, url: &str) -> Result<StoryImage, String> {
         let parsed = Url::parse(url).map_err(|e| format!("bad URL: {}", e))?;
-        if !image_url_allowed(&parsed) {
+        if !public_url_allowed(&parsed) {
             return Err("not a public web address".to_string());
         }
         let resp = self
@@ -539,7 +761,8 @@ impl FeedFetcher {
                 && Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(".svg")));
 
         let bytes = read_limited(resp, MAX_IMAGE_BYTES).await?;
-        tokio::task::spawn_blocking(move || if is_svg { clean_svg(&bytes) } else { decode_image(&bytes) })
+        let _slot = DECODE_SLOTS.acquire().await.map_err(|e| e.to_string())?;
+        tokio::task::spawn_blocking(move || if is_svg { render_svg(&bytes) } else { decode_image(&bytes) })
             .await
             .map_err(|e| format!("decoding failed: {}", e))?
     }
@@ -677,11 +900,10 @@ mod tests {
         );
     }
 
-    fn svg_text(image: &StoryImage) -> String {
-        match image {
-            StoryImage::Svg(bytes) => String::from_utf8(bytes.clone()).unwrap(),
-            other => panic!("expected an SVG, got {:?}", other),
-        }
+    fn pixel(image: &StoryImage, x: u32, y: u32) -> [u8; 4] {
+        let StoryImage::Raster { width, pixels, .. } = image;
+        let i = ((y * width + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
     }
 
     /// A story SVG can't pull in local files; embedded images still work.
@@ -696,6 +918,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageOutputFormat::Png)
             .unwrap();
         use base64_free::encode;
+        // Left half: a local file (red). Right half: an embedded image (blue).
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
                 <image href="{}" width="10" height="10"/>
@@ -705,19 +928,17 @@ mod tests {
             encode(&png_bytes)
         );
 
-        // What iced would do with it unchecked: the local file is loaded
+        // What iced would do with it: the local file is loaded
         let unchecked = usvg::Tree::from_data(svg.as_bytes(), &usvg::Options::default()).unwrap();
         let unchecked = unchecked.to_string(&usvg::WriteOptions::default());
         assert_eq!(unchecked.matches("data:image/png").count(), 2);
 
-        // Cleaned: only the embedded image is left
-        let cleaned = svg_text(&clean_svg(svg.as_bytes()).unwrap());
-        assert_eq!(cleaned.matches("data:image/png").count(), 1, "{}", cleaned);
-        assert!(!cleaned.contains("local.png"));
-        // And the result is itself a valid SVG
-        usvg::Tree::from_data(cleaned.as_bytes(), &usvg::Options::default()).unwrap();
+        // Drawn here: the local file's half stays empty
+        let drawn = render_svg(svg.as_bytes()).unwrap();
+        assert_eq!(pixel(&drawn, 5, 5)[3], 0, "the local file was drawn");
+        assert_eq!(pixel(&drawn, 15, 5), [0, 0, 255, 255], "the embedded image is missing");
 
-        // A named pipe would block the reader forever; cleaning doesn't touch it
+        // A named pipe would block the reader forever; it's never opened
         let pipe = dir.join("pipe");
         let c_path = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
         // SAFETY: plain libc call with a valid NUL-terminated path
@@ -728,15 +949,30 @@ mod tests {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(clean_svg(svg.as_bytes()).is_ok());
+            let _ = tx.send(render_svg(svg.as_bytes()).is_ok());
         });
-        let finished = rx.recv_timeout(Duration::from_secs(5));
+        let finished = rx.recv_timeout(Duration::from_secs(10));
         if finished.is_err() {
             // Unblock the stuck thread before failing
             let _ = std::fs::OpenOptions::new().write(true).open(&pipe);
         }
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(finished, Ok(true), "cleaning an SVG that names a pipe must not hang");
+        assert_eq!(finished, Ok(true), "drawing an SVG that names a pipe must not hang");
+    }
+
+    /// SVGs come out as ordinary images within the photo size limits, text
+    /// included, and huge ones are scaled down.
+    #[test]
+    fn story_svgs_become_images() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="1000">
+            <rect width="4000" height="1000" fill="white"/>
+            <text x="10" y="900" font-size="900" font-family="sans-serif" fill="black">Hello</text>
+        </svg>"#;
+        let drawn = render_svg(svg).unwrap();
+        let StoryImage::Raster { width, height, ref pixels } = drawn;
+        assert_eq!((width, height), (MAX_IMAGE_WIDTH, 400));
+        // Some of it is the black text
+        assert!(pixels.chunks(4).any(|p| p[0] < 50 && p[3] == 255), "no text was drawn");
     }
 
     /// Tiny base64 encoder for the test above (no extra dependency).
@@ -773,7 +1009,7 @@ mod tests {
         for ip in local {
             assert!(!is_public_ip(ip.parse().unwrap()), "{} should be local", ip);
         }
-        let allowed = |u: &str| image_url_allowed(&Url::parse(u).unwrap());
+        let allowed = |u: &str| public_url_allowed(&Url::parse(u).unwrap());
         assert!(allowed("https://example.com/a.png"));
         assert!(allowed("http://8.8.8.8/a.png"));
         assert!(!allowed("http://192.168.1.1/reboot"));
@@ -794,6 +1030,111 @@ mod tests {
         assert!(error.contains("request failed"), "{}", error);
         // The feed client is unaffected
         assert!(fetcher.preview(&format!("{}/good", base)).await.is_ok());
+    }
+
+    /// Which addresses count as deliberately local feeds.
+    #[test]
+    fn local_feed_addresses() {
+        let local = |u: &str| is_local_address(&Url::parse(u).unwrap());
+        for u in [
+            "http://localhost:8080/feed", "http://nas/rss", "http://192.168.1.5/feed", "http://[::1]/f",
+            "http://pi.local/feed", "http://server.lan/rss", "http://x.home.arpa/f", "http://feeds.internal/",
+            "http://NAS.LOCAL./feed",
+        ] {
+            assert!(local(u), "{} should be local", u);
+        }
+        for u in ["https://example.com/feed", "http://8.8.8.8/x", "https://blog.localhost-tools.com/rss", "https://lan.example.org/"] {
+            assert!(!local(u), "{} should be public", u);
+        }
+    }
+
+    /// A public download can't be redirected, or looked up, to this machine.
+    #[tokio::test]
+    async fn public_downloads_cant_be_steered_to_local_addresses() {
+        let base = test_server().await;
+        let client = public_client(true);
+        // A redirect to a numeric local address
+        let redirected = client.get(format!("{}/redirect-to/{}/good", base, base)).send().await;
+        let error = format!("{:?}", redirected.unwrap_err());
+        assert!(error.contains("redirected to a local"), "{}", error);
+        // A name that resolves locally
+        let named = client.get(base.replace("127.0.0.1", "localhost")).send().await;
+        let error = format!("{:?}", named.unwrap_err());
+        assert!(error.contains("isn't a public internet address"), "{}", error);
+    }
+
+    /// A feed can add at most `MAX_NEW_PER_REFRESH` stories per refresh and
+    /// `MAX_NEW_PER_DAY` per day; held-back stories come in later.
+    #[tokio::test]
+    async fn feeds_cant_flood_the_archive() {
+        let base = test_server().await;
+        let db = Database::open_in_memory().unwrap();
+        let fetcher = FeedFetcher::new();
+        let url = format!("{}/many", base); // 1500 stories
+        let feed = db.add_or_update_feed(&url, "Many", None, None, None).unwrap();
+
+        let first = fetcher.fetch_and_sync(&db, feed).await;
+        assert_eq!((first.articles_inserted, first.limited), (MAX_NEW_PER_REFRESH, true), "{:?}", first.error);
+        let second = fetcher.fetch_and_sync(&db, feed).await;
+        assert_eq!((second.articles_inserted, second.limited), (500, false));
+        assert_eq!(second.articles_unchanged, 1000);
+
+        // Daily allowance: a second feed that has nearly used up today's
+        let other = db.add_or_update_feed(&format!("{}/many?2", base), "Many 2", None, None, None).unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        db.add_intake(other, &today, MAX_NEW_PER_DAY - 10, 0).unwrap();
+        let capped = fetcher.fetch_and_sync(&db, other).await;
+        assert_eq!((capped.articles_inserted, capped.limited), (10, true));
+        // Yesterday's intake doesn't count
+        db.add_intake(other, "2000-01-01", 0, 0).unwrap();
+        let next_day = fetcher.fetch_and_sync(&db, other).await;
+        assert_eq!(next_day.articles_inserted, MAX_NEW_PER_REFRESH);
+    }
+
+    #[test]
+    fn oversized_text_is_cut() {
+        assert_eq!(clean_line("A\ntitle\u{1b}[31m red", 100), "A title [31m red");
+        let long = "é".repeat(2000);
+        let cut = clean_line(&long, MAX_TITLE_CHARS);
+        assert_eq!(cut.chars().count(), MAX_TITLE_CHARS + 1); // plus "…"
+        let story = "<p>".to_string() + &"é".repeat(MAX_STORY_BYTES);
+        let capped = cap_story(story);
+        assert!(capped.len() < MAX_STORY_BYTES + 300);
+        assert!(capped.ends_with("Open it in the browser for the rest.]</em></p>"));
+        assert_eq!(cap_story("short".into()), "short");
+    }
+
+    /// An image declaring an enormous size is refused before decoding.
+    #[test]
+    fn decompression_bombs_are_refused() {
+        // A real 1x1 PNG, then its header rewritten to claim 100000x100000
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageOutputFormat::Png)
+            .unwrap();
+        png[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        let error = decode_image(&png).unwrap_err();
+        assert!(error.contains("too large"), "{}", error);
+        // A normal image still decodes
+        let mut ok = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(3, 2))
+            .write_to(&mut std::io::Cursor::new(&mut ok), image::ImageOutputFormat::Png)
+            .unwrap();
+        assert!(matches!(decode_image(&ok), Ok(StoryImage::Raster { width: 3, height: 2, .. })));
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
     }
 
     /// A tiny HTTP server for tests. Paths:
@@ -818,6 +1159,17 @@ mod tests {
                     match path.as_str() {
                         "/good" => {
                             let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", feed.len(), feed).as_bytes()).await;
+                        }
+                        p if p.starts_with("/many") => {
+                            let items: String = (0..1500)
+                                .map(|i| format!("<item><guid>m{}</guid><title>Story {}</title><description>x</description></item>", i, i))
+                                .collect();
+                            let body = format!(r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Many</title>{}</channel></rss>"#, items);
+                            let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await;
+                        }
+                        p if p.starts_with("/redirect-to/") => {
+                            let target = &p["/redirect-to/".len()..];
+                            let _ = sock.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", target).as_bytes()).await;
                         }
                         "/drop" => {
                             // Promises 100000 bytes, sends a few, hangs up

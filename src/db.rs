@@ -7,6 +7,28 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{Article, ArticleFilter, Feed, Folder, IngestionResult};
 
+/// Restricts `path` to `mode` (owner-only permissions). Best effort: on
+/// failure the archive still works, just with the default permissions.
+fn set_private(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            tracing::warn!("Couldn't make {:?} private: {}", path, e);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+/// What `Database::stored_state` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredState {
+    New,
+    Unchanged,
+    Changed,
+}
+
 /// How long a query waits for another connection's lock before failing.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -26,7 +48,16 @@ impl Database {
     pub fn open_default() -> Result<Self> {
         let path = match std::env::var_os("RSS_READER_DB") {
             Some(env_path) => PathBuf::from(env_path),
-            None => Self::default_db_path()?,
+            None => {
+                let path = Self::default_db_path()?;
+                // The app's own folder: private to this user, like the files
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)
+                        .with_context(|| format!("Failed to create database directory {:?}", dir))?;
+                    set_private(dir, 0o700);
+                }
+                path
+            }
         };
         Self::open(&path)
     }
@@ -40,6 +71,18 @@ impl Database {
 
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open SQLite database at {:?}", path))?;
+        // The archive is a reading history: readable by this user only. (New
+        // files get the default "everyone can read"; SQLite gives its -wal
+        // and -shm files the database file's permissions.)
+        set_private(path, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let mut side_file = path.as_os_str().to_owned();
+            side_file.push(suffix);
+            let side_file = PathBuf::from(side_file);
+            if side_file.exists() {
+                set_private(&side_file, 0o600);
+            }
+        }
         // Before anything else: switching to WAL below needs a lock too, and
         // without a timeout a moment's lock by another copy of the app fails
         // instantly
@@ -67,7 +110,15 @@ impl Database {
         Ok(db)
     }
 
-    pub fn path(&self) -> &Path {
+    /// The connection. A panic elsewhere while it was held "poisons" the
+    /// lock; the connection itself is still fine (SQLite rolls back any
+    /// unfinished transaction), so carry on rather than make every later
+    /// database call panic too.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+        pub fn path(&self) -> &Path {
         &self.db_path
     }
 
@@ -92,7 +143,7 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
 
         // 1. Pragmas for high performance, crash-safety, and integrity
         conn.execute_batch(
@@ -196,6 +247,11 @@ impl Database {
         // Migration: user-defined folder order (NULL = not yet arranged; those
         // sort alphabetically after arranged folders)
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER", []);
+        // Migration: how much each feed has added today (UTC), for the daily
+        // allowance that stops one feed from filling the disk
+        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_day TEXT", []);
+        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_stories INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_bytes INTEGER NOT NULL DEFAULT 0", []);
 
         // 3. Full-Text Search (FTS5) for instant offline search across entire story history
         conn.execute_batch(
@@ -241,7 +297,7 @@ impl Database {
 
     /// A saved UI setting, if any.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let value = conn
             .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| row.get(0))
             .optional()?;
@@ -249,7 +305,7 @@ impl Database {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -259,7 +315,7 @@ impl Database {
     }
 
     pub fn create_folder(&self, name: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO folders (name) VALUES (?1)",
             params![name.trim()],
@@ -268,7 +324,7 @@ impl Database {
     }
 
     pub fn get_or_create_folder(&self, name: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT id FROM folders WHERE name = ?1 COLLATE NOCASE",
@@ -289,7 +345,7 @@ impl Database {
     }
 
     pub fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             "UPDATE folders SET name = ?1 WHERE id = ?2",
             params![new_name.trim(), folder_id],
@@ -298,7 +354,7 @@ impl Database {
     }
 
     pub fn delete_folder(&self, folder_id: i64) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock();
         let tx = conn.transaction()?;
         // Its feeds land in Uncategorized: forget their order in this folder so
         // they slot in alphabetically after any feeds arranged there by hand.
@@ -314,7 +370,7 @@ impl Database {
     }
 
     pub fn set_feed_folder(&self, feed_id: i64, folder_id: Option<i64>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             // Clearing sort_order places the feed after any manually arranged
             // feeds in its new folder (or alphabetically if none are arranged)
@@ -328,7 +384,7 @@ impl Database {
     /// this order. Used for drag-and-drop reordering and for moving a feed to a
     /// specific position in another folder.
     pub fn place_feeds(&self, folder_id: Option<i64>, ordered_feed_ids: &[i64]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt =
@@ -343,7 +399,7 @@ impl Database {
 
     /// Puts the folders in exactly this order (drag-and-drop in the sidebar).
     pub fn order_folders(&self, ordered_folder_ids: &[i64]) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare("UPDATE folders SET sort_order = ?1 WHERE id = ?2")?;
@@ -356,7 +412,7 @@ impl Database {
     }
 
     pub fn get_folders(&self) -> Result<Vec<Folder>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(
             r#"
             SELECT 
@@ -399,7 +455,7 @@ impl Database {
         site_url: Option<&str>,
         folder_id: Option<i64>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             r#"
             INSERT INTO feeds (url, title, description, site_url, folder_id)
@@ -433,7 +489,7 @@ impl Database {
         description: Option<&str>,
         site_url: Option<&str>,
     ) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let changed = conn.execute(
             r#"
             UPDATE feeds SET
@@ -458,7 +514,7 @@ impl Database {
         last_modified: Option<&str>,
         fetched_at: DateTime<Utc>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let fetched_at_str = fetched_at.to_rfc3339();
         conn.execute(
             r#"
@@ -474,7 +530,7 @@ impl Database {
     }
 
     pub fn get_feeds(&self) -> Result<Vec<Feed>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(
             r#"
             SELECT 
@@ -518,7 +574,7 @@ impl Database {
     }
 
     pub fn get_feed(&self, id: i64) -> Result<Option<Feed>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(
             r#"
             SELECT 
@@ -560,7 +616,7 @@ impl Database {
     /// Sets a custom display name. Sync keeps it, since it only replaces titles
     /// that are empty or equal to the feed URL.
     pub fn rename_feed(&self, feed_id: i64, title: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute("UPDATE feeds SET title = ?1 WHERE id = ?2", params![title, feed_id])?;
         Ok(())
     }
@@ -569,7 +625,7 @@ impl Database {
     /// headers are cleared so the next refresh does a full fetch of the new URL.
     /// Archived stories stay attached to the feed either way.
     pub fn update_feed_details(&self, feed_id: i64, title: &str, url: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             r#"
             UPDATE feeds
@@ -587,7 +643,7 @@ impl Database {
 
     /// Number of starred stories.
     pub fn starred_count(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         Ok(conn.query_row("SELECT COUNT(*) FROM articles WHERE is_starred = 1", [], |r| r.get(0))?)
     }
 
@@ -598,7 +654,7 @@ impl Database {
     /// feed in full: otherwise an unchanged feed answers "304 Not Modified"
     /// and its current stories wouldn't come back until it next posts.
     pub fn clear_stories(&self, keep_starred: bool) -> Result<usize> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.lock();
         let tx = conn.transaction()?;
         // The delete trigger also removes each story from the search index
         let deleted = if keep_starred {
@@ -622,12 +678,71 @@ impl Database {
     }
 
     pub fn delete_feed(&self, feed_id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute("DELETE FROM feeds WHERE id = ?1", params![feed_id])?;
         Ok(())
     }
 
     // --- Article Archival & Ingestion ---
+
+    /// Whether a story is already stored, and if so whether its text
+    /// (title, summary, content) differs: the same comparison
+    /// `upsert_article` makes. Lets a refresh skip converting unchanged
+    /// stories to plain text, and check new ones against the allowance.
+    pub fn stored_state(
+        &self,
+        feed_id: i64,
+        guid_hash: &str,
+        title: &str,
+        summary: Option<&str>,
+        content_html: Option<&str>,
+    ) -> Result<StoredState> {
+        let conn = self.lock();
+        let changed: Option<bool> = conn
+            .query_row(
+                r#"
+                SELECT NOT (title IS ?3 AND summary IS ?4 AND (?5 IS NULL OR content_html IS ?5))
+                FROM articles WHERE feed_id = ?1 AND guid_hash = ?2
+                "#,
+                params![feed_id, guid_hash, title, summary, content_html],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match changed {
+            None => StoredState::New,
+            Some(false) => StoredState::Unchanged,
+            Some(true) => StoredState::Changed,
+        })
+    }
+
+    /// New stories and bytes `feed_id` has added on `day` (a UTC date).
+    pub fn intake(&self, feed_id: i64, day: &str) -> Result<(u64, u64)> {
+        let conn = self.lock();
+        let used = conn
+            .query_row(
+                "SELECT intake_stories, intake_bytes FROM feeds WHERE id = ?1 AND intake_day = ?2",
+                params![feed_id, day],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?;
+        Ok(used.unwrap_or((0, 0)))
+    }
+
+    /// Adds to `feed_id`'s intake for `day`, starting over on a new day.
+    pub fn add_intake(&self, feed_id: i64, day: &str, stories: u64, bytes: u64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            r#"
+            UPDATE feeds SET
+                intake_stories = CASE WHEN intake_day IS ?2 THEN intake_stories ELSE 0 END + ?3,
+                intake_bytes = CASE WHEN intake_day IS ?2 THEN intake_bytes ELSE 0 END + ?4,
+                intake_day = ?2
+            WHERE id = ?1
+            "#,
+            params![feed_id, day, stories as i64, bytes as i64],
+        )?;
+        Ok(())
+    }
 
     /// Inserts or updates an article without ever losing existing articles or resetting read/starred states.
     /// This is the core engine guarantee: newly ingested feed items never purge older items.
@@ -645,7 +760,7 @@ impl Database {
         published_at: Option<DateTime<Utc>>,
         updated_at: Option<DateTime<Utc>>,
     ) -> Result<IngestionResult> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
 
         let pub_str = published_at.map(|dt| dt.to_rfc3339());
         let upd_str = updated_at.map(|dt| dt.to_rfc3339());
@@ -765,7 +880,7 @@ impl Database {
 
     /// How many stories match `filter` (its limit and offset aside).
     pub fn count_articles(&self, filter: &ArticleFilter) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let (clause, params_vec) = Self::filter_clause(filter);
         let query = format!("SELECT COUNT(*) FROM articles a WHERE {}", clause);
         let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
@@ -776,7 +891,7 @@ impl Database {
     /// How many stories matching `filter` come before story `article_id` in
     /// the list order (its index in the full list, if it's part of it).
     pub fn count_before(&self, filter: &ArticleFilter, article_id: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let (clause, clause_params) = Self::filter_clause(filter);
         let query = format!(
             r#"
@@ -805,7 +920,7 @@ impl Database {
     /// they add up to tens of MB over a few thousand stories and the list never
     /// shows them. Use `get_article` for one complete story.
     pub fn get_articles(&self, filter: &ArticleFilter) -> Result<Vec<Article>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let (clause, params_vec) = Self::filter_clause(filter);
 
         // Newest first by publication date, but a date in the future counts
@@ -871,7 +986,7 @@ impl Database {
     }
 
     pub fn get_article(&self, id: i64) -> Result<Option<Article>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let mut stmt = conn.prepare(
             r#"
             SELECT 
@@ -915,7 +1030,7 @@ impl Database {
     }
 
     pub fn set_article_read(&self, id: i64, is_read: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         conn.execute(
             "UPDATE articles SET is_read = ?1 WHERE id = ?2",
             params![if is_read { 1 } else { 0 }, id],
@@ -939,7 +1054,7 @@ impl Database {
         folder_id: Option<i64>,
         is_read: bool,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let is_read = is_read as i64;
         if let Some(feed_id) = feed_id {
             conn.execute(
@@ -958,7 +1073,7 @@ impl Database {
     }
 
     pub fn toggle_article_starred(&self, id: i64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let new_val: bool = conn.query_row(
             "UPDATE articles SET is_starred = NOT is_starred WHERE id = ?1 RETURNING is_starred",
             params![id],
@@ -968,7 +1083,7 @@ impl Database {
     }
 
     pub fn get_total_stats(&self) -> Result<(i64, i64, i64)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock();
         let (total_feeds, total_articles, unread_articles) = conn.query_row(
             r#"
             SELECT 
@@ -1225,6 +1340,21 @@ mod tests {
         let only = |id| ArticleFilter { starred_only: true, article_id: Some(id), ..Default::default() };
         assert_eq!(db.get_articles(&only(full[20])).unwrap().len(), 1);
         assert!(db.get_articles(&only(full[21])).unwrap().is_empty());
+    }
+
+    /// A panic while the connection is held doesn't break the database for
+    /// the rest of the session.
+    #[test]
+    fn survives_a_panic_while_locked() {
+        let db = Database::open_in_memory().unwrap();
+        let other = db.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = other.lock();
+            panic!("simulated bug");
+        })
+        .join();
+        assert!(db.conn.is_poisoned());
+        assert!(db.get_folders().is_ok());
     }
 
     #[test]

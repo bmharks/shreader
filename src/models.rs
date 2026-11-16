@@ -83,4 +83,7 @@ pub struct FeedSyncSummary {
     pub articles_updated: usize,
     pub articles_unchanged: usize,
     pub error: Option<String>,
+    /// Some new stories were held back: the feed sent more than
+    /// `feed::MAX_NEW_PER_REFRESH`, or used up its daily allowance
+    pub limited: bool,
 }
