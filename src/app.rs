@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use iced::mouse;
@@ -46,6 +46,10 @@ const IMAGE_PRELOAD_MARGIN: f32 = 1000.0;
 /// loaded longest ago (normally those farthest from where you're reading)
 /// are released and reload if scrolled back to.
 const STORY_IMAGE_MEMORY: u64 = 400 * 1024 * 1024;
+
+/// Story images downloaded at once. Each download can hold up to 20 MB
+/// until it's decoded, and a story can ask for 100+ images in one go.
+const MAX_IMAGE_DOWNLOADS: usize = 4;
 
 /// Setting: download story images as they scroll into view (default), or
 /// only when clicked
@@ -122,6 +126,10 @@ pub struct RssApp {
     story_images: HashMap<String, ImageState>,
     /// Counts image loads, for `ImageState::Raster::order`
     image_loads: u64,
+    /// Images waiting to download, in the order they were asked for
+    image_queue: VecDeque<String>,
+    /// Downloads in progress. Dropping a handle cancels its download.
+    image_downloads: HashMap<String, iced::task::Handle>,
     /// Whether story images load automatically (`LOAD_IMAGES_SETTING`)
     load_images: bool,
     /// The open story's text blocks as read-only editors, so text can be
@@ -433,6 +441,8 @@ impl RssApp {
             reader_body: None,
             story_images: HashMap::new(),
             image_loads: 0,
+            image_queue: VecDeque::new(),
+            image_downloads: HashMap::new(),
             load_images: true,
             reader_texts: Vec::new(),
             reader_text_menu: None,
@@ -724,14 +734,8 @@ impl RssApp {
                     }
                     Some(_) => return Task::none(), // already loaded or loading
                 }
-                let fetcher = self.fetcher.clone();
-                Task::perform(
-                    {
-                        let url = url.clone();
-                        async move { fetcher.fetch_image(&url).await }
-                    },
-                    move |result| Message::StoryImageLoaded(url.clone(), result),
-                )
+                self.image_queue.push_back(url);
+                self.start_image_downloads()
             }
             Message::ReaderTextAction(index, action) => {
                 // Read-only: allow selecting, moving, clicking, but never editing
@@ -768,6 +772,8 @@ impl RssApp {
                 Task::none()
             }
             Message::StoryImageLoaded(url, result) => {
+                self.image_downloads.remove(&url);
+                let next = self.start_image_downloads();
                 // Ignore downloads for a story that's no longer open
                 if let Some(state) = self.story_images.get_mut(&url) {
                     self.image_loads += 1;
@@ -784,10 +790,10 @@ impl RssApp {
                         }
                     };
                     if self.release_story_images_over_budget(&url) {
-                        return release_memory_soon();
+                        return Task::batch([next, release_memory_soon()]);
                     }
                 }
-                Task::none()
+                next
             }
             Message::FeedAdded(result) => {
                 self.syncs_running = self.syncs_running.saturating_sub(1);
@@ -1778,6 +1784,8 @@ impl RssApp {
             self.article_menu = None;
         }
         self.story_images.clear();
+        self.image_queue.clear();
+        self.image_downloads.clear();
         release_memory_soon()
     }
 
@@ -1887,6 +1895,33 @@ impl RssApp {
         // Keep what this story still uses (e.g. reopening the same story); retry failures
         self.story_images
             .retain(|url, state| urls.contains(url.as_str()) && !matches!(state, ImageState::Failed));
+        // Downloads for images no longer shown are cancelled (dropping the
+        // handle aborts them), and ones not yet started are forgotten
+        self.image_downloads.retain(|url, _| self.story_images.contains_key(url));
+        self.image_queue.retain(|url| self.story_images.contains_key(url));
+    }
+
+    /// Starts queued image downloads, up to `MAX_IMAGE_DOWNLOADS` at once.
+    fn start_image_downloads(&mut self) -> Task<Message> {
+        let mut started = Vec::new();
+        while self.image_downloads.len() < MAX_IMAGE_DOWNLOADS {
+            let Some(url) = self.image_queue.pop_front() else { break };
+            let fetcher = self.fetcher.clone();
+            let (task, handle) = Task::perform(
+                {
+                    let url = url.clone();
+                    async move { fetcher.fetch_image(&url).await }
+                },
+                {
+                    let url = url.clone();
+                    move |result| Message::StoryImageLoaded(url.clone(), result)
+                },
+            )
+            .abortable();
+            self.image_downloads.insert(url, handle.abort_on_drop());
+            started.push(task);
+        }
+        Task::batch(started)
     }
 
     /// Keeps the open story's decoded images within `STORY_IMAGE_MEMORY` by
@@ -4082,6 +4117,27 @@ fn selected_story_id() -> container::Id {
 #[cfg(test)]
 mod tests {
     use super::{format_size, open_in_browser, ImageState, RefreshInterval, RssApp};
+
+    /// Story images download a few at a time, in order; switching stories
+    /// cancels downloads and queued images the new story doesn't show.
+    #[test]
+    fn story_images_download_a_few_at_a_time() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let (mut app, _) = RssApp::new(db);
+        for n in 0..10 {
+            let _ = app.update(super::Message::LoadStoryImage(format!("https://example.com/{}.png", n)));
+        }
+        assert_eq!(app.image_downloads.len(), super::MAX_IMAGE_DOWNLOADS);
+        assert_eq!(app.image_queue.front().map(String::as_str), Some("https://example.com/4.png"));
+        assert_eq!(app.image_queue.len(), 10 - super::MAX_IMAGE_DOWNLOADS);
+
+        // A story showing images 1 and 7 only
+        let keep = ["https://example.com/1.png", "https://example.com/7.png"];
+        let blocks: Vec<_> = keep.iter().map(|src| crate::story_content::Block::Image { src: src.to_string() }).collect();
+        app.prune_story_images(&blocks);
+        assert_eq!(app.image_downloads.keys().map(String::as_str).collect::<Vec<_>>(), [keep[0]]);
+        assert_eq!(app.image_queue, [keep[1]]);
+    }
 
     /// Past the memory budget, the images loaded longest ago are released
     /// (keeping their size for the layout); the newest is never released.

@@ -3,6 +3,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use crate::db::Database;
+use crate::feed::{clean_line, MAX_TITLE_CHARS};
 
 pub struct OpmlOutline {
     pub title: String,
@@ -10,6 +11,12 @@ pub struct OpmlOutline {
     pub html_url: Option<String>,
     pub folder: Option<String>,
 }
+
+/// Longest folder name taken from an OPML file. Feed and folder names are
+/// cleaned like names from feeds (`clean_line`): OPML files get shared, and
+/// a name could carry terminal escape codes (printed by `--list-feeds`) or
+/// be large enough to slow the sidebar.
+const MAX_FOLDER_NAME_CHARS: usize = 200;
 
 /// Parses an OPML XML string and extracts all feed URLs, titles, and their parent folder names.
 pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
@@ -49,9 +56,7 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
                     }
 
                     if let Some(url) = xml_url {
-                        let display_title = title
-                            .or(text_attr)
-                            .unwrap_or_else(|| url.clone());
+                        let display_title = clean_line(&title.or(text_attr).unwrap_or_else(|| url.clone()), MAX_TITLE_CHARS);
 
                         outlines.push(OpmlOutline {
                             title: display_title,
@@ -62,9 +67,10 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
                         tag_stack.push(false);
                     } else {
                         // Outline without xmlUrl is a folder group (Akregator / OPML 2.0 standard)
-                        let folder_name = title
-                            .or(text_attr)
-                            .unwrap_or_else(|| "Uncategorized".to_string());
+                        let folder_name = clean_line(
+                            &title.or(text_attr).unwrap_or_else(|| "Uncategorized".to_string()),
+                            MAX_FOLDER_NAME_CHARS,
+                        );
                         folder_stack.push(folder_name);
                         tag_stack.push(true);
                     }
@@ -97,9 +103,7 @@ pub fn parse_opml(opml_content: &str) -> Result<Vec<OpmlOutline>> {
                     }
 
                     if let Some(url) = xml_url {
-                        let display_title = title
-                            .or(text_attr)
-                            .unwrap_or_else(|| url.clone());
+                        let display_title = clean_line(&title.or(text_attr).unwrap_or_else(|| url.clone()), MAX_TITLE_CHARS);
 
                         outlines.push(OpmlOutline {
                             title: display_title,
@@ -271,6 +275,22 @@ fn escape_xml(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Names from a shared OPML file are cleaned and capped like feed names.
+    #[test]
+    fn imported_names_are_cleaned() {
+        let long = "x".repeat(10_000);
+        let opml = format!(
+            r#"<opml version="2.0"><body><outline text="Evil&#27;[2J folder {long}"><outline text="Feed&#27;]0;pwned&#7;" xmlUrl="https://e.com/rss"/></outline></body></opml>"#
+        );
+        let outlines = parse_opml(&opml).unwrap();
+        assert_eq!(outlines.len(), 1);
+        assert!(!outlines[0].title.chars().any(char::is_control), "{:?}", outlines[0].title);
+        let folder = outlines[0].folder.as_deref().unwrap();
+        assert!(!folder.chars().any(char::is_control));
+        assert_eq!(folder.chars().count(), MAX_FOLDER_NAME_CHARS + 1); // plus "…"
+    }
+
     use super::*;
 
     #[test]

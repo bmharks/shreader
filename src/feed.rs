@@ -166,6 +166,14 @@ fn is_public_ip(ip: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public_ip(IpAddr::V4(v4));
             }
+            // NAT64 (64:ff9b::/96): an IPv4 address in the last 32 bits, which
+            // the network's gateway translates to, local ones included
+            let segments = v6.segments();
+            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = segments[6].to_be_bytes();
+                let [c, d] = segments[7].to_be_bytes();
+                return is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
+            }
             let first = v6.segments()[0];
             !(v6.is_loopback()
                 || v6.is_unspecified()
@@ -272,7 +280,7 @@ const MAX_FEED_BYTES: usize = 25 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 /// Longest story title stored, in characters
-const MAX_TITLE_CHARS: usize = 500;
+pub(crate) const MAX_TITLE_CHARS: usize = 500;
 /// Longest author line stored, in characters
 const MAX_AUTHOR_CHARS: usize = 300;
 /// Largest story body (and summary) stored. The largest real story seen was
@@ -292,7 +300,7 @@ const MAX_BYTES_PER_DAY: u64 = 100 * 1024 * 1024;
 /// (newlines, terminal escape codes) become spaces, invisible text-direction
 /// overrides are removed (they can make a title display as something else),
 /// and it's cut to `max_chars` characters.
-fn clean_line(text: &str, max_chars: usize) -> String {
+pub(crate) fn clean_line(text: &str, max_chars: usize) -> String {
     let cleaned: String = text
         .chars()
         .filter(|c| !is_direction_control(*c))
@@ -1009,11 +1017,12 @@ mod tests {
 
     #[test]
     fn public_and_local_addresses() {
-        let public = ["93.184.215.14", "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "100.128.0.1"];
+        let public = ["93.184.215.14", "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "100.128.0.1", "64:ff9b::808:808"];
         let local = [
             "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254",
             "0.0.0.0", "100.64.0.1", "100.127.255.255", "255.255.255.255", "224.0.0.1",
             "::1", "::", "fe80::1", "fd12:3456::1", "::ffff:192.168.1.1", "::ffff:127.0.0.1",
+            "64:ff9b::c0a8:101", "64:ff9b::7f00:1",
         ];
         for ip in public {
             assert!(is_public_ip(ip.parse().unwrap()), "{} should be public", ip);
