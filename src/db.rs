@@ -149,10 +149,35 @@ impl Database {
                 UNIQUE(feed_id, guid_hash)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_articles_feed_id ON articles(feed_id);
-            CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles(published_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_articles_fetched_at ON articles(fetched_at DESC);
+            -- Feed lookups, and the sidebar's per-feed and per-folder counts
+            -- (total and unread), which it answers from the index alone instead
+            -- of reading every story. Replaces an index on feed_id by itself.
+            CREATE INDEX IF NOT EXISTS idx_articles_feed_read ON articles(feed_id, is_read);
+            DROP INDEX IF EXISTS idx_articles_feed_id;
+            -- Replaced by the idx_articles_*shown_date indexes below (the list
+            -- sorts by a combination of the two dates)
+            DROP INDEX IF EXISTS idx_articles_published_at;
+            DROP INDEX IF EXISTS idx_articles_fetched_at;
             CREATE INDEX IF NOT EXISTS idx_articles_read_starred ON articles(is_read, is_starred);
+            "#,
+        )?;
+
+        // The story list's sort order (see `SHOWN_DATE`), so a page of the
+        // newest stories is read straight off an index instead of sorting
+        // the whole archive. Expression indexes only match a query that
+        // spells the expression the same way.
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_articles_shown_date
+                ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at));
+            CREATE INDEX IF NOT EXISTS idx_articles_unread_shown_date
+                ON articles(is_read, MIN(COALESCE(published_at, fetched_at), fetched_at));
+            CREATE INDEX IF NOT EXISTS idx_articles_starred_shown_date
+                ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at)) WHERE is_starred = 1;
+            -- Feed and folder views: lets a big folder be sorted from the
+            -- index rather than by reading all its stories
+            CREATE INDEX IF NOT EXISTS idx_articles_feed_shown_date
+                ON articles(feed_id, MIN(COALESCE(published_at, fetched_at), fetched_at));
             "#,
         )?;
 
@@ -697,59 +722,109 @@ impl Database {
         }
     }
 
-    /// Stories matching `filter`, newest first, for the story list.
-    ///
-    /// Bodies (`summary`, `content_html`, `content_text`) are left out (`None`):
-    /// they add up to tens of MB over a few thousand stories and the list never
-    /// shows them. Use `get_article` for one complete story.
-    pub fn get_articles(&self, filter: &ArticleFilter) -> Result<Vec<Article>> {
-        let conn = self.conn.lock().unwrap();
-
-        let mut query = String::from(
-            r#"
-            SELECT 
-                a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
-                a.title, a.url, a.author, NULL, NULL, NULL,
-                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
-            FROM articles a
-            JOIN feeds f ON f.id = a.feed_id
-            WHERE 1=1
-            "#,
-        );
-
+    /// The WHERE clause (without "WHERE") and its parameters for `filter`,
+    /// shared by `get_articles` and `count_articles`.
+    fn filter_clause(filter: &ArticleFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut clause = String::from("1=1");
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(feed_id) = filter.feed_id {
-            query.push_str(" AND a.feed_id = ?");
+            clause.push_str(" AND a.feed_id = ?");
             params_vec.push(Box::new(feed_id));
         }
 
         if let Some(folder_id) = filter.folder_id {
-            query.push_str(" AND a.feed_id IN (SELECT id FROM feeds WHERE folder_id = ?)");
+            clause.push_str(" AND a.feed_id IN (SELECT id FROM feeds WHERE folder_id = ?)");
             params_vec.push(Box::new(folder_id));
         }
 
+        if let Some(article_id) = filter.article_id {
+            clause.push_str(" AND a.id = ?");
+            params_vec.push(Box::new(article_id));
+        }
+
         if filter.unread_only {
-            query.push_str(" AND a.is_read = 0");
+            clause.push_str(" AND a.is_read = 0");
         }
 
         if filter.starred_only {
-            query.push_str(" AND a.is_starred = 1");
+            clause.push_str(" AND a.is_starred = 1");
         }
 
         if let Some(ref search) = filter.search_query {
             if !search.trim().is_empty() {
-                query.push_str(" AND a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)");
+                clause.push_str(" AND a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)");
                 // Format FTS5 search query nicely (e.g. quote words)
                 let fts_query = format!("\"{}\"", search.replace('"', "\"\""));
                 params_vec.push(Box::new(fts_query));
             }
         }
 
+        (clause, params_vec)
+    }
+
+    /// How many stories match `filter` (its limit and offset aside).
+    pub fn count_articles(&self, filter: &ArticleFilter) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let (clause, params_vec) = Self::filter_clause(filter);
+        let query = format!("SELECT COUNT(*) FROM articles a WHERE {}", clause);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.query_row(&query, param_refs.as_slice(), |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// How many stories matching `filter` come before story `article_id` in
+    /// the list order (its index in the full list, if it's part of it).
+    pub fn count_before(&self, filter: &ArticleFilter, article_id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let (clause, clause_params) = Self::filter_clause(filter);
+        let query = format!(
+            r#"
+            SELECT COUNT(*)
+            FROM articles a,
+                 (SELECT MIN(COALESCE(published_at, fetched_at), fetched_at) AS k FROM articles WHERE id = ?) t
+            WHERE {}
+              AND (MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) > t.k
+                   OR (MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) = t.k AND a.id > ?))
+            "#,
+            clause
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(article_id)];
+        params_vec.extend(clause_params);
+        params_vec.push(Box::new(article_id));
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let count: i64 = conn.query_row(&query, param_refs.as_slice(), |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Stories matching `filter`, newest first, for the story list. Use
+    /// `limit` to read just the part on screen: with an archive of hundreds
+    /// of thousands of stories, reading them all takes seconds.
+    ///
+    /// Bodies (`summary`, `content_html`, `content_text`) are left out (`None`):
+    /// they add up to tens of MB over a few thousand stories and the list never
+    /// shows them. Use `get_article` for one complete story.
+    pub fn get_articles(&self, filter: &ArticleFilter) -> Result<Vec<Article>> {
+        let conn = self.conn.lock().unwrap();
+        let (clause, params_vec) = Self::filter_clause(filter);
+
         // Newest first by publication date, but a date in the future counts
         // as the time the story was downloaded (see `Article::shown_date`).
         // Both are stored as UTC RFC 3339 text, which sorts chronologically.
-        query.push_str(" ORDER BY MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC");
+        // The expression matches the `idx_articles_*shown_date` indexes.
+        let mut query = format!(
+            r#"
+            SELECT
+                a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
+                a.title, a.url, a.author, NULL, NULL, NULL,
+                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
+            FROM articles a
+            JOIN feeds f ON f.id = a.feed_id
+            WHERE {}
+            ORDER BY MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC, a.id DESC
+            "#,
+            clause
+        );
 
         if let Some(limit) = filter.limit {
             query.push_str(&format!(" LIMIT {}", limit));
@@ -1108,6 +1183,48 @@ mod tests {
         for a in &articles {
             assert!(a.shown_date().unwrap() <= Utc::now());
         }
+    }
+
+    /// Pages of the list join up into exactly the full list, even with many
+    /// stories sharing a date; counts and positions agree with it.
+    #[test]
+    fn paged_list_matches_full_list() {
+        let db = Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://f.example/rss", "F", None, None, None).unwrap();
+        let base = Utc::now() - chrono::Duration::days(30);
+        for i in 0..40 {
+            // Groups of four share a date
+            let published = base + chrono::Duration::hours(i / 4);
+            let hash = format!("s{}", i);
+            db.upsert_article(feed, None, &hash, &hash, None, None, None, None, None, Some(published), None)
+                .unwrap();
+        }
+        let all = ArticleFilter::default();
+        let full: Vec<i64> = db.get_articles(&all).unwrap().iter().map(|a| a.id).collect();
+        assert_eq!(db.count_articles(&all).unwrap(), 40);
+
+        for limit in [1, 7, 13, 40, 50] {
+            let page: Vec<i64> = db
+                .get_articles(&ArticleFilter { limit: Some(limit), ..Default::default() })
+                .unwrap()
+                .iter()
+                .map(|a| a.id)
+                .collect();
+            assert_eq!(page, full[..limit.min(40)], "limit {}", limit);
+        }
+        for (index, id) in full.iter().enumerate() {
+            assert_eq!(db.count_before(&all, *id).unwrap(), index);
+        }
+
+        // Counts and positions within a narrower view
+        db.toggle_article_starred(full[10]).unwrap();
+        db.toggle_article_starred(full[20]).unwrap();
+        let starred = ArticleFilter { starred_only: true, ..Default::default() };
+        assert_eq!(db.count_articles(&starred).unwrap(), 2);
+        assert_eq!(db.count_before(&starred, full[20]).unwrap(), 1);
+        let only = |id| ArticleFilter { starred_only: true, article_id: Some(id), ..Default::default() };
+        assert_eq!(db.get_articles(&only(full[20])).unwrap().len(), 1);
+        assert!(db.get_articles(&only(full[21])).unwrap().is_empty());
     }
 
     #[test]

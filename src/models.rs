@@ -63,6 +63,8 @@ pub struct ArticleFilter {
     pub unread_only: bool,
     pub starred_only: bool,
     pub search_query: Option<String>,
+    /// Only this story (to check whether it's part of a view)
+    pub article_id: Option<i64>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }

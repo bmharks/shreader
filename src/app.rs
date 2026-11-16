@@ -94,7 +94,13 @@ pub struct RssApp {
     folders: Vec<Folder>,
     feeds: Vec<Feed>,
     articles: Vec<Article>,
-    article_render_limit: usize,                // how many of `articles` are rendered
+    /// How many stories are loaded into `articles` (and shown)
+    article_render_limit: usize,
+    /// How many stories the current view has in all
+    article_total: usize,
+    /// The open story's list entry (no body; see `reader_body`), while it's
+    /// part of the current view
+    open_article: Option<Article>,
     expanded_folders: HashSet<i64>,
     active_filter: ActiveFilter,
     selected_article_id: Option<i64>,
@@ -397,6 +403,8 @@ impl RssApp {
             feeds: Vec::new(),
             articles: Vec::new(),
             article_render_limit: ARTICLE_PAGE_SIZE,
+            article_total: 0,
+            open_article: None,
             expanded_folders: HashSet::new(),
             active_filter: ActiveFilter::All,
             selected_article_id: None,
@@ -521,55 +529,56 @@ impl RssApp {
         self.reload_articles();
     }
 
-    fn reload_articles(&mut self) {
-        let filter = match self.active_filter {
-            ActiveFilter::All => ArticleFilter {
-                search_query: if self.search_query.trim().is_empty() {
-                    None
-                } else {
-                    Some(self.search_query.clone())
-                },
-                ..Default::default()
-            },
-            ActiveFilter::Unread => ArticleFilter {
-                unread_only: true,
-                search_query: if self.search_query.trim().is_empty() {
-                    None
-                } else {
-                    Some(self.search_query.clone())
-                },
-                ..Default::default()
-            },
-            ActiveFilter::Starred => ArticleFilter {
-                starred_only: true,
-                search_query: if self.search_query.trim().is_empty() {
-                    None
-                } else {
-                    Some(self.search_query.clone())
-                },
-                ..Default::default()
-            },
-            ActiveFilter::Folder(folder_id) => ArticleFilter {
-                folder_id: Some(folder_id),
-                search_query: if self.search_query.trim().is_empty() {
-                    None
-                } else {
-                    Some(self.search_query.clone())
-                },
-                ..Default::default()
-            },
-            ActiveFilter::Feed(feed_id) => ArticleFilter {
-                feed_id: Some(feed_id),
-                search_query: if self.search_query.trim().is_empty() {
-                    None
-                } else {
-                    Some(self.search_query.clone())
-                },
-                ..Default::default()
-            },
+    /// The stories the list is showing, as a database filter (no limit).
+    fn list_filter(&self) -> ArticleFilter {
+        let mut filter = ArticleFilter {
+            search_query: Some(self.search_query.clone()).filter(|q| !q.trim().is_empty()),
+            ..Default::default()
         };
+        match self.active_filter {
+            ActiveFilter::All => {}
+            ActiveFilter::Unread => filter.unread_only = true,
+            ActiveFilter::Starred => filter.starred_only = true,
+            ActiveFilter::Folder(folder_id) => filter.folder_id = Some(folder_id),
+            ActiveFilter::Feed(feed_id) => filter.feed_id = Some(feed_id),
+        }
+        filter
+    }
 
-        self.articles = self.db.get_articles(&filter).unwrap_or_default();
+    /// Reloads the story list: only the part that's shown
+    /// (`article_render_limit` stories), plus the total for the counts.
+    /// Reading every matching story would take seconds once the archive
+    /// holds a few hundred thousand.
+    fn reload_articles(&mut self) {
+        let filter = self.list_filter();
+        self.article_total = self.db.count_articles(&filter).unwrap_or(0);
+        self.load_list_page(&filter);
+
+        // The open story stays open while it's part of this view, even if
+        // newer stories pushed it past the loaded part: then the list loads
+        // down to it, so the arrow keys continue from where it is.
+        self.open_article = None;
+        let Some(id) = self.selected_article_id else {
+            return;
+        };
+        if let Some(article) = self.articles.iter().find(|a| a.id == id) {
+            self.open_article = Some(article.clone());
+            return;
+        }
+        let only_it = ArticleFilter { article_id: Some(id), ..filter.clone() };
+        let Some(article) = self.db.get_articles(&only_it).ok().and_then(|a| a.into_iter().next()) else {
+            return; // not in this view
+        };
+        if let Ok(position) = self.db.count_before(&filter, id) {
+            self.article_render_limit = (position / ARTICLE_PAGE_SIZE + 1) * ARTICLE_PAGE_SIZE;
+            self.load_list_page(&filter);
+        }
+        self.open_article = Some(article);
+    }
+
+    fn load_list_page(&mut self, filter: &ArticleFilter) {
+        let page = ArticleFilter { limit: Some(self.article_render_limit), ..filter.clone() };
+        self.articles = self.db.get_articles(&page).unwrap_or_default();
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -601,6 +610,7 @@ impl RssApp {
             Message::SelectArticle(article_id) => {
                 self.selected_article_id = Some(article_id);
                 self.mark_opened_story_read(article_id);
+                self.open_article = self.articles.iter().find(|a| a.id == article_id).cloned();
                 // The list holds no story bodies; load just this one
                 let blocks = self
                     .db
@@ -647,9 +657,19 @@ impl RssApp {
                 {
                     return Task::none();
                 }
-                let current = self
-                    .selected_article_id
-                    .and_then(|id| self.articles.iter().position(|a| a.id == id));
+                let position = |app: &Self| {
+                    app.selected_article_id
+                        .and_then(|id| app.articles.iter().position(|a| a.id == id))
+                };
+                // Stepping past the loaded part of the list loads more
+                if forward
+                    && position(self).is_some_and(|i| i + 1 == self.articles.len())
+                    && self.articles.len() < self.article_total
+                {
+                    self.article_render_limit += ARTICLE_PAGE_SIZE;
+                    self.reload_articles();
+                }
+                let current = position(self);
                 let target = match (current, forward) {
                     // Nothing open yet: either arrow starts at the top
                     (None, _) => 0,
@@ -657,10 +677,6 @@ impl RssApp {
                     (Some(i), false) if i > 0 => i - 1,
                     _ => return Task::none(), // already at the end
                 };
-                // Stepping past the rendered part of the list renders more
-                if target >= self.article_render_limit {
-                    self.article_render_limit = target + 1 + ARTICLE_PAGE_SIZE;
-                }
                 self.feed_menu = None;
                 self.folder_menu = None;
                 self.article_menu = None;
@@ -1499,6 +1515,7 @@ impl RssApp {
             }
             Message::ShowMoreArticles => {
                 self.article_render_limit += ARTICLE_PAGE_SIZE;
+                self.reload_articles();
                 Task::none()
             }
             Message::StatusTimedOut(generation) => {
@@ -1709,6 +1726,7 @@ impl RssApp {
             return Task::none();
         }
         self.selected_article_id = None;
+        self.open_article = None;
         self.reader_body = None;
         self.reader_texts.clear();
         self.reader_text_menu = None;
@@ -3301,9 +3319,9 @@ impl RssApp {
             .size(13);
 
         let list_header_label = match self.active_filter {
-            ActiveFilter::All => format!("All Stories ({})", self.articles.len()),
-            ActiveFilter::Unread => format!("Unread Stories ({})", self.articles.len()),
-            ActiveFilter::Starred => format!("Starred Stories ({})", self.articles.len()),
+            ActiveFilter::All => format!("All Stories ({})", self.article_total),
+            ActiveFilter::Unread => format!("Unread Stories ({})", self.article_total),
+            ActiveFilter::Starred => format!("Starred Stories ({})", self.article_total),
             ActiveFilter::Folder(foid) => {
                 let name = self
                     .folders
@@ -3311,7 +3329,7 @@ impl RssApp {
                     .find(|f| f.id == foid)
                     .map(|f| f.name.as_str())
                     .unwrap_or("Folder");
-                format!("{} ({})", name, self.articles.len())
+                format!("{} ({})", name, self.article_total)
             }
             ActiveFilter::Feed(fid) => {
                 let name = self
@@ -3320,7 +3338,7 @@ impl RssApp {
                     .find(|f| f.id == fid)
                     .map(|f| f.title.as_str())
                     .unwrap_or("Feed");
-                format!("{} ({})", name, self.articles.len())
+                format!("{} ({})", name, self.article_total)
             }
         };
 
@@ -3408,7 +3426,7 @@ impl RssApp {
                 article_items = article_items.push(card);
             }
 
-            let remaining = self.articles.len().saturating_sub(self.article_render_limit);
+            let remaining = self.article_total.saturating_sub(self.articles.len());
             if remaining > 0 {
                 article_items = article_items.push(
                     button(
@@ -3447,9 +3465,7 @@ impl RssApp {
     }
 
     fn view_reader(&self) -> Element<'_, Message> {
-        let selected_article = self
-            .selected_article_id
-            .and_then(|id| self.articles.iter().find(|a| a.id == id).cloned());
+        let selected_article = self.open_article.clone();
 
         match selected_article {
             None => container(
