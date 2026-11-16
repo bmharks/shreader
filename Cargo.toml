@@ -1,7 +1,16 @@
 [package]
-name = "rss_reader"
+name = "shreader"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "An RSS and Atom reader for Linux that keeps every story it receives, in a searchable local archive"
+authors = ["bmharks <bmharks@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/bmharks/shreader"
+homepage = "https://github.com/bmharks/shreader"
+readme = "README.md"
+keywords = ["rss", "atom", "feed-reader", "archive", "linux"]
+categories = ["gui"]
 
 [dependencies]
 # Storage & Database

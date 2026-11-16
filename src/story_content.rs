@@ -500,11 +500,11 @@ mod tests {
     }
 
     /// Converts every story in a database without panicking:
-    /// `RSS_READER_DB=/path/to/rss_reader.db cargo test all_stories -- --ignored`
+    /// `SHREADER_DB=/path/to/shreader.db cargo test all_stories -- --ignored`
     #[test]
     #[ignore]
     fn all_stories_convert() {
-        let path = std::env::var("RSS_READER_DB").expect("set RSS_READER_DB");
+        let path = std::env::var("SHREADER_DB").expect("set SHREADER_DB");
         let conn = rusqlite::Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

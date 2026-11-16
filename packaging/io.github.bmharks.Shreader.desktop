@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Shreader
+GenericName=RSS Reader
+Comment=Read RSS and Atom feeds, keeping every story in a searchable archive
+Exec=shreader
+Icon=io.github.bmharks.Shreader
+Terminal=false
+Categories=Network;Feed;News;
+Keywords=RSS;Atom;Feed;News;Reader;Archive;Podcast;
+StartupWMClass=io.github.bmharks.Shreader

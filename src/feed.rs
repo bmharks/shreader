@@ -262,7 +262,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
 }
 
 /// How the app identifies itself to feed servers.
-const USER_AGENT: &str = concat!("ShreaderRSS/", env!("CARGO_PKG_VERSION"), " (Linux)");
+const USER_AGENT: &str = concat!("Shreader/", env!("CARGO_PKG_VERSION"), " (+https://github.com/bmharks/shreader)");
 
 /// Largest feed document downloaded. Real feeds are well under 5 MB; this
 /// only stops a wrong or hostile URL from filling memory.

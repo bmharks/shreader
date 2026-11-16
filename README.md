@@ -1,103 +1,103 @@
-# Shreader RSS Reader (Linux / Rust)
+# Shreader
 
-A modern, high-performance RSS/Atom feed reader built in Rust for Linux, designed around one core principle: **you should never lose a story**.
+An RSS and Atom feed reader for Linux that keeps every story it receives.
 
-Most RSS readers mirror the current state of a feed, which means when a publisher trims their feed to the newest 10–20 posts, older stories quietly vanish. **Shreader RSS Reader** implements an append-only SQLite storage engine with full-text search, keeping every story you ever receive permanently archived locally.
+Most feed readers show what a feed contains right now, so when a site trims its feed to the latest 20 posts, older stories disappear. Shreader keeps every story it downloads in a local, searchable archive, even after it drops out of the feed.
 
----
+## Features
 
-## Key Features & Archival Guarantees
+- **A permanent archive.** Stories stay after they leave the feed, along with whether you've read or starred them.
+- **Folders.** Group feeds into folders and drag feeds and folders to rearrange them. Collapsed folders stay collapsed, and the app opens on your top folder.
+- **Full-text search** across titles, story text and authors of everything archived.
+- **Automatic refresh** every 30 minutes by default (the same as Akregator), adjustable in Settings. Feeds also refresh when the app starts.
+- **Images in stories** load as you scroll to them, or only when you click, if you prefer (see [Privacy](#privacy)).
+- **OPML import and export**, keeping your folders, so you can move from or to other readers such as Akregator.
+- **Keyboard navigation** (see below).
 
-- **Permanent SQL Archival**:
-  - Stories are stored in SQLite in **Write-Ahead Logging (WAL)** mode for crash resilience and zero data corruption.
-  - Periodic feed syncs **never delete** older articles. If an article drops out of a publisher's feed, it remains preserved in your local SQL database forever.
-- **Akregator-Style Folder Organization**:
-  - Group feeds into custom categories and folders (e.g., `Linux & Open Source`, `Technology`, `News`).
-  - **Drag-and-Drop Organization**: Drag feeds by their `⠿` handle directly into any folder or out into "Uncategorized" to reorganize your subscriptions on the fly.
-  - **Instant Naming Focus**: Clicking `+ Folder` immediately focuses and highlights the input box so you can start typing the folder name right away without clicking into it.
-  - **Aggregated Reading**: Clicking a folder displays articles from **all feeds inside that folder** with combined unread counts.
-  - **Collapsible Tree**: Expand (`▼`) or collapse (`▶`) folders in the sidebar.
-  - **Safe Deletion**: Deleting a folder unlinks its feeds safely without deleting the feeds or their archived stories.
-- **Robust Deduplication Engine**:
-  - Normalizes URLs by stripping tracking query parameters (`utm_*`, `ref`, `fbclid`, `gclid`).
-  - Computes a canonical SHA-256 hash using `(feed_id, guid)`, with fallback to `(feed_id, clean_url)` or `(feed_id, title + content)`.
-  - Updating an article modifies its content or metadata without ever wiping your read or starred bookmark status.
-- **SQLite FTS5 Full-Text Search**:
-  - Automated triggers keep an SQLite FTS5 index synchronized across article titles, summaries, clean body text, and authors.
-  - Search through thousands of archived stories instantly without network delays.
-- **Native Desktop GUI (Iced)**:
-  - 3-column desktop layout (Feeds & Folders Tree, Article List, Full Reader View).
-  - Dark theme with unread badges, star bookmarks, and direct "Open in Browser" integration (`xdg-open`).
-  - Live status indicator displaying the number of stories and folders safely archived in SQL.
-- **OPML 2.0 Import & Export with Folders**:
-  - Compatible with Akregator, Feedly, and NetNewsWire OPML files with nested `<outline>` tags.
-  - Import or export subscriptions while preserving your complete folder hierarchy.
+## Installing
 
----
+Shreader is built from source. You need [Rust](https://rustup.rs) 1.89 or newer and a C compiler (for the bundled SQLite).
 
-## Project Structure
-
-```text
-├── Cargo.toml
-├── sample_feeds.opml          # Example OPML file for testing
-└── src
-    ├── app.rs                 # Desktop GUI (Iced 0.13 Elm architecture) with folder tree
-    ├── db.rs                  # SQLite engine with WAL, FTS5, folders & append-only upsert
-    ├── feed.rs                # Feed fetcher (reqwest + feed-rs) with conditional GET & hashing
-    ├── main.rs                # App entrypoint with CLI subcommands & GUI launcher
-    ├── models.rs              # Domain data models (Folder, Feed, Article, Filters)
-    └── opml.rs                # OPML 2.0 importer & exporter with nested folder support
-```
-
----
-
-## Building and Running
-
-### Prerequisites
-- Rust 1.80+ (Rust 2024 edition supported)
-- Standard Linux libraries (Wayland / X11 / Mesa)
-
-### Launch Desktop GUI
 ```bash
-cargo run
+git clone https://github.com/bmharks/shreader.git
+cd shreader
+packaging/install.sh
 ```
 
-### CLI Subcommands
+This builds Shreader and installs it for your user only (no root needed): the program in `~/.local/bin`, plus a launcher and icon so it appears in your applications menu. `~/.local/bin` needs to be on your `PATH`; the script tells you if it isn't.
 
-| Command | Description |
+To uninstall, run `packaging/install.sh --uninstall`. Your archive is left in place (see [Your data](#your-data)).
+
+## Using Shreader
+
+- **Add a feed** with **+ Feed** above the feed list. Paste the feed's address; Shreader looks it up and fills in its name.
+- **Right-click** a feed or folder for more: refresh it, mark it read or unread, rename or delete it, or move a feed to another folder.
+- **Drag** feeds by their handle into another folder or position, and folders to reorder them.
+- **Settings** (the gear icon) has automatic refresh, image loading, OPML import and export, and clearing archived stories.
+
+| Key | Action |
 |---|---|
-| `cargo run -- --stats` | View total feeds, folders, archived story count, and database path |
-| `cargo run -- --list-folders` | List all folders with feed counts and unread badges |
-| `cargo run -- --list-feeds` | List all feeds grouped by folder with unread story counts |
-| `cargo run -- --create-folder <name>` | Create a new folder category |
-| `cargo run -- --move-feed <id> [folder]` | Move a feed to a folder (or "none" for uncategorized) |
-| `cargo run -- --add-feed <url> [name] [fld]` | Add and immediately ingest a feed into a folder |
-| `cargo run -- --import-opml <file.opml>` | Import subscriptions from an OPML file (preserves folders) |
-| `cargo run -- --export-opml [out.opml]` | Export subscriptions to OPML with nested folder outlines |
-| `cargo run -- --help` | Display CLI help menu |
+| Right / Left | Next / previous story |
+| Up / Down | Scroll the open story |
+| Esc | Close a menu or dialog |
 
----
+Searches match the words you type as an exact phrase.
 
-## Database Location & Configuration
+## Your data
 
-By default, the database is placed according to Linux XDG standards:
+Everything is stored in one SQLite file, readable only by your user account:
+
 ```text
-~/.local/share/rss_reader/rss_reader.db
+~/.local/share/shreader/shreader.db
 ```
 
-You can customize the storage path at any time by setting the `RSS_READER_DB` environment variable:
+To back it up, copy that file while Shreader is closed. To keep it somewhere else, set the `SHREADER_DB` environment variable to the path of the file you want.
+
+If you used Shreader while it was still called "rss_reader", your archive is moved from `~/.local/share/rss_reader/` the first time you start this version.
+
+Nothing is ever deleted by a refresh. Stories only leave the archive when you delete their feed or clear stories in Settings (where you can choose to keep starred ones).
+
+### Limits
+
+To stop a broken or hostile feed from making the app unusable or filling your disk, Shreader stores:
+
+- stories up to 512 KB each (anything longer is shortened, with a note to open the rest in your browser) and titles up to 500 characters;
+- at most 1,000 new stories per feed in one refresh, and 3,000 stories or 100 MB per feed per day. Stories held back arrive in later refreshes if the feed still lists them, and the refresh message says when this happens.
+
+Ordinary feeds stay far below these limits.
+
+## Privacy
+
+- **Feeds** are downloaded directly from each site, which sees your IP address and when you refresh. Shreader identifies itself as `Shreader/<version> (+https://github.com/bmharks/shreader)`.
+- **Images** are downloaded from wherever the story says they are. Newsletters often use this to tell when a story was opened. To prevent that, turn off **Load images in stories automatically** in Settings; each image then has a button to load it.
+- **Your network:** feeds with public addresses, and all story images, can only be downloaded from public internet addresses, so a feed can't make Shreader send requests to your router or other devices on your network. Feeds you subscribe to at a local address (such as `http://nas/feed` or `http://192.168.1.10/rss`) still work.
+- **Links** open in your browser only if they're web links (`http` or `https`).
+
+## Command line
+
+The same program also works from a terminal:
+
+| Command | What it does |
+|---|---|
+| `shreader --stats` | Show the archive's location and how many feeds, folders and stories it holds |
+| `shreader --list-folders` | List folders with their unread counts |
+| `shreader --list-feeds` | List feeds grouped by folder, with their IDs |
+| `shreader --create-folder <name>` | Create a folder |
+| `shreader --add-feed <url> [name] [folder]` | Subscribe to a feed and download its stories |
+| `shreader --move-feed <id> [folder]` | Move a feed to a folder (or `none`) |
+| `shreader --import-opml <file>` | Import feeds from an OPML file |
+| `shreader --export-opml [file]` | Export your feeds and folders to OPML |
+| `shreader --help` | Show this list |
+
+## Building and testing
+
 ```bash
-export RSS_READER_DB=/path/to/custom_storage.db
-cargo run
-```
-
-If the XDG directory is not writable, the application automatically falls back to `./rss_reader.db`.
-
----
-
-## Testing
-
-Run the automated test suite verifying database append-only persistence, folder grouping, tracking parameter cleanup, hash stability, and nested OPML parsing:
-```bash
+cargo build --release --locked   # the program is target/release/shreader
 cargo test
 ```
+
+The code is in `src/`: `app.rs` is the interface (built with [iced](https://iced.rs)), `db.rs` the SQLite archive, `feed.rs` downloading and processing feeds, `opml.rs` import and export, and `story_content.rs` turning story HTML into text and images. `packaging/` has the launcher, icon and install script.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

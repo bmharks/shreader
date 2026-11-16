@@ -3760,32 +3760,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rss_reader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "directories",
- "feed-rs",
- "futures",
- "hex",
- "html2text",
- "iced",
- "image",
- "libc",
- "quick-xml",
- "reqwest",
- "resvg",
- "rfd",
- "rusqlite",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "rusqlite"
 version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4070,6 +4044,32 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "shreader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "directories",
+ "feed-rs",
+ "futures",
+ "hex",
+ "html2text",
+ "iced",
+ "image",
+ "libc",
+ "quick-xml",
+ "reqwest",
+ "resvg",
+ "rfd",
+ "rusqlite",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
 
 [[package]]
 name = "signal-hook-registry"

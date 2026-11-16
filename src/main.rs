@@ -58,7 +58,7 @@ async fn run() -> Result<()> {
             }
             "--import-opml" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: rss_reader --import-opml <path-to-opml-file>");
+                    eprintln!("Usage: shreader --import-opml <path-to-opml-file>");
                     std::process::exit(1);
                 }
                 let file_path = &args[2];
@@ -80,7 +80,7 @@ async fn run() -> Result<()> {
             }
             "--create-folder" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: rss_reader --create-folder <folder-name>");
+                    eprintln!("Usage: shreader --create-folder <folder-name>");
                     std::process::exit(1);
                 }
                 let folder_name = &args[2];
@@ -90,7 +90,7 @@ async fn run() -> Result<()> {
             }
             "--add-feed" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: rss_reader --add-feed <feed-url> [title] [folder-name]");
+                    eprintln!("Usage: shreader --add-feed <feed-url> [title] [folder-name]");
                     std::process::exit(1);
                 }
                 let url = &args[2];
@@ -124,7 +124,7 @@ async fn run() -> Result<()> {
             }
             "--move-feed" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: rss_reader --move-feed <feed-id> [folder-name]");
+                    eprintln!("Usage: shreader --move-feed <feed-id> [folder-name]");
                     std::process::exit(1);
                 }
                 let feed_id: i64 = args[2].parse().expect("Invalid feed ID");
@@ -216,11 +216,7 @@ async fn run() -> Result<()> {
     let settings = iced::application("Shreader RSS Reader", RssApp::update, RssApp::view)
         .subscription(RssApp::subscription)
         .theme(RssApp::theme)
-        .window(iced::window::Settings {
-            size: iced::Size::new(1200.0, 750.0),
-            min_size: Some(iced::Size::new(900.0, 550.0)),
-            ..Default::default()
-        });
+        .window(window_settings(iced::Size::new(1200.0, 750.0), Some(iced::Size::new(900.0, 550.0))));
 
     if let Err(e) = settings.run_with(move || RssApp::new(db)) {
         eprintln!("Failed to launch GUI: {}", e);
@@ -264,33 +260,74 @@ fn show_startup_error(reason: String) {
 
     let result = iced::application("Shreader RSS Reader", update, view)
     .theme(|_| Theme::Dark)
-    .window(iced::window::Settings {
-        size: iced::Size::new(560.0, 240.0),
-        ..Default::default()
-    })
+    .window(window_settings(iced::Size::new(560.0, 240.0), None))
     .run_with(move || (message, Task::none()));
     if let Err(e) = result {
         eprintln!("Failed to show the error window: {}", e);
     }
 }
 
+/// The app ID: the launcher file is `<APP_ID>.desktop` and the icon
+/// `<APP_ID>.svg` (see `packaging/`). Desktops match windows to them by it.
+const APP_ID: &str = "io.github.bmharks.Shreader";
+
+/// The app icon (also installed with the launcher)
+const ICON_SVG: &str = include_str!("../packaging/io.github.bmharks.Shreader.svg");
+
+/// Window settings with the app's ID and icon.
+fn window_settings(size: iced::Size, min_size: Option<iced::Size>) -> iced::window::Settings {
+    iced::window::Settings {
+        size,
+        min_size,
+        icon: window_icon(),
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: APP_ID.to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// The icon as pixels, for the window itself (used on X11 and when the
+/// launcher isn't installed; Wayland desktops take it from the launcher).
+fn window_icon() -> Option<iced::window::Icon> {
+    use resvg::{tiny_skia, usvg};
+    const SIZE: u32 = 128;
+    let tree = usvg::Tree::from_str(ICON_SVG, &usvg::Options::default()).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE)?;
+    let scale = SIZE as f32 / tree.size().width().max(tree.size().height());
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let rgba = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    iced::window::icon::from_rgba(rgba, SIZE, SIZE).ok()
+}
+
 fn print_help() {
     println!(
         r#"
-Shreader RSS Reader (Linux)
-A permanent-archive RSS reader backed by SQLite with Akregator-style folder grouping.
+Shreader RSS Reader
+An RSS and Atom reader for Linux that keeps every story it receives.
 
 USAGE:
-    rss_reader                               Launch the Desktop GUI
-    rss_reader --import-opml <file>          Import feeds from an OPML file (preserves folders)
-    rss_reader --export-opml [file]          Export subscriptions to OPML with folder tags
-    rss_reader --create-folder <name>        Create a new folder category
-    rss_reader --add-feed <url> [name] [fld] Add and immediately fetch a feed
-    rss_reader --move-feed <id> [folder]     Move a feed to a folder (or "none")
-    rss_reader --list-folders                List all folders and unread counts
-    rss_reader --list-feeds                  List all subscribed feeds grouped by folder
-    rss_reader --stats                       Show SQL database storage statistics
-    rss_reader --help                        Display this help menu
+    shreader                               Launch the desktop app
+    shreader --import-opml <file>          Import feeds from an OPML file (preserves folders)
+    shreader --export-opml [file]          Export subscriptions to OPML with folder tags
+    shreader --create-folder <name>        Create a new folder category
+    shreader --add-feed <url> [name] [fld] Add and immediately fetch a feed
+    shreader --move-feed <id> [folder]     Move a feed to a folder (or "none")
+    shreader --list-folders                List all folders and unread counts
+    shreader --list-feeds                  List all subscribed feeds grouped by folder
+    shreader --stats                       Show SQL database storage statistics
+    shreader --help                        Display this help menu
+
+The archive is kept in ~/.local/share/shreader/shreader.db; set SHREADER_DB
+to use another file.
 "#
     );
 }

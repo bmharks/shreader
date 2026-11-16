@@ -987,7 +987,7 @@ impl RssApp {
                     settings.export_result = None;
                 }
                 let file_name = format!(
-                    "rss-reader-feeds-{}.opml",
+                    "shreader-feeds-{}.opml",
                     chrono::Local::now().format("%Y-%m-%d")
                 );
                 Task::perform(

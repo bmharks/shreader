@@ -7,6 +7,60 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{Article, ArticleFilter, Feed, Folder, IngestionResult};
 
+/// The archive to open: `new`, after moving an archive from `legacy` there
+/// if only `legacy` has one. If it can't be moved (in use, another disk),
+/// `legacy` is used where it is, so an archive is never split or lost.
+fn adopt_legacy_archive(legacy: &Path, new: &Path) -> PathBuf {
+    if new.exists() || !legacy.exists() {
+        return new.to_path_buf();
+    }
+    match move_archive(legacy, new) {
+        Ok(()) => {
+            tracing::info!("Moved the archive from {:?} to {:?}", legacy, new);
+            new.to_path_buf()
+        }
+        Err(e) => {
+            tracing::warn!("Couldn't move the archive from {:?} ({:#}); using it there", legacy, e);
+            legacy.to_path_buf()
+        }
+    }
+}
+
+/// Moves a closed SQLite archive from `from` to `to` (a file that doesn't
+/// exist yet). Nothing is copied or deleted: it's one rename, after making
+/// sure the file alone holds everything.
+fn move_archive(from: &Path, to: &Path) -> Result<()> {
+    let side_file = |path: &Path, suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    {
+        // Fold the write-ahead log into the main file. Closing the last
+        // connection then removes the -wal and -shm files.
+        let conn = Connection::open(from)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if busy != 0 {
+            anyhow::bail!("the archive is in use");
+        }
+    }
+    // Still there: another program (an older copy of the app?) has it open,
+    // and would keep writing to the old location
+    if side_file(from, "-wal").exists() || side_file(from, "-shm").exists() {
+        anyhow::bail!("the archive is open in another program");
+    }
+    let dir = to.parent().context("no folder for the archive")?;
+    std::fs::create_dir_all(dir)?;
+    set_private(dir, 0o700);
+    std::fs::rename(from, to)?;
+    // The old folder, if that left it empty (fails harmlessly otherwise)
+    if let Some(old_dir) = from.parent() {
+        let _ = std::fs::remove_dir(old_dir);
+    }
+    Ok(())
+}
+
 /// Restricts `path` to `mode` (owner-only permissions). Best effort: on
 /// failure the archive still works, just with the default permissions.
 fn set_private(path: &Path, mode: u32) {
@@ -39,17 +93,23 @@ pub struct Database {
 }
 
 impl Database {
-    /// Opens or creates the SQLite database at standard Linux XDG path
-    /// (~/.local/share/rss_reader/rss_reader.db), or at `$RSS_READER_DB`.
+    /// Opens or creates the archive at the standard Linux location
+    /// (~/.local/share/shreader/shreader.db), or at `$SHREADER_DB`
+    /// (`$RSS_READER_DB` from before the rename also still works). An
+    /// archive at the location used before the rename is moved over first.
     ///
     /// There's deliberately no fallback location: opening an empty database
     /// elsewhere would look like the archive was lost, and anything added
     /// would land in the wrong file.
     pub fn open_default() -> Result<Self> {
-        let path = match std::env::var_os("RSS_READER_DB") {
+        let env_path = std::env::var_os("SHREADER_DB").or_else(|| std::env::var_os("RSS_READER_DB"));
+        let path = match env_path {
             Some(env_path) => PathBuf::from(env_path),
             None => {
-                let path = Self::default_db_path()?;
+                let path = match Self::legacy_db_path() {
+                    Some(legacy) => adopt_legacy_archive(&legacy, &Self::default_db_path()?),
+                    None => Self::default_db_path()?,
+                };
                 // The app's own folder: private to this user, like the files
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)
@@ -135,11 +195,18 @@ impl Database {
             .sum()
     }
 
+    /// ~/.local/share/shreader/shreader.db (named after the app ID,
+    /// io.github.bmharks.Shreader)
     pub fn default_db_path() -> Result<PathBuf> {
-        let proj = ProjectDirs::from("org", "rss_reader", "rss_reader")
+        let proj = ProjectDirs::from("io.github", "bmharks", "Shreader")
             .context("Could not determine user XDG data directory")?;
-        let data_dir = proj.data_dir();
-        Ok(data_dir.join("rss_reader.db"))
+        Ok(proj.data_dir().join("shreader.db"))
+    }
+
+    /// Where the archive was kept before the app was renamed:
+    /// ~/.local/share/rss_reader/rss_reader.db
+    fn legacy_db_path() -> Option<PathBuf> {
+        ProjectDirs::from("org", "rss_reader", "rss_reader").map(|proj| proj.data_dir().join("rss_reader.db"))
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -1355,6 +1422,43 @@ mod tests {
         .join();
         assert!(db.conn.is_poisoned());
         assert!(db.get_folders().is_ok());
+    }
+
+    /// An archive in the pre-rename location moves to the new one with all
+    /// its data, including changes still in the write-ahead log; one that's
+    /// open elsewhere stays put and keeps being used.
+    #[test]
+    fn archive_moves_to_the_new_location() {
+        let root = std::env::temp_dir().join(format!("shreader-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("rss_reader/rss_reader.db");
+        let new = root.join("shreader/shreader.db");
+
+        let old_db = Database::open(&legacy).unwrap();
+        old_db.create_folder("Kept").unwrap();
+        {
+            // Leave the change in the write-ahead log, as a running app would
+            let conn = old_db.lock();
+            conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        }
+        old_db.create_folder("Also kept").unwrap();
+
+        // Still open: not moved, and the old archive is the one to use
+        assert_eq!(adopt_legacy_archive(&legacy, &new), legacy);
+        assert!(legacy.exists() && !new.exists());
+
+        drop(old_db);
+        assert_eq!(adopt_legacy_archive(&legacy, &new), new);
+        assert!(!legacy.exists() && !root.join("rss_reader").exists());
+        let moved = Database::open(&new).unwrap();
+        let names: Vec<String> = moved.get_folders().unwrap().into_iter().map(|f| f.name).collect();
+        assert_eq!(names.len(), 2, "{:?}", names);
+
+        // Once moved, a new archive is never replaced by an old one
+        Database::open(&legacy).unwrap();
+        assert_eq!(adopt_legacy_archive(&legacy, &new), new);
+        assert!(legacy.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
