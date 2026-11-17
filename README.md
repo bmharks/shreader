@@ -1,4 +1,4 @@
-# Shreader
+# Shreader (Pronounced Shredder)
 
 An RSS and Atom feed reader for Linux that keeps every story it receives.
 
