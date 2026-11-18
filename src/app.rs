@@ -2867,7 +2867,9 @@ impl RssApp {
         // System tray
         let tray_section = column![
             text("System tray").size(14),
-            checkbox("Keep running in the system tray when the window is closed", self.keep_in_tray)
+            // Shown as it actually behaves: without a tray, closing quits
+            // whatever the saved choice
+            checkbox("Keep running in the system tray when the window is closed", self.tray && self.keep_in_tray)
                 .on_toggle_maybe(self.tray.then_some(Message::SetKeepInTray))
                 .size(14)
                 .text_size(12),
