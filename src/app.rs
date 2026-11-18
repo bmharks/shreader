@@ -14,7 +14,7 @@ use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
 use crate::story_content::{self, Block, LinkSpan};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
-use crate::key_press::{on_key_press, scroll_into_view};
+use crate::key_press::{on_key_press, scroll_by_step, scroll_into_view};
 use crate::lazy_load::on_visible;
 use crate::image_space::image_space;
 use crate::story_text::{find_matches, story_text, TextRange};
@@ -857,11 +857,15 @@ impl RssApp {
                 self.folder_menu = None;
                 self.article_menu = None;
                 let id = self.articles[target].id;
+                let from = current.map(|i| self.articles[i].id);
                 let select = self.update(Message::SelectArticle(id));
-                Task::batch([
-                    select,
-                    then_redraw(scroll_into_view(article_list_scroll_id(), selected_story_id())),
-                ])
+                // The whole list moves by one story, so the selection keeps
+                // its place on screen and the stories after it stay in view
+                let scroll = match from {
+                    Some(from) => scroll_by_step(article_list_scroll_id(), story_card_id(from), story_card_id(id)),
+                    None => scroll_into_view(article_list_scroll_id(), story_card_id(id)),
+                };
+                Task::batch([select, then_redraw(scroll)])
             }
             Message::LoadStoryImage(url) => {
                 match self.story_images.get(&url) {
@@ -3965,16 +3969,14 @@ impl RssApp {
                     .on_press(Message::SelectArticle(article.id));
 
                 let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
-                let mut card = container(
+                let card = container(
                     context_menu(item_btn)
                         .menu(menu)
                         .on_right_press(Message::OpenArticleMenu(article.id))
                         .on_dismiss(Message::CloseArticleMenu),
                 );
-                // So the arrow keys can scroll the open story into view
-                if is_selected {
-                    card = card.id(selected_story_id());
-                }
+                // So the arrow keys can find the cards to scroll by
+                let card = card.id(story_card_id(article.id));
                 article_items = article_items.push(card);
             }
 
@@ -4608,9 +4610,9 @@ fn reader_scroll_id() -> scrollable::Id {
 /// (about three lines; holding the key repeats it).
 const READER_ARROW_STEP: f32 = 60.0;
 
-/// The open story's card in the list.
-fn selected_story_id() -> container::Id {
-    container::Id::new("selected-story")
+/// A story's card in the list.
+fn story_card_id(article_id: i64) -> container::Id {
+    container::Id::new(format!("story-{}", article_id))
 }
 
 /// The current find match (reported by `story_text`, to scroll to it)

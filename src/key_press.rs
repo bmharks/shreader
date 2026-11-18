@@ -299,3 +299,94 @@ impl Operation<Option<f32>> for FindItem {
         operation::Outcome::Some(offset)
     }
 }
+
+/// Scrolls the scrollable `scroll_id` by the distance from container `from`
+/// to container `to`, so `to` lands where `from` was: stepping through a
+/// list moves the whole list by one item, and the selection stays put on
+/// screen (with what's coming next in view below it). Where the list can't
+/// scroll that far (near its ends), or `to` would still be out of view, it
+/// scrolls just enough to show `to`, like `scroll_into_view`.
+pub fn scroll_by_step<Message: Send + 'static>(
+    scroll_id: scrollable::Id,
+    from: container::Id,
+    to: container::Id,
+) -> Task<Message> {
+    let find = FindPair {
+        scroll_id: scroll_id.clone().into(),
+        from_id: from.into(),
+        to_id: to.into(),
+        scroll: None,
+        from: None,
+        to: None,
+    };
+    iced::advanced::widget::operate(find).then(move |offset: Option<f32>| match offset {
+        Some(y) => scrollable::scroll_to(scroll_id.clone(), scrollable::AbsoluteOffset { x: 0.0, y }),
+        None => Task::none(),
+    })
+}
+
+/// Finds the scrollable and both items; its outcome is the offset to scroll
+/// to, if any.
+struct FindPair {
+    scroll_id: widget::Id,
+    from_id: widget::Id,
+    to_id: widget::Id,
+    /// (viewport bounds, content bounds, current translation)
+    scroll: Option<(Rectangle, Rectangle, Vector)>,
+    from: Option<Rectangle>,
+    to: Option<Rectangle>,
+}
+
+impl Operation<Option<f32>> for FindPair {
+    fn container(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        operate_on_children: &mut dyn FnMut(&mut dyn Operation<Option<f32>>),
+    ) {
+        if id == Some(&self.from_id) {
+            self.from = Some(bounds);
+        }
+        if id == Some(&self.to_id) {
+            self.to = Some(bounds);
+        }
+        if self.from.is_none() || self.to.is_none() {
+            operate_on_children(self);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        _state: &mut dyn operation::Scrollable,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+    ) {
+        if id == Some(&self.scroll_id) {
+            self.scroll = Some((bounds, content_bounds, translation));
+        }
+    }
+
+    fn finish(&self) -> operation::Outcome<Option<f32>> {
+        let (Some((viewport, content, translation)), Some(to)) = (self.scroll, self.to) else {
+            return operation::Outcome::Some(None);
+        };
+        let max_offset = (content.height - viewport.height).max(0.0);
+        // Positions within the scrolled content
+        let to_top = to.y - content.y;
+        let to_bottom = to_top + to.height;
+        let mut offset = match self.from {
+            // Move the list by the distance between the two items
+            Some(from) => (translation.y + (to.y - from.y)).clamp(0.0, max_offset),
+            None => translation.y,
+        };
+        // Whatever happens, `to` ends up fully in view
+        if to_top < offset {
+            offset = (to_top - SCROLL_MARGIN).max(0.0);
+        } else if to_bottom > offset + viewport.height {
+            offset = (to_bottom - viewport.height + SCROLL_MARGIN).min(to_top - SCROLL_MARGIN).max(0.0);
+        }
+        operation::Outcome::Some((offset != translation.y).then_some(offset))
+    }
+}
