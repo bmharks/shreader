@@ -65,6 +65,8 @@ pub struct ArticleFilter {
     pub search_query: Option<String>,
     /// Only this story (to check whether it's part of a view)
     pub article_id: Option<i64>,
+    /// Unread stories before read ones (each newest first)
+    pub unread_first: bool,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }

@@ -288,8 +288,12 @@ impl Database {
             r#"
             CREATE INDEX IF NOT EXISTS idx_articles_shown_date
                 ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at));
-            CREATE INDEX IF NOT EXISTS idx_articles_unread_shown_date
-                ON articles(is_read, MIN(COALESCE(published_at, fetched_at), fetched_at));
+            -- The Unread view, and "unread first" (read status, then newest
+            -- first). Replaces an index without the directions, which only
+            -- served the Unread view.
+            DROP INDEX IF EXISTS idx_articles_unread_shown_date;
+            CREATE INDEX IF NOT EXISTS idx_articles_read_shown_date
+                ON articles(is_read, MIN(COALESCE(published_at, fetched_at), fetched_at) DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_articles_starred_shown_date
                 ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at)) WHERE is_starred = 1;
             -- Feed and folder views: lets a big folder be sorted from the
@@ -960,16 +964,25 @@ impl Database {
     pub fn count_before(&self, filter: &ArticleFilter, article_id: i64) -> Result<usize> {
         let conn = self.lock();
         let (clause, clause_params) = Self::filter_clause(filter);
+        // "Before" in the list order (see `get_articles`): newer, or as new
+        // with a higher id; with unread first, any unread story comes before
+        // a read one
+        let newer = "(MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) > t.k \
+                     OR (MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) = t.k AND a.id > ?))";
+        let before = if filter.unread_first {
+            format!("(a.is_read < t.r OR (a.is_read = t.r AND {}))", newer)
+        } else {
+            newer.to_string()
+        };
         let query = format!(
             r#"
             SELECT COUNT(*)
             FROM articles a,
-                 (SELECT MIN(COALESCE(published_at, fetched_at), fetched_at) AS k FROM articles WHERE id = ?) t
-            WHERE {}
-              AND (MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) > t.k
-                   OR (MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) = t.k AND a.id > ?))
+                 (SELECT MIN(COALESCE(published_at, fetched_at), fetched_at) AS k, is_read AS r
+                  FROM articles WHERE id = ?) t
+            WHERE {} AND {}
             "#,
-            clause
+            clause, before
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(article_id)];
         params_vec.extend(clause_params);
@@ -1003,9 +1016,10 @@ impl Database {
             FROM articles a
             JOIN feeds f ON f.id = a.feed_id
             WHERE {}
-            ORDER BY MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC, a.id DESC
+            ORDER BY {}MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC, a.id DESC
             "#,
-            clause
+            clause,
+            if filter.unread_first { "a.is_read, " } else { "" }
         );
 
         if let Some(limit) = filter.limit {
@@ -1396,6 +1410,34 @@ mod tests {
         }
         for (index, id) in full.iter().enumerate() {
             assert_eq!(db.count_before(&all, *id).unwrap(), index);
+        }
+
+        // Unread first: pages, counts and positions follow that order too
+        // Every third story read
+        for id in full.iter().step_by(3) {
+            db.set_article_read(*id, true).unwrap();
+        }
+        let unread_first = ArticleFilter { unread_first: true, ..Default::default() };
+        let ordered: Vec<i64> = db.get_articles(&unread_first).unwrap().iter().map(|a| a.id).collect();
+        let expected: Vec<i64> = full
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 != 0)
+            .chain(full.iter().enumerate().filter(|(i, _)| i % 3 == 0))
+            .map(|(_, id)| *id)
+            .collect();
+        assert_eq!(ordered, expected);
+        for limit in [1, 7, 26, 27, 40] {
+            let page: Vec<i64> = db
+                .get_articles(&ArticleFilter { limit: Some(limit), ..unread_first.clone() })
+                .unwrap()
+                .iter()
+                .map(|a| a.id)
+                .collect();
+            assert_eq!(page, ordered[..limit], "limit {}", limit);
+        }
+        for (index, id) in ordered.iter().enumerate() {
+            assert_eq!(db.count_before(&unread_first, *id).unwrap(), index);
         }
 
         // Counts and positions within a narrower view

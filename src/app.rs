@@ -56,6 +56,9 @@ const MAX_IMAGE_DOWNLOADS: usize = 4;
 /// only when clicked
 const LOAD_IMAGES_SETTING: &str = "load_images";
 
+/// Setting: list unread stories before read ones
+const UNREAD_FIRST_SETTING: &str = "unread_first";
+
 /// Setting: show messages in the corner of the window (default), or none
 const NOTIFICATIONS_SETTING: &str = "notifications";
 
@@ -138,6 +141,8 @@ pub struct RssApp {
     load_images: bool,
     /// Whether messages pop up in the corner (`NOTIFICATIONS_SETTING`)
     notifications: bool,
+    /// Whether the story list shows unread stories first (`UNREAD_FIRST_SETTING`)
+    unread_first: bool,
     /// The open story's text blocks as read-only editors, so text can be
     /// selected and copied (iced's plain `text` can't be selected)
     reader_texts: Vec<text_editor::Content>,
@@ -325,6 +330,7 @@ pub enum Message {
     SetAutoRefresh(bool),
     SetLoadImages(bool),
     SetNotifications(bool),
+    ToggleUnreadFirst,
     SetAutoRefreshInterval(RefreshInterval),
     SearchChanged(String),
     ToggleStar(i64),
@@ -465,6 +471,7 @@ impl RssApp {
             image_downloads: HashMap::new(),
             load_images: true,
             notifications: true,
+            unread_first: false,
             reader_texts: Vec::new(),
             reader_links: Vec::new(),
             pressed_link: None,
@@ -513,6 +520,7 @@ impl RssApp {
         if let Ok(Some(on)) = app.db.get_setting(NOTIFICATIONS_SETTING) {
             app.notifications = on != "false";
         }
+        app.unread_first = matches!(app.db.get_setting(UNREAD_FIRST_SETTING), Ok(Some(on)) if on == "true");
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
         }
@@ -599,6 +607,7 @@ impl RssApp {
     fn list_filter(&self) -> ArticleFilter {
         let mut filter = ArticleFilter {
             search_query: Some(self.search_query.clone()).filter(|q| !q.trim().is_empty()),
+            unread_first: self.unread_first,
             ..Default::default()
         };
         match self.active_filter {
@@ -1258,6 +1267,16 @@ impl RssApp {
                     return Task::none();
                 }
                 self.update(Message::RefreshClicked)
+            }
+            Message::ToggleUnreadFirst => {
+                self.unread_first = !self.unread_first;
+                let _ = self
+                    .db
+                    .set_setting(UNREAD_FIRST_SETTING, if self.unread_first { "true" } else { "false" });
+                // A different order: start again from the top
+                self.article_render_limit = ARTICLE_PAGE_SIZE;
+                self.reload_articles();
+                scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START)
             }
             Message::SetNotifications(on) => {
                 self.notifications = on;
@@ -3612,14 +3631,23 @@ impl RssApp {
         }
         header_label = header_label.push(text(list_header_label).size(14));
 
-        let header_row = row![
-            header_label,
+        let mut header_row = row![header_label].spacing(6).align_y(Alignment::Center);
+        // Pointless in the Unread view, where everything is unread
+        if self.active_filter != ActiveFilter::Unread {
+            header_row = header_row.push(
+                button(text("Unread first").size(12))
+                    .padding([4, 8])
+                    // Highlighted while on
+                    .style(if self.unread_first { button::primary } else { button::secondary })
+                    .on_press(Message::ToggleUnreadFirst),
+            );
+        }
+        let header_row = header_row.push(
             button(text("Mark All Read").size(12))
                 .padding([4, 8])
                 .style(button::secondary)
                 .on_press(Message::MarkAllRead),
-        ]
-        .align_y(Alignment::Center);
+        );
 
         // List of Articles
         let mut article_items = column![].spacing(6);
