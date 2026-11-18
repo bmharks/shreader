@@ -762,7 +762,7 @@ impl RssApp {
                 self.reader_body = Some((article_id, blocks));
                 // A new story starts at its top (the reader's scroll position
                 // otherwise carries over from the previous one)
-                let to_top = scrollable::snap_to(reader_scroll_id(), scrollable::RelativeOffset::START);
+                let to_top = then_redraw(scrollable::snap_to(reader_scroll_id(), scrollable::RelativeOffset::START));
                 if had_images {
                     Task::batch([to_top, release_memory_soon()])
                 } else {
@@ -774,7 +774,7 @@ impl RssApp {
                 if self.settings.is_some() || self.add_feed.is_some() || self.editing_feed.is_some() {
                     return Task::none();
                 }
-                scrollable::scroll_by(reader_scroll_id(), scrollable::AbsoluteOffset { x: 0.0, y: dy })
+                then_redraw(scrollable::scroll_by(reader_scroll_id(), scrollable::AbsoluteOffset { x: 0.0, y: dy }))
             }
             Message::SelectAdjacentStory(forward) => {
                 // Not while a dialog or rename field is up: the arrows belong there
@@ -814,7 +814,7 @@ impl RssApp {
                 let select = self.update(Message::SelectArticle(id));
                 Task::batch([
                     select,
-                    scroll_into_view(article_list_scroll_id(), selected_story_id()),
+                    then_redraw(scroll_into_view(article_list_scroll_id(), selected_story_id())),
                 ])
             }
             Message::LoadStoryImage(url) => {
@@ -1354,7 +1354,7 @@ impl RssApp {
                 // A different order: start again from the top
                 self.article_render_limit = ARTICLE_PAGE_SIZE;
                 self.reload_articles();
-                scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START)
+                then_redraw(scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START))
             }
             Message::SetNotifications(on) => {
                 self.notifications = on;
@@ -2095,7 +2095,7 @@ impl RssApp {
     /// Scrolls the story so the current find match is in view.
     fn scroll_to_find_match(&self) -> Task<Message> {
         if self.find.as_ref().is_some_and(|f| f.total() > 0) {
-            scroll_into_view(reader_scroll_id(), find_match_id())
+            then_redraw(scroll_into_view(reader_scroll_id(), find_match_id()))
         } else {
             Task::none()
         }
@@ -4385,6 +4385,16 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Runs a scroll task, then has the window redrawn.
+///
+/// iced applies scrolling (a widget operation) without asking for a redraw,
+/// so on Wayland, where windows only redraw when asked, the new position
+/// only appeared with the next event, such as moving the mouse. Any message
+/// makes iced redraw.
+fn then_redraw(scroll: Task<Message>) -> Task<Message> {
+    scroll.chain(Task::done(Message::Noop))
 }
 
 /// Schedules `release_memory` shortly after a story with images is closed:
