@@ -770,6 +770,7 @@ impl RssApp {
                 Task::none()
             }
             Message::SelectArticle(article_id) => {
+                let other_story = self.selected_article_id != Some(article_id);
                 self.selected_article_id = Some(article_id);
                 self.mark_opened_story_read(article_id);
                 self.open_article = self.articles.iter().find(|a| a.id == article_id).cloned();
@@ -795,8 +796,14 @@ impl RssApp {
                     .unzip();
                 self.pressed_link = None;
                 self.menu_link = None;
-                // An open find bar searches the new story
-                self.update_find_matches();
+                // Like a browser on a new page: a different story closes the
+                // find bar and its highlights. (Reopening the same story keeps
+                // them, with the matches found again in its fresh text.)
+                if other_story {
+                    self.find = None;
+                } else {
+                    self.update_find_matches();
+                }
                 self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
                 // A new story starts at its top (the reader's scroll position
@@ -4647,6 +4654,30 @@ mod tests {
             let _ = app.update(super::Message::SelectFilter(filter.clone()));
             assert_eq!(app.starred_total, 2, "in {:?}", filter);
         }
+    }
+
+    /// Opening a different story closes the find bar; reopening the same
+    /// one keeps it.
+    #[test]
+    fn find_bar_closes_on_another_story() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://f.example/rss", "F", None, None, None).unwrap();
+        for n in 0..2 {
+            let hash = format!("story-{}", n);
+            db.upsert_article(feed, None, &hash, &hash, None, None, Some("<p>the cat sat</p>"), None, None, None, None)
+                .unwrap();
+        }
+        let (mut app, _) = RssApp::new(db, false);
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::All));
+        let (first, second) = (app.articles[0].id, app.articles[1].id);
+        let _ = app.update(super::Message::SelectArticle(first));
+        let _ = app.update(super::Message::OpenFind);
+        let _ = app.update(super::Message::FindQueryChanged("cat".into()));
+        assert_eq!(app.find.as_ref().map(|f| f.total()), Some(1));
+        let _ = app.update(super::Message::SelectArticle(first));
+        assert_eq!(app.find.as_ref().map(|f| f.total()), Some(1), "same story: kept");
+        let _ = app.update(super::Message::SelectArticle(second));
+        assert!(app.find.is_none(), "another story: closed");
     }
 
     /// With notifications off, no message pops up; turning them back on
