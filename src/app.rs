@@ -161,6 +161,8 @@ pub struct RssApp {
     /// Bumped whenever a new status message appears; see `STATUS_TIMEOUT`
     status_generation: u64,
     stats: (i64, i64, i64), // (total_feeds, total_articles, unread_articles)
+    /// Starred stories in the whole archive (for the sidebar)
+    starred_total: i64,
 
     // Drag-and-drop state
     dragging_feed: Option<i64>,                 // feed_id being dragged
@@ -475,6 +477,7 @@ impl RssApp {
             status_message: None,
             status_generation: 0,
             stats: (0, 0, 0),
+            starred_total: 0,
             dragging_feed: None,
             dragging_folder: None,
             auto_refresh: true,
@@ -588,6 +591,7 @@ impl RssApp {
         self.folders = self.db.get_folders().unwrap_or_default();
         self.feeds = self.db.get_feeds().unwrap_or_default();
         self.stats = self.db.get_total_stats().unwrap_or((0, 0, 0));
+        self.starred_total = self.db.starred_count().unwrap_or(0);
         self.reload_articles();
     }
 
@@ -3213,16 +3217,13 @@ impl RssApp {
             &unread_articles.to_string(),
         );
 
-        let starred_count = self
-            .articles
-            .iter()
-            .filter(|a| a.is_starred)
-            .count();
+        // From the archive, like the counts above (the story list only holds
+        // the current view, and only its loaded part)
         let starred_btn = self.filter_button(
             ActiveFilter::Starred,
             Some(Icon::StarFilled),
             "Starred",
-            &starred_count.to_string(),
+            &self.starred_total.to_string(),
         );
 
         let categories = column![all_btn, unread_btn, starred_btn].spacing(4);
@@ -4294,6 +4295,40 @@ fn selected_story_id() -> container::Id {
 #[cfg(test)]
 mod tests {
     use super::{format_size, open_in_browser, ImageState, RefreshInterval, RssApp};
+
+    /// The sidebar's Starred count covers the whole archive, whichever view
+    /// is open.
+    #[test]
+    fn starred_count_is_for_the_whole_archive() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let folder_a = db.create_folder("A").unwrap();
+        let folder_b = db.create_folder("B").unwrap();
+        for (url, folder) in [("https://a.example/rss", folder_a), ("https://b.example/rss", folder_b)] {
+            let feed = db.add_or_update_feed(url, url, None, None, Some(folder)).unwrap();
+            for n in 0..3 {
+                let hash = format!("{}-{}", url, n);
+                db.upsert_article(feed, None, &hash, &hash, None, None, None, None, None, None, None).unwrap();
+            }
+        }
+        let (mut app, _) = RssApp::new(db.clone());
+        // Star one story in each folder, from folder A's view
+        let in_a = app.articles[0].id;
+        let _ = app.update(super::Message::ToggleStar(in_a));
+        let in_b = db
+            .get_articles(&crate::models::ArticleFilter { folder_id: Some(folder_b), ..Default::default() })
+            .unwrap()[0]
+            .id;
+        let _ = app.update(super::Message::ToggleStar(in_b));
+        for filter in [
+            super::ActiveFilter::Folder(folder_a),
+            super::ActiveFilter::Folder(folder_b),
+            super::ActiveFilter::Starred,
+            super::ActiveFilter::Unread,
+        ] {
+            let _ = app.update(super::Message::SelectFilter(filter.clone()));
+            assert_eq!(app.starred_total, 2, "in {:?}", filter);
+        }
+    }
 
     /// With notifications off, no message pops up; turning them back on
     /// shows the next one.
