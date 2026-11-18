@@ -56,6 +56,10 @@ const MAX_IMAGE_DOWNLOADS: usize = 4;
 /// only when clicked
 const LOAD_IMAGES_SETTING: &str = "load_images";
 
+/// Setting: closing the window keeps Shreader running in the system tray
+/// (default), refreshing in the background
+const KEEP_IN_TRAY_SETTING: &str = "keep_in_tray";
+
 /// Setting: list unread stories before read ones
 const UNREAD_FIRST_SETTING: &str = "unread_first";
 
@@ -143,6 +147,12 @@ pub struct RssApp {
     notifications: bool,
     /// Whether the story list shows unread stories first (`UNREAD_FIRST_SETTING`)
     unread_first: bool,
+    /// The main window, while it's open (it isn't while running in the tray)
+    main_window: Option<iced::window::Id>,
+    /// Whether the desktop shows Shreader's tray icon
+    tray: bool,
+    /// Whether closing the window keeps the app in the tray (`KEEP_IN_TRAY_SETTING`)
+    keep_in_tray: bool,
     /// The open story's text blocks as read-only editors, so text can be
     /// selected and copied (iced's plain `text` can't be selected)
     reader_texts: Vec<text_editor::Content>,
@@ -368,6 +378,12 @@ pub enum Message {
     SetLoadImages(bool),
     SetNotifications(bool),
     ToggleUnreadFirst,
+    /// The window's close button
+    WindowCloseRequested,
+    /// From the tray, or a second copy of the app
+    Desktop(crate::desktop::Command),
+    SetKeepInTray(bool),
+    Quit,
     OpenFind,
     FindQueryChanged(String),
     FindNext,
@@ -491,7 +507,8 @@ pub enum Message {
 }
 
 impl RssApp {
-    pub fn new(db: Database) -> (Self, Task<Message>) {
+    /// `tray`: whether the tray icon is showing (see `desktop::start_tray`).
+    pub fn new(db: Database, tray: bool) -> (Self, Task<Message>) {
         let fetcher = Arc::new(FeedFetcher::new());
 
         let mut app = Self {
@@ -514,6 +531,9 @@ impl RssApp {
             load_images: true,
             notifications: true,
             unread_first: false,
+            main_window: None,
+            tray,
+            keep_in_tray: true,
             reader_texts: Vec::new(),
             reader_links: Vec::new(),
             pressed_link: None,
@@ -564,6 +584,7 @@ impl RssApp {
             app.notifications = on != "false";
         }
         app.unread_first = matches!(app.db.get_setting(UNREAD_FIRST_SETTING), Ok(Some(on)) if on == "true");
+        app.keep_in_tray = !matches!(app.db.get_setting(KEEP_IN_TRAY_SETTING), Ok(Some(on)) if on == "false");
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
         }
@@ -618,7 +639,20 @@ impl RssApp {
             Task::none()
         };
 
-        (app, initial_task)
+        let open_window = app.open_main_window();
+        (app, Task::batch([open_window, initial_task]))
+    }
+
+    /// Opens the main window (it's closed while the app runs in the tray).
+    fn open_main_window(&mut self) -> Task<Message> {
+        let (id, opened) = iced::window::open(crate::desktop::main_window_settings());
+        self.main_window = Some(id);
+        opened.map(|_| Message::Noop)
+    }
+
+    /// The window title
+    pub fn title(&self, _window: iced::window::Id) -> String {
+        "Shreader RSS Reader".to_string()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -630,12 +664,17 @@ impl RssApp {
         //
         // The refresh timer is fine: it ticks once per interval. Changing the
         // interval makes a new subscription, which restarts the countdown.
-        if self.auto_refresh && self.auto_refresh_minutes > 0 {
+        //
+        // The tray and a second copy of the app send their requests through
+        // `desktop::commands`.
+        let refresh = if self.auto_refresh && self.auto_refresh_minutes > 0 {
             iced::time::every(std::time::Duration::from_secs(u64::from(self.auto_refresh_minutes) * 60))
                 .map(|_| Message::AutoRefreshTick)
         } else {
             Subscription::none()
-        }
+        };
+        let desktop = Subscription::run(crate::desktop::commands).map(Message::Desktop);
+        Subscription::batch([refresh, desktop])
     }
 
     fn reload_data(&mut self) {
@@ -1344,6 +1383,32 @@ impl RssApp {
             }
             Message::CloseFind => {
                 self.find = None;
+                Task::none()
+            }
+            Message::WindowCloseRequested => {
+                // With a tray to come back from: close just the window, and
+                // keep running (and refreshing). Otherwise, quit.
+                if !(self.tray && self.keep_in_tray) {
+                    return iced::exit();
+                }
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = None;
+                self.reader_text_menu = None;
+                match self.main_window.take() {
+                    Some(id) => iced::window::close(id),
+                    None => Task::none(),
+                }
+            }
+            Message::Desktop(crate::desktop::Command::Show) => match self.main_window {
+                Some(id) => iced::window::gain_focus(id),
+                None => self.open_main_window(),
+            },
+            Message::Desktop(crate::desktop::Command::Refresh) => self.update(Message::RefreshClicked),
+            Message::Desktop(crate::desktop::Command::Quit) | Message::Quit => iced::exit(),
+            Message::SetKeepInTray(on) => {
+                self.keep_in_tray = on;
+                let _ = self.db.set_setting(KEEP_IN_TRAY_SETTING, if on { "true" } else { "false" });
                 Task::none()
             }
             Message::ToggleUnreadFirst => {
@@ -2788,6 +2853,23 @@ impl RssApp {
         ]
         .spacing(6);
 
+        // System tray
+        let tray_section = column![
+            text("System tray").size(14),
+            checkbox("Keep running in the system tray when the window is closed", self.keep_in_tray)
+                .on_toggle_maybe(self.tray.then_some(Message::SetKeepInTray))
+                .size(14)
+                .text_size(12),
+            text(if self.tray {
+                "Feeds keep refreshing in the background. Click the tray icon to open the window again; quit from its menu, or with Ctrl+Q."
+            } else {
+                "This desktop doesn't have a system tray, so closing the window quits Shreader."
+            })
+            .size(12)
+            .style(text::secondary),
+        ]
+        .spacing(6);
+
         // Notifications
         let notifications_section = column![
             text("Notifications").size(14),
@@ -2908,6 +2990,8 @@ impl RssApp {
                 images_section,
                 horizontal_rule(1),
                 notifications_section,
+                horizontal_rule(1),
+                tray_section,
                 horizontal_rule(1),
                 import_section,
                 horizontal_rule(1),
@@ -3197,7 +3281,7 @@ impl RssApp {
         menu_card(body, 160.0)
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub fn view(&self, _window: iced::window::Id) -> Element<'_, Message> {
         let sidebar = self.view_sidebar();
         let article_list = self.view_article_list();
         let reader_view = self.view_reader();
@@ -3222,6 +3306,10 @@ impl RssApp {
                 iced::keyboard::Key::Character(c) if modifiers.command() && c.eq_ignore_ascii_case("f") => {
                     return Some(Message::OpenFind);
                 }
+                // Ctrl+Q: quit, even when closing the window wouldn't
+                iced::keyboard::Key::Character(c) if modifiers.command() && c.eq_ignore_ascii_case("q") => {
+                    return Some(Message::Quit);
+                }
                 _ => {}
             }
             if !modifiers.is_empty() {
@@ -3234,7 +3322,9 @@ impl RssApp {
                 iced::keyboard::Key::Named(Named::ArrowDown) => Some(Message::ScrollReader(READER_ARROW_STEP)),
                 _ => None,
             }
-        });
+        })
+        // The window's close button: the app decides between the tray and quitting
+        .on_close_request(Message::WindowCloseRequested);
 
         let mut layers: Vec<Element<'_, Message>> = vec![content.into()];
 
@@ -4097,7 +4187,7 @@ impl RssApp {
         }
     }
 
-    pub fn theme(&self) -> Theme {
+    pub fn theme(&self, _window: iced::window::Id) -> Theme {
         Theme::Dark
     }
 }
@@ -4539,7 +4629,7 @@ mod tests {
                 db.upsert_article(feed, None, &hash, &hash, None, None, None, None, None, None, None).unwrap();
             }
         }
-        let (mut app, _) = RssApp::new(db.clone());
+        let (mut app, _) = RssApp::new(db.clone(), false);
         // Star one story in each folder, from folder A's view
         let in_a = app.articles[0].id;
         let _ = app.update(super::Message::ToggleStar(in_a));
@@ -4564,7 +4654,7 @@ mod tests {
     #[tokio::test]
     async fn notifications_can_be_silenced() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let (mut app, _) = RssApp::new(db);
+        let (mut app, _) = RssApp::new(db, false);
         let _ = app.update(super::Message::SetNotifications(false));
         let _ = app.update(super::Message::OpenUrl("file:///etc/passwd".into())); // refused: an error message
         assert_eq!(app.status_message, None);
@@ -4578,7 +4668,7 @@ mod tests {
     #[test]
     fn story_images_download_a_few_at_a_time() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let (mut app, _) = RssApp::new(db);
+        let (mut app, _) = RssApp::new(db, false);
         for n in 0..10 {
             let _ = app.update(super::Message::LoadStoryImage(format!("https://example.com/{}.png", n)));
         }
@@ -4599,7 +4689,7 @@ mod tests {
     #[test]
     fn story_images_stay_within_memory_budget() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let (mut app, _) = RssApp::new(db);
+        let (mut app, _) = RssApp::new(db, false);
         // 20 images of 1600x4800 (~30 MB each, ~614 MB in all). The handles
         // are 1x1: the budget goes by the recorded size.
         for n in 1..=20u64 {

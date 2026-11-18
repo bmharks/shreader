@@ -1,6 +1,7 @@
 pub mod app;
 pub mod context_menu;
 pub mod db;
+pub mod desktop;
 pub mod feed;
 pub mod follow_cursor;
 pub mod key_press;
@@ -240,6 +241,12 @@ async fn run() -> Result<()> {
     }
 
     // Launch Desktop GUI (Iced)
+    // One copy at a time: a second one (say, from the menu while the first
+    // runs in the tray) shows the first one's window instead
+    if let desktop::Instance::AlreadyRunning = desktop::claim_single_instance().await {
+        return Ok(());
+    }
+
     let db = match Database::open_default() {
         Ok(db) => db,
         Err(e) => {
@@ -250,12 +257,14 @@ async fn run() -> Result<()> {
         }
     };
 
-    let settings = iced::application("Shreader RSS Reader", RssApp::update, RssApp::view)
+    // A daemon rather than a plain application: it keeps running (and
+    // refreshing) with no window open, from the tray
+    let tray = desktop::start_tray().await;
+    let app = iced::daemon(RssApp::title, RssApp::update, RssApp::view)
         .subscription(RssApp::subscription)
-        .theme(RssApp::theme)
-        .window(window_settings(iced::Size::new(1200.0, 750.0), Some(iced::Size::new(900.0, 550.0))));
+        .theme(RssApp::theme);
 
-    if let Err(e) = settings.run_with(move || RssApp::new(db)) {
+    if let Err(e) = app.run_with(move || RssApp::new(db, tray)) {
         eprintln!("Failed to launch GUI: {}", e);
     }
 
@@ -297,52 +306,15 @@ fn show_startup_error(reason: String) {
 
     let result = iced::application("Shreader RSS Reader", update, view)
     .theme(|_| Theme::Dark)
-    .window(window_settings(iced::Size::new(560.0, 240.0), None))
+    .window(iced::window::Settings {
+        // Unlike the main window, closing this one simply ends the app
+        exit_on_close_request: true,
+        ..desktop::window_settings(iced::Size::new(560.0, 240.0), None)
+    })
     .run_with(move || (message, Task::none()));
     if let Err(e) = result {
         eprintln!("Failed to show the error window: {}", e);
     }
-}
-
-/// The app ID: the launcher file is `<APP_ID>.desktop` and the icon
-/// `<APP_ID>.svg` (see `packaging/`). Desktops match windows to them by it.
-const APP_ID: &str = "io.github.bmharks.Shreader";
-
-/// The app icon (also installed with the launcher)
-const ICON_SVG: &str = include_str!("../packaging/io.github.bmharks.Shreader.svg");
-
-/// Window settings with the app's ID and icon.
-fn window_settings(size: iced::Size, min_size: Option<iced::Size>) -> iced::window::Settings {
-    iced::window::Settings {
-        size,
-        min_size,
-        icon: window_icon(),
-        platform_specific: iced::window::settings::PlatformSpecific {
-            application_id: APP_ID.to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-/// The icon as pixels, for the window itself (used on X11 and when the
-/// launcher isn't installed; Wayland desktops take it from the launcher).
-fn window_icon() -> Option<iced::window::Icon> {
-    use resvg::{tiny_skia, usvg};
-    const SIZE: u32 = 128;
-    let tree = usvg::Tree::from_str(ICON_SVG, &usvg::Options::default()).ok()?;
-    let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE)?;
-    let scale = SIZE as f32 / tree.size().width().max(tree.size().height());
-    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-    let rgba = pixmap
-        .pixels()
-        .iter()
-        .flat_map(|p| {
-            let c = p.demultiply();
-            [c.red(), c.green(), c.blue(), c.alpha()]
-        })
-        .collect();
-    iced::window::icon::from_rgba(rgba, SIZE, SIZE).ok()
 }
 
 fn print_help() {

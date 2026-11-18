@@ -45,6 +45,11 @@ iced = { version = "0.13", features = ["tokio", "svg", "image", "advanced"] }
 image = "0.24"
 # To check for a Vulkan GPU at startup (same version iced uses)
 wgpu = "0.19"
+# System tray icon (StatusNotifierItem, as used by KDE), for running in the background
+ksni = { version = "0.3.7", default-features = false, features = ["tokio"] }
+# Only one copy runs: a second one asks the first over D-Bus to show its window
+# (the zbus version ksni and the file dialogs already use)
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 # Draws story SVGs into images in the background (same version and features
 # iced uses, so nothing extra is compiled)
 resvg = { version = "0.42", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }

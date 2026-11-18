@@ -25,6 +25,8 @@ pub struct OnKeyPress<'a, Message, Theme, Renderer> {
     on_key: Box<dyn Fn(&Key, Modifiers) -> Option<Message> + 'a>,
     /// Offer keys to `on_key` before the children (see `first`)
     first: bool,
+    /// Published when the window is asked to close (its close button)
+    on_close_request: Option<Message>,
 }
 
 /// Wraps `content`; key presses its children ignore go to `on_key`, which
@@ -37,6 +39,7 @@ pub fn on_key_press<'a, Message, Theme, Renderer>(
         content: content.into(),
         on_key: Box::new(on_key),
         first: false,
+        on_close_request: None,
     }
 }
 
@@ -48,11 +51,20 @@ impl<'a, Message, Theme, Renderer> OnKeyPress<'a, Message, Theme, Renderer> {
         self.first = true;
         self
     }
+
+    /// Publish `message` when the window is asked to close. The request
+    /// reaches the window's widgets when the window doesn't close itself
+    /// (`exit_on_close_request: false`), which lets the app decide.
+    pub fn on_close_request(mut self, message: Message) -> Self {
+        self.on_close_request = Some(message);
+        self
+    }
 }
 
 impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for OnKeyPress<'a, Message, Theme, Renderer>
 where
+    Message: Clone,
     Renderer: iced::advanced::Renderer,
 {
     fn children(&self) -> Vec<Tree> {
@@ -107,6 +119,12 @@ where
             }
             _ => None,
         };
+        if let (Event::Window(iced::window::Event::CloseRequested), Some(message)) =
+            (&event, &self.on_close_request)
+        {
+            shell.publish(message.clone());
+            return event::Status::Captured;
+        }
         if self.first {
             if let Some(message) = pressed.as_ref().and_then(|(key, modifiers)| (self.on_key)(key, *modifiers)) {
                 shell.publish(message);
@@ -188,7 +206,7 @@ where
 impl<'a, Message, Theme, Renderer> From<OnKeyPress<'a, Message, Theme, Renderer>>
     for Element<'a, Message, Theme, Renderer>
 where
-    Message: 'a,
+    Message: Clone + 'a,
     Theme: 'a,
     Renderer: iced::advanced::Renderer + 'a,
 {

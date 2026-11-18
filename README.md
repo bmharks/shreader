@@ -27,12 +27,16 @@ To uninstall, run `packaging/install.sh --uninstall`. Your archive is left in pl
 - **Right-click** a feed or folder for more: refresh it, mark it read or unread, rename or delete it, or move a feed to another folder.
 - **Drag** feeds by their handle into another folder or position, and folders to reorder them.
 - **Settings** (the gear icon) has automatic refresh, image loading, OPML import and export, and clearing archived stories.
+- **Closing the window** keeps Shreader running in the system tray, so feeds keep refreshing. Click the tray icon to open it again; quit from the tray icon's menu or with Ctrl+Q. (On desktops without a system tray, closing the window quits.)
 
 | Key | Action |
 |---|---|
 | Right / Left | Next / previous story |
 | Up / Down | Scroll the open story |
-| Esc | Close a menu or dialog |
+| Ctrl+F | Find in the open story |
+| F3 / Shift+F3 | Next / previous match |
+| Ctrl+Q | Quit |
+| Esc | Close a menu, dialog or the find bar |
 
 Searches match the words you type as an exact phrase.
 
@@ -67,7 +71,7 @@ Everything is stored in one SQLite file, readable only by your user account:
 ~/.local/share/shreader/shreader.db
 ```
 
-To back it up, copy that file while Shreader is closed. To keep it somewhere else, set the `SHREADER_DB` environment variable to the path of the file you want.
+To back it up, copy that file while Shreader isn't running (quit it from the tray icon or with Ctrl+Q; closing the window leaves it running). To keep it somewhere else, set the `SHREADER_DB` environment variable to the path of the file you want.
 
 ## License
 
