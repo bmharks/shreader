@@ -17,7 +17,7 @@ use crate::follow_cursor::follow_cursor;
 use crate::key_press::{on_key_press, scroll_into_view};
 use crate::lazy_load::on_visible;
 use crate::image_space::image_space;
-use crate::link_hover::link_hover;
+use crate::story_text::{find_matches, story_text, TextRange};
 use crate::icons::{icon, Icon, Tint};
 use crate::spinner::spinner;
 use crate::split::split;
@@ -153,6 +153,8 @@ pub struct RssApp {
     pressed_link: Option<String>,
     /// The link under the right click that opened the story text's menu
     menu_link: Option<String>,
+    /// The find bar, while it's open
+    find: Option<FindState>,
     /// Text block whose right-click (Copy / Select all) menu is open
     reader_text_menu: Option<usize>,
     search_query: String,
@@ -252,6 +254,41 @@ enum ImageState {
     Failed,
 }
 
+/// Find in story (Ctrl+F)
+#[derive(Debug, Clone, Default)]
+struct FindState {
+    query: String,
+    /// The matches in each of the story's text blocks
+    matches: Vec<Vec<TextRange>>,
+    /// Index of the current match, counting through all blocks
+    current: usize,
+}
+
+impl FindState {
+    fn total(&self) -> usize {
+        self.matches.iter().map(Vec::len).sum()
+    }
+
+    /// The current match as (text block, index within it)
+    fn current_location(&self) -> Option<(usize, usize)> {
+        let mut remaining = self.current;
+        for (block, matches) in self.matches.iter().enumerate() {
+            if remaining < matches.len() {
+                return Some((block, remaining));
+            }
+            remaining -= matches.len();
+        }
+        None
+    }
+}
+
+/// Most matches found in one story (finding "e" in a long story could
+/// otherwise mean tens of thousands of highlights)
+const MAX_FIND_MATCHES: usize = 5000;
+
+/// Id of the find bar's text field
+const FIND_INPUT_ID: &str = "find-in-story";
+
 /// State of the Settings window.
 #[derive(Debug, Clone)]
 struct SettingsState {
@@ -331,6 +368,11 @@ pub enum Message {
     SetLoadImages(bool),
     SetNotifications(bool),
     ToggleUnreadFirst,
+    OpenFind,
+    FindQueryChanged(String),
+    FindNext,
+    FindPrevious,
+    CloseFind,
     SetAutoRefreshInterval(RefreshInterval),
     SearchChanged(String),
     ToggleStar(i64),
@@ -476,6 +518,7 @@ impl RssApp {
             reader_links: Vec::new(),
             pressed_link: None,
             menu_link: None,
+            find: None,
             reader_text_menu: None,
             search_query: String::new(),
             new_folder_input: String::new(),
@@ -713,6 +756,8 @@ impl RssApp {
                     .unzip();
                 self.pressed_link = None;
                 self.menu_link = None;
+                // An open find bar searches the new story
+                self.update_find_matches();
                 self.reader_text_menu = None;
                 self.reader_body = Some((article_id, blocks));
                 // A new story starts at its top (the reader's scroll position
@@ -1267,6 +1312,39 @@ impl RssApp {
                     return Task::none();
                 }
                 self.update(Message::RefreshClicked)
+            }
+            Message::OpenFind => {
+                if self.reader_body.is_none() {
+                    return Task::none(); // no story open
+                }
+                if self.find.is_none() {
+                    self.find = Some(FindState::default());
+                }
+                let id = text_input::Id::new(FIND_INPUT_ID);
+                Task::batch([text_input::focus(id.clone()), text_input::select_all(id)])
+            }
+            Message::FindQueryChanged(query) => {
+                if let Some(find) = &mut self.find {
+                    find.query = query;
+                }
+                self.update_find_matches();
+                self.scroll_to_find_match()
+            }
+            Message::FindNext | Message::FindPrevious => {
+                let forward = matches!(message, Message::FindNext);
+                let Some(find) = &mut self.find else {
+                    return Task::none();
+                };
+                let total = find.total();
+                if total == 0 {
+                    return Task::none();
+                }
+                find.current = if forward { (find.current + 1) % total } else { (find.current + total - 1) % total };
+                self.scroll_to_find_match()
+            }
+            Message::CloseFind => {
+                self.find = None;
+                Task::none()
             }
             Message::ToggleUnreadFirst => {
                 self.unread_first = !self.unread_first;
@@ -1992,6 +2070,75 @@ impl RssApp {
         self.image_queue.retain(|url| self.story_images.contains_key(url));
     }
 
+    /// Finds the find bar's query in the open story, starting again from the
+    /// first match.
+    fn update_find_matches(&mut self) {
+        let Some(find) = &mut self.find else { return };
+        let mut limit = MAX_FIND_MATCHES;
+        find.matches = match &self.reader_body {
+            Some((_, blocks)) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Text { text, .. } => {
+                        let found = find_matches(text, find.query.trim(), limit);
+                        limit -= found.len();
+                        Some(found)
+                    }
+                    Block::Image { .. } => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        find.current = 0;
+    }
+
+    /// Scrolls the story so the current find match is in view.
+    fn scroll_to_find_match(&self) -> Task<Message> {
+        if self.find.as_ref().is_some_and(|f| f.total() > 0) {
+            scroll_into_view(reader_scroll_id(), find_match_id())
+        } else {
+            Task::none()
+        }
+    }
+
+    /// The find bar shown above the story.
+    fn find_bar<'a>(&'a self, find: &'a FindState) -> Element<'a, Message> {
+        let total = find.total();
+        let count = if find.query.trim().is_empty() {
+            String::new()
+        } else if total == 0 {
+            "No matches".to_string()
+        } else {
+            let more = if total >= MAX_FIND_MATCHES { "+" } else { "" };
+            format!("{} of {}{}", find.current + 1, total, more)
+        };
+        let nav = |label: &'static str, message: Message| {
+            button(text(label).size(12))
+                .padding([4, 8])
+                .style(button::secondary)
+                .on_press_maybe((total > 0).then_some(message))
+        };
+        row![
+            text_input("Find in story", &find.query)
+                .id(text_input::Id::new(FIND_INPUT_ID))
+                .on_input(Message::FindQueryChanged)
+                .on_submit(Message::FindNext)
+                .size(13)
+                .padding(5)
+                .width(Length::Fill),
+            text(count).size(12).style(text::secondary),
+            nav("Previous", Message::FindPrevious),
+            nav("Next", Message::FindNext),
+            button(text("Close").size(12))
+                .padding([4, 8])
+                .style(button::text)
+                .on_press(Message::CloseFind),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
     /// The link at the text cursor in story text block `index`, if any.
     fn link_at_cursor(&self, index: usize) -> Option<String> {
         let content = self.reader_texts.get(index)?;
@@ -2155,8 +2302,17 @@ impl RssApp {
             menu_card(items, 170.0)
         });
 
-        // The hand pointer over links (the editor itself only has the I-beam)
-        let editor = link_hover(editor, block_text, block_links, READER_TEXT_SIZE, READER_TEXT_WRAPPING);
+        // The hand pointer over links (the editor itself only has the I-beam),
+        // and find highlights
+        let mut editor = story_text(editor, block_text, block_links, READER_TEXT_SIZE, READER_TEXT_WRAPPING);
+        if let Some(find) = &self.find {
+            if let Some(matches) = find.matches.get(index) {
+                let current = find
+                    .current_location()
+                    .and_then(|(block, local)| (block == index).then_some(local));
+                editor = editor.matches(matches, current, find_match_id().into());
+            }
+        }
 
         context_menu(editor)
             .menu(menu)
@@ -3059,8 +3215,15 @@ impl RssApp {
         // Left/Right arrows step through the story list, Up/Down scroll the
         // open story. Only keys nothing else used: a focused search or rename
         // field keeps its arrows.
-        let content = on_key_press(content, |key, modifiers| {
+        let content = on_key_press(content, move |key, modifiers| {
             use iced::keyboard::key::Named;
+            match key.as_ref() {
+                // Ctrl+F: find in the story
+                iced::keyboard::Key::Character(c) if modifiers.command() && c.eq_ignore_ascii_case("f") => {
+                    return Some(Message::OpenFind);
+                }
+                _ => {}
+            }
             if !modifiers.is_empty() {
                 return None;
             }
@@ -3891,21 +4054,44 @@ impl RssApp {
                 ]
                 .spacing(4);
 
-                container(
-                    column![
-                        gutter(reading_column(
-                            // Wrap so a narrow reader moves items to a new line instead of squeezing them
-                            column![title, meta_items.wrap(), action_row.wrap(), horizontal_rule(1)]
-                                .spacing(12),
-                        )),
-                        body_scroll,
-                        gutter(reading_column(footer)),
-                    ]
-                    .spacing(12)
-                    .padding(20),
+                // The find bar goes in the header, not before it: widgets keep
+                // their state (the story's scroll position) by their place in
+                // the layout, so the scrollable's place mustn't change
+                let mut header = column![].spacing(12);
+                if let Some(find) = &self.find {
+                    header = header.push(self.find_bar(find));
+                }
+                // Wrap so a narrow reader moves items to a new line instead of squeezing them
+                let header = header.push(
+                    column![title, meta_items.wrap(), action_row.wrap(), horizontal_rule(1)].spacing(12),
+                );
+                let reader = container(
+                    column![gutter(reading_column(header)), body_scroll, gutter(reading_column(footer))]
+                        .spacing(12)
+                        .padding(20),
                 )
                 .width(Length::Fill)
-                .height(Length::Fill)
+                .height(Length::Fill);
+                // While the find bar is open: Esc closes it, and F3 / Shift+F3
+                // or Shift+Enter go through matches, even while typing in it
+                // (its text field would otherwise keep those keys). Always in
+                // the layout, doing nothing while the bar is closed, so opening
+                // and closing it doesn't move the story's scroll position.
+                let find_open = self.find.is_some();
+                on_key_press(reader, move |key, modifiers| {
+                    use iced::keyboard::key::Named;
+                    if !find_open {
+                        return None;
+                    }
+                    match key.as_ref() {
+                        iced::keyboard::Key::Named(Named::Escape) => Some(Message::CloseFind),
+                        iced::keyboard::Key::Named(Named::F3) if modifiers.shift() => Some(Message::FindPrevious),
+                        iced::keyboard::Key::Named(Named::F3) => Some(Message::FindNext),
+                        iced::keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::FindPrevious),
+                        _ => None,
+                    }
+                })
+                .first()
                 .into()
             }
         }
@@ -4318,6 +4504,11 @@ const READER_ARROW_STEP: f32 = 60.0;
 /// The open story's card in the list.
 fn selected_story_id() -> container::Id {
     container::Id::new("selected-story")
+}
+
+/// The current find match (reported by `story_text`, to scroll to it)
+fn find_match_id() -> container::Id {
+    container::Id::new("find-match")
 }
 
 #[cfg(test)]

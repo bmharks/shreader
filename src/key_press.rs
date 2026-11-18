@@ -23,6 +23,8 @@ use iced::{event, mouse, Element, Event, Length, Rectangle, Size, Task, Vector};
 pub struct OnKeyPress<'a, Message, Theme, Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_key: Box<dyn Fn(&Key, Modifiers) -> Option<Message> + 'a>,
+    /// Offer keys to `on_key` before the children (see `first`)
+    first: bool,
 }
 
 /// Wraps `content`; key presses its children ignore go to `on_key`, which
@@ -34,6 +36,17 @@ pub fn on_key_press<'a, Message, Theme, Renderer>(
     OnKeyPress {
         content: content.into(),
         on_key: Box::new(on_key),
+        first: false,
+    }
+}
+
+impl<'a, Message, Theme, Renderer> OnKeyPress<'a, Message, Theme, Renderer> {
+    /// Offer key presses to the mapping function before the children: keys
+    /// it maps never reach them (even a focused text field). For shortcuts
+    /// that must work while typing, like F3 in a find bar.
+    pub fn first(mut self) -> Self {
+        self.first = true;
+        self
     }
 }
 
@@ -94,6 +107,12 @@ where
             }
             _ => None,
         };
+        if self.first {
+            if let Some(message) = pressed.as_ref().and_then(|(key, modifiers)| (self.on_key)(key, *modifiers)) {
+                shell.publish(message);
+                return event::Status::Captured;
+            }
+        }
 
         let status = self.content.as_widget_mut().on_event(
             &mut tree.children[0],

@@ -5,7 +5,6 @@ pub mod feed;
 pub mod follow_cursor;
 pub mod key_press;
 pub mod lazy_load;
-pub mod link_hover;
 pub mod icons;
 pub mod image_space;
 pub mod models;
@@ -13,6 +12,7 @@ pub mod on_escape;
 pub mod opml;
 pub mod spinner;
 pub mod story_content;
+pub mod story_text;
 pub mod split;
 
 use std::env;
