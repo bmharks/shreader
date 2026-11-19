@@ -381,6 +381,8 @@ struct Joining {
     title: String,
     /// One story, not a group
     single: bool,
+    /// Its folder: only groups there can be chosen
+    folder: i64,
 }
 
 impl ReaderGroup {
@@ -1173,6 +1175,11 @@ impl RssApp {
     /// The folder a feed is in
     fn folder_of_feed(&self, feed_id: i64) -> Option<i64> {
         self.feeds.iter().find(|f| f.id == feed_id).and_then(|f| f.folder_id)
+    }
+
+    /// The folder a feed is in, if its stories are grouped
+    fn grouped_folder_of_feed(&self, feed_id: i64) -> Option<i64> {
+        self.folder_of_feed(feed_id).filter(|id| self.folders.iter().any(|f| f.id == *id && f.grouping))
     }
 
     /// The grouped folders, as Settings offers them
@@ -2169,7 +2176,9 @@ impl RssApp {
             Message::StartJoining(group) => {
                 let members = self.db.group_members(&ArticleFilter::default(), &[group]).unwrap_or_default();
                 let Some(oldest) = members.last() else { return Task::none() };
-                self.joining = Some(Joining { group, title: oldest.title.clone(), single: members.len() == 1 });
+                // Only within a grouped folder
+                let Some(folder) = self.grouped_folder_of_feed(oldest.feed_id) else { return Task::none() };
+                self.joining = Some(Joining { group, title: oldest.title.clone(), single: members.len() == 1, folder });
                 Task::none()
             }
             Message::CancelJoining => {
@@ -2183,8 +2192,15 @@ impl RssApp {
                 }
                 let all = ArticleFilter::default();
                 let moving = self.db.group_members(&all, &[joining.group]).unwrap_or_default();
-                let staying: Vec<i64> =
-                    self.db.group_members(&all, &[target]).unwrap_or_default().iter().map(|a| a.id).collect();
+                let target_stories = self.db.group_members(&all, &[target]).unwrap_or_default();
+                // Groups never span folders (the list only offers the same folder's)
+                let same_folder = |stories: &[Article]| {
+                    !stories.is_empty() && stories.iter().all(|a| self.folder_of_feed(a.feed_id) == Some(joining.folder))
+                };
+                if !same_folder(&moving) || !same_folder(&target_stories) {
+                    return Task::none();
+                }
+                let staying: Vec<i64> = target_stories.iter().map(|a| a.id).collect();
                 let correction = match crate::group_corrections::join_groups(&self.db, &moving, target, &staying) {
                     Ok(correction) => correction,
                     Err(e) => {
@@ -3280,7 +3296,13 @@ impl RssApp {
 
         let card_title = text(&article.title)
             .size(13)
-            .color(if article.is_read { READ_TITLE } else { UNREAD_TITLE });
+            .color(if self.unavailable_to_join(article.group(), article.feed_id) {
+                UNAVAILABLE_TITLE
+            } else if article.is_read {
+                READ_TITLE
+            } else {
+                UNREAD_TITLE
+            });
 
         let meta_row = row![
             text(feed_name).size(11).style(text::secondary),
@@ -3295,7 +3317,7 @@ impl RssApp {
             .width(Length::Fill)
             .padding(8)
             .style(move |theme, status| story_card(theme, status, is_selected))
-            .on_press_maybe(self.card_press(article.group(), Message::SelectArticle(article.id)));
+            .on_press_maybe(self.card_press(article.group(), article.feed_id, Message::SelectArticle(article.id)));
 
         let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
         let card = container(
@@ -3315,9 +3337,17 @@ impl RssApp {
     /// What clicking a card in the story list does: opens it, or while
     /// choosing a group to join (see `Joining`), joins it (not the one
     /// being placed, which can't be clicked).
-    fn card_press(&self, group: i64, open: Message) -> Option<Message> {
+    /// While choosing a group to join: whether a card is from another
+    /// folder (shown dimmed, as it can't be chosen)
+    fn unavailable_to_join(&self, group: i64, feed_id: i64) -> bool {
+        self.joining.as_ref().is_some_and(|j| j.group != group && self.folder_of_feed(feed_id) != Some(j.folder))
+    }
+
+    fn card_press(&self, group: i64, feed_id: i64, open: Message) -> Option<Message> {
         match &self.joining {
             Some(joining) if joining.group == group => None,
+            // Only the same folder's groups (or lone stories) can be chosen
+            Some(joining) if self.folder_of_feed(feed_id) != Some(joining.folder) => None,
             Some(_) => Some(Message::JoinInto(group)),
             None => Some(open),
         }
@@ -3334,7 +3364,10 @@ impl RssApp {
                 column![
                     text(what).size(12),
                     text(&joining.title).size(12).style(text::secondary),
-                    text("Click the group (or story) it belongs with. Search to find it.")
+                    text(format!(
+                        "Click the group (or story) in {} it belongs with. Search to find it.",
+                        self.folders.iter().find(|f| f.id == joining.folder).map_or("its folder", |f| f.name.as_str())
+                    ))
                         .size(11)
                         .style(text::secondary),
                 ]
@@ -3381,7 +3414,15 @@ impl RssApp {
             format!("{} stories", entry.members.len())
         };
         let content = column![
-            text(entry.title()).size(13).color(if unread > 0 { UNREAD_TITLE } else { READ_TITLE }),
+            text(entry.title()).size(13).color(
+                if self.unavailable_to_join(entry.group, entry.members.first().map_or(0, |a| a.feed_id)) {
+                    UNAVAILABLE_TITLE
+                } else if unread > 0 {
+                    UNREAD_TITLE
+                } else {
+                    READ_TITLE
+                }
+            ),
             row![
                 text(count).size(11).style(text::secondary),
                 text("•").size(11).style(text::secondary),
@@ -3398,7 +3439,11 @@ impl RssApp {
             .width(Length::Fill)
             .padding(8)
             .style(move |theme, status| story_card(theme, status, is_selected))
-            .on_press_maybe(self.card_press(entry.group, Message::SelectGroup(entry.group)));
+            .on_press_maybe(self.card_press(
+                entry.group,
+                entry.members.first().map_or(0, |a| a.feed_id),
+                Message::SelectGroup(entry.group),
+            ));
         container(card).id(group_card_id(entry.group)).into()
     }
 
@@ -5371,7 +5416,8 @@ impl RssApp {
                 // A lone story in the grouped list can join a group
                 let art_group = art.group_id.unwrap_or(art.id);
                 let lone = self.story_groups.iter().any(|g| matches!(g.members.as_slice(), [only] if only.id == art.id));
-                if self.grouped && lone {
+                // (only in a grouped folder: groups are within one)
+                if self.grouped && lone && self.grouped_folder_of_feed(art.feed_id).is_some() {
                     action_row = action_row.push(
                         button(text("Add to a group…").size(12))
                             .padding([4, 10])
@@ -6024,6 +6070,9 @@ impl iced::advanced::text::Highlighter for LinkHighlighter {
 const UNREAD_TITLE: Color = Color::from_rgb(0.36, 0.84, 0.49);
 /// Title color of a read story.
 const READ_TITLE: Color = Color::WHITE;
+/// A card's title while it can't be chosen (another folder's, while
+/// choosing a group to join)
+const UNAVAILABLE_TITLE: Color = Color::from_rgb(0.42, 0.42, 0.45);
 
 /// A story in the list: the page background with a grey outline, so the
 /// colored titles stay readable. Hovering brightens the outline; the open
@@ -6335,6 +6384,57 @@ mod tests {
         let _ = app.update(super::Message::StartJoining(court.group()));
         let _ = app.update(super::Message::CancelJoining);
         assert!(app.joining.is_none());
+    }
+
+    /// Adding to and merging groups stays within a grouped folder.
+    #[test]
+    fn joining_stays_within_a_folder() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let news = db.test_grouping_folder();
+        let tech = db.create_folder("Tech").unwrap();
+        db.set_folder_grouping(tech, true).unwrap();
+        let other = db.create_folder("Other").unwrap();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(tech)).unwrap();
+        let blog = db.add_or_update_feed("https://blog.example/rss", "Blog", None, None, Some(other)).unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let add = |feed: i64, hash: &str, hours: i64, title: &str| {
+            db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
+                Some(base + chrono::Duration::hours(hours)), None).unwrap();
+        };
+        add(reuters, "a", 0, "Spirit Airlines data sold to Google in bankruptcy sale");
+        add(reuters, "b", 1, "Court clears the sale of an airline's customer records");
+        add(verge, "c", 2, "Google buys Spirit Airlines data in bankruptcy deal");
+        add(blog, "d", 3, "Google gets Spirit Airlines data in bankruptcy sale");
+        crate::story_groups::group_new_stories(&db).unwrap();
+
+        let (mut app, _) = RssApp::new(db, false);
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::All));
+        let _ = app.update(super::Message::ToggleGrouped);
+        let story = |app: &RssApp, start: &str| {
+            app.articles.iter().find(|a| a.title.starts_with(start)).unwrap().clone()
+        };
+        let (spirit, court, verge_story, blog_story) =
+            (story(&app, "Spirit"), story(&app, "Court"), story(&app, "Google buys"), story(&app, "Google gets"));
+        assert_eq!(blog_story.group_id, None, "Other isn't grouped");
+
+        // A story in an ungrouped folder can't be added to a group
+        let _ = app.update(super::Message::StartJoining(blog_story.group()));
+        assert!(app.joining.is_none());
+
+        // From News: Tech's story can't be chosen, and joining it anyway does nothing
+        let _ = app.update(super::Message::StartJoining(court.group()));
+        assert_eq!(app.joining.as_ref().map(|j| j.folder), Some(news));
+        assert_eq!(app.card_press(verge_story.group(), verge_story.feed_id, super::Message::Noop).is_some(), false);
+        assert!(app.card_press(spirit.group(), spirit.feed_id, super::Message::Noop).is_some());
+        let _ = app.update(super::Message::JoinInto(verge_story.group()));
+        let groups = |app: &RssApp| app.db.get_articles(&Default::default()).unwrap().iter().map(|a| a.group()).collect::<std::collections::HashSet<i64>>().len();
+        assert_eq!(groups(&app), 4, "nothing joined");
+
+        // Within News it works
+        let _ = app.update(super::Message::StartJoining(court.group()));
+        let _ = app.update(super::Message::JoinInto(spirit.group()));
+        assert_eq!(groups(&app), 3);
     }
 
     /// A folder's menu turns grouping on and off; turning it back on after
