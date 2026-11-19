@@ -63,6 +63,9 @@ const KEEP_IN_TRAY_SETTING: &str = "keep_in_tray";
 /// Setting: the story list shows groups of stories about the same thing
 const GROUPED_SETTING: &str = "grouped_view";
 
+/// Setting: the Ollama model that labels training examples
+const OLLAMA_MODEL_SETTING: &str = "ollama_model";
+
 /// Setting: list unread stories before read ones
 const UNREAD_FIRST_SETTING: &str = "unread_first";
 
@@ -158,6 +161,14 @@ pub struct RssApp {
     reader_group: Option<ReaderGroup>,
     /// Story embeddings: whether they're ready
     embeddings: EmbeddingStatus,
+    ollama: crate::ollama::Ollama,
+    /// The models installed in Ollama, or why it couldn't be reached (checked
+    /// when Settings opens)
+    ollama_models: Option<Result<Vec<String>, String>>,
+    ollama_model: String,
+    labelling: Option<Labelling>,
+    /// Pairs Ollama has labelled, and how many it judged the same story
+    ollama_labels: (i64, i64),
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -314,6 +325,13 @@ enum EmbeddingStatus {
     Failed(String),
 }
 
+/// A labelling run in progress (see `training::label_with_ollama`)
+struct Labelling {
+    status: crate::training::LabelEvent,
+    /// Dropping it stops the run
+    _handle: iced::task::Handle,
+}
+
 /// Find in story (Ctrl+F)
 #[derive(Debug, Clone, Default)]
 struct FindState {
@@ -435,6 +453,11 @@ pub enum Message {
     StoriesGrouped(Result<usize, String>),
     /// Background embedding finished: how many stories it embedded
     StoriesEmbedded(Result<usize, String>),
+    OllamaModels(Result<Vec<String>, String>),
+    SetOllamaModel(String),
+    StartLabelling,
+    StopLabelling,
+    Labelling(crate::training::LabelEvent),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -592,6 +615,11 @@ impl RssApp {
             story_groups: Vec::new(),
             reader_group: None,
             embeddings: EmbeddingStatus::Idle,
+            ollama: crate::ollama::Ollama::new(),
+            ollama_models: None,
+            ollama_model: crate::ollama::DEFAULT_MODEL.to_string(),
+            labelling: None,
+            ollama_labels: (0, 0),
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -646,6 +674,9 @@ impl RssApp {
         }
         app.unread_first = matches!(app.db.get_setting(UNREAD_FIRST_SETTING), Ok(Some(on)) if on == "true");
         app.grouped = matches!(app.db.get_setting(GROUPED_SETTING), Ok(Some(on)) if on == "true");
+        if let Ok(Some(model)) = app.db.get_setting(OLLAMA_MODEL_SETTING) {
+            app.ollama_model = model;
+        }
         app.keep_in_tray = !matches!(app.db.get_setting(KEEP_IN_TRAY_SETTING), Ok(Some(on)) if on == "false");
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
@@ -1201,6 +1232,14 @@ impl RssApp {
                 Task::none()
             }
             Message::OpenSettings => {
+                self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+                if let (EmbeddingStatus::Idle, Ok(count)) = (&self.embeddings, self.db.embedding_count()) {
+                    if count > 0 {
+                        self.embeddings = EmbeddingStatus::Ready(count);
+                    }
+                }
+                let ollama = self.ollama.clone();
+                let check = Task::perform(async move { ollama.models().await }, Message::OllamaModels);
                 self.feed_menu = None;
                 self.folder_menu = None;
                 self.article_menu = None;
@@ -1212,6 +1251,90 @@ impl RssApp {
                     import_result: None,
                     export_result: None,
                 });
+                check
+            }
+            Message::OllamaModels(models) => {
+                // The saved model, if it's installed; otherwise the default, or any
+                if let Ok(installed) = &models {
+                    if !installed.contains(&self.ollama_model) {
+                        let fallback = if installed.iter().any(|m| m == crate::ollama::DEFAULT_MODEL) {
+                            Some(crate::ollama::DEFAULT_MODEL.to_string())
+                        } else {
+                            installed.first().cloned()
+                        };
+                        if let Some(model) = fallback {
+                            self.ollama_model = model;
+                        }
+                    }
+                }
+                self.ollama_models = Some(models);
+                Task::none()
+            }
+            Message::SetOllamaModel(model) => {
+                let _ = self.db.set_setting(OLLAMA_MODEL_SETTING, &model);
+                self.ollama_model = model;
+                Task::none()
+            }
+            Message::StartLabelling => {
+                if self.labelling.is_some() {
+                    return Task::none();
+                }
+                let db = self.db.clone();
+                let fetcher = self.fetcher.clone();
+                let dir = crate::embeddings::model_dir(db.path());
+                let embed_db = db.clone();
+                // Recent stories need embeddings first (and the model, the first time)
+                let prepare = move || async move {
+                    crate::embeddings::ensure_model(&dir, |url, max| {
+                        let fetcher = fetcher.clone();
+                        async move { fetcher.download(url, max).await }
+                    })
+                    .await?;
+                    tokio::task::spawn_blocking(move || {
+                        crate::embeddings::embed_new_stories(&embed_db, &dir).map_err(|e| format!("{:#}", e))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    Ok(())
+                };
+                let (ollama, model) = (self.ollama.clone(), self.ollama_model.clone());
+                let events = iced::stream::channel(100, move |sender| {
+                    crate::training::label_with_ollama(db, ollama, model, prepare, sender)
+                });
+                let (task, handle) = Task::run(events, Message::Labelling).abortable();
+                self.labelling = Some(Labelling {
+                    status: crate::training::LabelEvent::Preparing,
+                    _handle: handle.abort_on_drop(),
+                });
+                task
+            }
+            Message::StopLabelling => {
+                self.labelling = None; // dropping the handle stops it
+                self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+                Task::none()
+            }
+            Message::Labelling(event) => {
+                use crate::training::LabelEvent;
+                if let LabelEvent::Progress { .. } = &event {
+                    if self.embeddings == EmbeddingStatus::Working || self.embeddings == EmbeddingStatus::Idle {
+                        self.embeddings = EmbeddingStatus::Ready(self.db.embedding_count().unwrap_or(0));
+                    }
+                }
+                if let LabelEvent::Finished(result) = &event {
+                    self.labelling = None;
+                    self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+                    self.status_message = Some(match result {
+                        Ok(n) => (
+                            format!("Ollama labelled {} {} of stories.", n, if *n == 1 { "pair" } else { "pairs" }),
+                            false,
+                        ),
+                        Err(e) => (format!("Labelling stopped: {}", e), true),
+                    });
+                    return Task::none();
+                }
+                if let Some(labelling) = &mut self.labelling {
+                    labelling.status = event;
+                }
                 Task::none()
             }
             Message::CloseSettings => {
@@ -3303,11 +3426,75 @@ impl RssApp {
             EmbeddingStatus::Ready(n) => format!("Language model ready: {} recent {} analysed.", n, if *n == 1 { "story" } else { "stories" }),
             EmbeddingStatus::Failed(e) => format!("The language model couldn't be set up: {}", e),
         };
+        // Training examples from Ollama
+        let ollama_row: Element<'_, Message> = match &self.ollama_models {
+            None => text("Looking for Ollama…").size(12).style(text::secondary).into(),
+            Some(Err(e)) => text(format!("{}. Install and start Ollama (ollama.com) to label examples.", e))
+                .size(12)
+                .style(text::secondary)
+                .into(),
+            Some(Ok(models)) if models.is_empty() => {
+                text("Ollama has no models installed. Install one with: ollama pull llama3.1:8b")
+                    .size(12)
+                    .style(text::secondary)
+                    .into()
+            }
+            Some(Ok(models)) => row![
+                text("Ollama model").size(12),
+                pick_list(models.as_slice(), Some(&self.ollama_model), Message::SetOllamaModel)
+                    .text_size(12)
+                    .padding([3, 8]),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+        };
+        let can_label = matches!(&self.ollama_models, Some(Ok(models)) if !models.is_empty());
+        let label_row: Element<'_, Message> = match &self.labelling {
+            Some(labelling) => {
+                use crate::training::LabelEvent;
+                let progress = match &labelling.status {
+                    LabelEvent::Preparing => "Getting ready: analysing recent stories…".to_string(),
+                    LabelEvent::Progress { done, total, same } => {
+                        format!("Labelling: {} of {} pairs ({} the same story)", done, total, same)
+                    }
+                    LabelEvent::Finished(_) => String::new(),
+                };
+                row![
+                    text(progress).size(12).width(Length::Fill),
+                    button(text("Stop").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::StopLabelling),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into()
+            }
+            None => row![
+                text(format!(
+                    "Examples from Ollama: {} pairs, {} the same story.",
+                    self.ollama_labels.0, self.ollama_labels.1
+                ))
+                .size(12)
+                .style(text::secondary)
+                .width(Length::Fill),
+                button(text(format!("Label the last {} days", crate::training::LABEL_DAYS)).size(12))
+                    .padding([4, 10])
+                    .style(button::secondary)
+                    .on_press_maybe(can_label.then_some(Message::StartLabelling)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+        };
         let grouping_section = column![
             text("Story grouping").size(14),
             text(grouping_status)
                 .size(12)
                 .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
+            ollama_row,
+            label_row,
+            text("Ollama judges whether likely pairs of recent stories are the same news. Its answers are examples the grouping learns from, alongside your own corrections. A run continues where the last one stopped.")
+                .size(12)
+                .style(text::secondary),
         ]
         .spacing(6);
 

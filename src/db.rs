@@ -326,6 +326,21 @@ impl Database {
                 vector BLOB NOT NULL
             )",
         )?;
+        // Training examples for grouping (see training.rs): whether two stories
+        // are the same news, from Ollama or from the user. One row per pair
+        // and source, smaller id first; removed with either story.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pair_labels (
+                a INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                b INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+                source TEXT NOT NULL,
+                same INTEGER NOT NULL,
+                labelled_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (a, b, source),
+                CHECK (a < b)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pair_labels_b ON pair_labels(b);",
+        )?;
         // Migration: each story's group (see story_groups.rs)
         let _ = conn.execute("ALTER TABLE articles ADD COLUMN group_id INTEGER", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_group ON articles(group_id)", []);
@@ -1053,6 +1068,72 @@ impl Database {
             }
         }
         Ok(found)
+    }
+
+    /// Stories dated `since` or later that have embeddings: (id, Unix time,
+    /// embedding).
+    pub fn recent_embedded_stories(&self, since: &str) -> Result<Vec<(i64, i64, Vec<f32>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT a.id, MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at), e.vector
+             FROM articles a JOIN story_embeddings e ON e.article_id = a.id
+             WHERE MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                let date: String = r.get(1)?;
+                let time = DateTime::parse_from_rfc3339(&date).map(|d| d.timestamp()).unwrap_or(0);
+                Ok((r.get(0)?, time, crate::embeddings::from_bytes(&r.get::<_, Vec<u8>>(2)?)))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The pairs `source` has labelled, smaller id first.
+    pub fn labelled_pairs(&self, source: &str) -> Result<std::collections::HashSet<(i64, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT a, b FROM pair_labels WHERE source = ?1")?;
+        let pairs = stmt.query_map(params![source], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(pairs)
+    }
+
+    /// Records whether stories `a` and `b` are the same news, per `source`
+    /// ("ollama" or "user"), replacing that source's earlier answer.
+    pub fn set_pair_label(&self, a: i64, b: i64, source: &str, same: bool) -> Result<()> {
+        if a == b {
+            return Ok(());
+        }
+        let (a, b) = (a.min(b), a.max(b));
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO pair_labels (a, b, source, same) VALUES (?1, ?2, ?3, ?4)",
+            params![a, b, source, same as i64],
+        )?;
+        Ok(())
+    }
+
+    /// How many pairs `source` has labelled, and how many of them it judged
+    /// the same story.
+    pub fn pair_label_counts(&self, source: &str) -> Result<(i64, i64)> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(same), 0) FROM pair_labels WHERE source = ?1",
+            params![source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// Titles of the given stories.
+    pub fn titles(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT title FROM articles WHERE id = ?1")?;
+        let mut titles = std::collections::HashMap::new();
+        for &id in ids {
+            if let Some(title) = stmt.query_row(params![id], |r| r.get::<_, String>(0)).optional()? {
+                titles.insert(id, title);
+            }
+        }
+        Ok(titles)
     }
 
     /// How many stories have embeddings.

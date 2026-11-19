@@ -10,12 +10,14 @@ pub mod lazy_load;
 pub mod icons;
 pub mod image_space;
 pub mod models;
+pub mod ollama;
 pub mod on_escape;
 pub mod opml;
 pub mod spinner;
 pub mod story_content;
 pub mod story_groups;
 pub mod story_text;
+pub mod training;
 pub mod split;
 
 use std::env;
