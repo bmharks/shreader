@@ -12,7 +12,15 @@ readme = "README.md"
 keywords = ["rss", "atom", "feed-reader", "archive", "linux"]
 categories = ["gui"]
 
+[workspace]
+# Tags (see tags/): the models that sort stories into tag views, shared with
+# the trainer
+members = ["tags"]
+
 [dependencies]
+# Tag models, and the story embeddings they work from
+shreader-tags = { path = "tags" }
+
 # Storage & Database
 rusqlite = { version = "0.41.1", features = ["bundled", "chrono"] }
 
@@ -63,4 +71,7 @@ futures = "0.3"
 # freeze on image-heavy stories. Our own crate stays at opt-level 0, so
 # rebuilding after an edit is still fast.
 [profile.dev.package."*"]
+opt-level = 3
+# Tag models train in seconds optimised, minutes not
+[profile.dev.package.shreader-tags]
 opt-level = 3
