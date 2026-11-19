@@ -1281,6 +1281,45 @@ impl Database {
         self.get_articles(&filter)
     }
 
+    /// Groups (or lone stories) in `filter`'s feed or folder with a story
+    /// shown at or after `since`, most stories first. Each counts all its
+    /// stories in that feed or folder, however old, read or not, so the
+    /// order doesn't change as stories are read. Ties: more feeds, then
+    /// newer, first.
+    pub fn top_groups(&self, filter: &ArticleFilter, since: &str) -> Result<Vec<i64>> {
+        let scope = ArticleFilter { feed_id: filter.feed_id, folder_id: filter.folder_id, ..Default::default() };
+        let conn = self.lock();
+        const SHOWN: &str = "MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at)";
+        let (clause, scope_params) = Self::filter_clause(&scope);
+        let query = format!(
+            r#"
+            WITH recent AS (
+                SELECT DISTINCT COALESCE(a.group_id, a.id) AS g FROM articles a
+                WHERE {clause} AND {SHOWN} >= ?
+            ),
+            members AS (
+                SELECT r.g, a.feed_id, {SHOWN} AS shown FROM recent r
+                JOIN articles a ON a.group_id = r.g WHERE {clause}
+                UNION ALL
+                SELECT r.g, a.feed_id, {SHOWN} FROM recent r
+                JOIN articles a ON a.id = r.g AND a.group_id IS NULL WHERE {clause}
+            )
+            SELECT g FROM members GROUP BY g
+            ORDER BY COUNT(*) DESC, COUNT(DISTINCT feed_id) DESC, MAX(shown) DESC, g DESC
+            "#
+        );
+        // The scope's parameters for each use of its clause
+        let since = since.to_string();
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = scope_params.iter().map(|p| p.as_ref()).collect();
+        params_vec.push(&since);
+        for _ in 0..2 {
+            params_vec.extend(scope_params.iter().map(|p| p.as_ref()));
+        }
+        let mut stmt = conn.prepare(&query)?;
+        let groups = stmt.query_map(params_vec.as_slice(), |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(groups)
+    }
+
     /// How many stories match `filter` (its limit and offset aside).
     pub fn count_articles(&self, filter: &ArticleFilter) -> Result<usize> {
         let conn = self.lock();
