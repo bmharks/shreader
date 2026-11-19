@@ -2,6 +2,7 @@ pub mod app;
 pub mod context_menu;
 pub mod db;
 pub mod desktop;
+pub mod embeddings;
 pub mod feed;
 pub mod follow_cursor;
 pub mod key_press;

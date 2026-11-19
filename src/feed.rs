@@ -229,9 +229,14 @@ fn proxy_configured() -> bool {
 /// when looked up (`PublicOnlyResolver`, unless `check_names` is off), and
 /// redirects to numeric local addresses are refused.
 fn public_client(check_names: bool) -> reqwest::Client {
+    public_client_with_timeout(check_names, Duration::from_secs(20))
+}
+
+/// `public_client` with a different time limit per download
+fn public_client_with_timeout(check_names: bool, timeout: Duration) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(20))
+        .timeout(timeout)
         // Redirects to numeric addresses skip the name lookup; check them
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
@@ -401,6 +406,9 @@ pub struct FeedFetcher {
     /// (Feeds use `client`, so subscribing to a feed on the local network
     /// still works.)
     image_client: reqwest::Client,
+    /// For large one-off downloads (the grouping model): public addresses
+    /// only, like images, but with time for 90 MB on a slow connection
+    download_client: reqwest::Client,
 }
 
 impl Default for FeedFetcher {
@@ -427,6 +435,7 @@ impl FeedFetcher {
                 .build()
                 .expect("the local feed client's settings are valid"),
             image_client: public_client(check_addresses),
+            download_client: public_client_with_timeout(check_addresses, Duration::from_secs(600)),
         }
     }
 
@@ -785,6 +794,19 @@ impl FeedFetcher {
         tokio::task::spawn_blocking(move || if is_svg { render_svg(&bytes) } else { decode_image(&bytes) })
             .await
             .map_err(|e| format!("decoding failed: {}", e))?
+    }
+
+    /// Downloads a file from a public web address, at most `max_bytes`.
+    pub async fn download(&self, url: String, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let parsed = Url::parse(&url).map_err(|e| format!("bad URL: {}", e))?;
+        if !public_url_allowed(&parsed) {
+            return Err("not a public web address".to_string());
+        }
+        let resp = self.download_client.get(parsed).send().await.map_err(|e| format!("request failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status().as_u16()));
+        }
+        read_limited(resp, max_bytes).await
     }
 
     /// Refreshes every feed in the database (see `sync_feeds`).

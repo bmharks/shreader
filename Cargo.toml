@@ -43,6 +43,16 @@ tracing-subscriber = "0.3"
 iced = { version = "0.13", features = ["tokio", "svg", "image", "advanced"] }
 # Same version iced uses; story images are decoded in the background with it
 image = "0.24"
+# Story embeddings: a small language model (all-MiniLM-L6-v2) that turns a
+# headline into numbers capturing its meaning, for grouping stories. Pure Rust;
+# the tokenizer without its default C regex library (BERT models don't need it)
+candle-core = "=0.11.1"
+candle-nn = "=0.11.1"
+candle-transformers = "=0.11.1"
+tokenizers = { version = "=0.23.2", default-features = false }
+serde_json = "1"
+# Embeddings are stored as 16-bit floats (half the size, no loss that matters)
+half = "2"
 # To check for a Vulkan GPU at startup (same version iced uses)
 wgpu = "0.19"
 # System tray icon (StatusNotifierItem, as used by KDE), for running in the background

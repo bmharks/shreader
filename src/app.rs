@@ -156,6 +156,8 @@ pub struct RssApp {
     story_groups: Vec<StoryGroupEntry>,
     /// The group open in the reader (instead of a single story)
     reader_group: Option<ReaderGroup>,
+    /// Story embeddings: whether they're ready
+    embeddings: EmbeddingStatus,
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -300,6 +302,18 @@ struct ReaderGroup {
     stories: Vec<(Article, Vec<Block>)>,
 }
 
+/// Where the story embeddings stand (see `embeddings`)
+#[derive(Debug, Clone, PartialEq)]
+enum EmbeddingStatus {
+    /// Not needed yet: grouping hasn't been used
+    Idle,
+    /// Downloading the model (the first time) and/or analysing stories
+    Working,
+    /// Up to date: this many stories have embeddings
+    Ready(i64),
+    Failed(String),
+}
+
 /// Find in story (Ctrl+F)
 #[derive(Debug, Clone, Default)]
 struct FindState {
@@ -419,6 +433,8 @@ pub enum Message {
     SelectGroup(i64),
     /// Background grouping finished: how many stories it grouped
     StoriesGrouped(Result<usize, String>),
+    /// Background embedding finished: how many stories it embedded
+    StoriesEmbedded(Result<usize, String>),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -575,6 +591,7 @@ impl RssApp {
             grouped: false,
             story_groups: Vec::new(),
             reader_group: None,
+            embeddings: EmbeddingStatus::Idle,
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -877,8 +894,38 @@ impl RssApp {
         Task::batch([select, then_redraw(scroll)])
     }
 
-    /// Groups new stories in the background (see `story_groups`).
-    fn group_stories(&self) -> Task<Message> {
+    /// Embeds recent stories in the background (see `embeddings`),
+    /// downloading the model the first time. Only once grouping is in use:
+    /// nobody else downloads 91 MB for a feature they don't use.
+    fn embed_stories(&mut self) -> Task<Message> {
+        if !self.grouped || self.embeddings == EmbeddingStatus::Working {
+            return Task::none();
+        }
+        self.embeddings = EmbeddingStatus::Working;
+        let db = self.db.clone();
+        let fetcher = self.fetcher.clone();
+        let dir = crate::embeddings::model_dir(db.path());
+        Task::perform(
+            async move {
+                crate::embeddings::ensure_model(&dir, |url, max| {
+                    let fetcher = fetcher.clone();
+                    async move { fetcher.download(url, max).await }
+                })
+                .await?;
+                tokio::task::spawn_blocking(move || {
+                    crate::embeddings::embed_new_stories(&db, &dir).map_err(|e| format!("{:#}", e))
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::StoriesEmbedded,
+        )
+    }
+
+    /// Groups new stories in the background (see `story_groups`), and
+    /// embeds them when grouping is in use.
+    fn group_stories(&mut self) -> Task<Message> {
+        let embed = self.embed_stories();
         let db = self.db.clone();
         Task::perform(
             async move {
@@ -888,6 +935,7 @@ impl RssApp {
             },
             Message::StoriesGrouped,
         )
+        .chain(embed)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -1584,7 +1632,26 @@ impl RssApp {
                 let _ = self.db.set_setting(GROUPED_SETTING, if self.grouped { "true" } else { "false" });
                 self.article_render_limit = ARTICLE_PAGE_SIZE;
                 self.reload_articles();
-                then_redraw(scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START))
+                let embed = self.embed_stories();
+                Task::batch([
+                    then_redraw(scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START)),
+                    embed,
+                ])
+            }
+            Message::StoriesEmbedded(result) => {
+                self.embeddings = match result {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!("Embedded {} stories", n);
+                        }
+                        EmbeddingStatus::Ready(self.db.embedding_count().unwrap_or(0))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Story embeddings failed: {}", e);
+                        EmbeddingStatus::Failed(e)
+                    }
+                };
+                Task::none()
             }
             Message::StoriesGrouped(result) => {
                 match result {
@@ -3229,6 +3296,21 @@ impl RssApp {
         ]
         .spacing(6);
 
+        // Story grouping
+        let grouping_status = match &self.embeddings {
+            EmbeddingStatus::Idle => "The language model that helps group stories isn't set up yet. It's downloaded (once, 91 MB) when you first use Grouped.".to_string(),
+            EmbeddingStatus::Working => "Setting up: downloading the language model (the first time, 91 MB) and analysing recent stories…".to_string(),
+            EmbeddingStatus::Ready(n) => format!("Language model ready: {} recent {} analysed.", n, if *n == 1 { "story" } else { "stories" }),
+            EmbeddingStatus::Failed(e) => format!("The language model couldn't be set up: {}", e),
+        };
+        let grouping_section = column![
+            text("Story grouping").size(14),
+            text(grouping_status)
+                .size(12)
+                .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
+        ]
+        .spacing(6);
+
         // System tray
         let tray_section = column![
             text("System tray").size(14),
@@ -3370,6 +3452,8 @@ impl RssApp {
                 notifications_section,
                 horizontal_rule(1),
                 tray_section,
+                horizontal_rule(1),
+                grouping_section,
                 horizontal_rule(1),
                 import_section,
                 horizontal_rule(1),

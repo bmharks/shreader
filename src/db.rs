@@ -318,6 +318,14 @@ impl Database {
         // Migration: user-defined folder order (NULL = not yet arranged; those
         // sort alphabetically after arranged folders)
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER", []);
+        // Story embeddings (see embeddings.rs): kept apart from the stories,
+        // and removed with them
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS story_embeddings (
+                article_id INTEGER PRIMARY KEY REFERENCES articles(id) ON DELETE CASCADE,
+                vector BLOB NOT NULL
+            )",
+        )?;
         // Migration: each story's group (see story_groups.rs)
         let _ = conn.execute("ALTER TABLE articles ADD COLUMN group_id INTEGER", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_group ON articles(group_id)", []);
@@ -999,6 +1007,58 @@ impl Database {
             stmt.query_map(params![from, to], row)?.collect::<rusqlite::Result<_>>()?;
         stories.extend(context);
         Ok(stories)
+    }
+
+    /// Up to `limit` stories dated `since` or later (newest first) that have
+    /// no embedding yet: (id, title, start of text).
+    pub fn stories_to_embed(&self, since: &str, limit: usize) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.title, substr(COALESCE(a.content_text, ''), 1, 600)
+             FROM articles a LEFT JOIN story_embeddings e ON e.article_id = a.id
+             WHERE e.article_id IS NULL
+               AND MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1
+             ORDER BY MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![since, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Stores embeddings (see `embeddings::to_bytes`).
+    pub fn set_embeddings(&self, rows: &[(i64, Vec<u8>)]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR REPLACE INTO story_embeddings (article_id, vector) VALUES (?1, ?2)")?;
+            for (id, vector) in rows {
+                stmt.execute(params![id, vector])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The embeddings of those of `ids` that have one.
+    pub fn get_embeddings(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, Vec<f32>>> {
+        let conn = self.lock();
+        let mut found = std::collections::HashMap::new();
+        let mut stmt = conn.prepare("SELECT vector FROM story_embeddings WHERE article_id = ?1")?;
+        for &id in ids {
+            if let Some(bytes) = stmt.query_row(params![id], |r| r.get::<_, Vec<u8>>(0)).optional()? {
+                found.insert(id, crate::embeddings::from_bytes(&bytes));
+            }
+        }
+        Ok(found)
+    }
+
+    /// How many stories have embeddings.
+    pub fn embedding_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        Ok(conn.query_row("SELECT COUNT(*) FROM story_embeddings", [], |r| r.get(0))?)
     }
 
     /// Records stories' groups.
