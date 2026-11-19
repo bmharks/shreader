@@ -1125,21 +1125,52 @@ impl Database {
 
     /// Stories dated `since` or later that have embeddings: (id, Unix time,
     /// embedding).
-    pub fn recent_embedded_stories(&self, since: &str) -> Result<Vec<(i64, i64, Vec<f32>)>> {
+    pub fn recent_embedded_stories(&self, since: &str, folder_id: i64) -> Result<Vec<(i64, i64, Vec<f32>)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT a.id, MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at), e.vector
              FROM articles a JOIN story_embeddings e ON e.article_id = a.id
-             WHERE MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1",
+             WHERE MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1
+               AND a.feed_id IN (SELECT id FROM feeds WHERE folder_id = ?2)",
         )?;
         let rows = stmt
-            .query_map(params![since], |r| {
+            .query_map(params![since, folder_id], |r| {
                 let date: String = r.get(1)?;
                 let time = DateTime::parse_from_rfc3339(&date).map(|d| d.timestamp()).unwrap_or(0);
                 Ok((r.get(0)?, time, crate::embeddings::from_bytes(&r.get::<_, Vec<u8>>(2)?)))
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// The labels of pairs whose stories are both in folder `folder_id`:
+    /// (a, b, source, same), smaller id first.
+    pub fn pair_labels_in(&self, folder_id: i64) -> Result<Vec<(i64, i64, String, bool)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT l.a, l.b, l.source, l.same FROM pair_labels l
+             JOIN articles x ON x.id = l.a JOIN feeds fx ON fx.id = x.feed_id
+             JOIN articles y ON y.id = l.b JOIN feeds fy ON fy.id = y.feed_id
+             WHERE fx.folder_id = ?1 AND fy.folder_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![folder_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// How many pairs of folder `folder_id`'s stories `source` has labelled,
+    /// and how many of them as the same story.
+    pub fn pair_label_counts_in(&self, folder_id: i64, source: &str) -> Result<(i64, i64)> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(l.same), 0) FROM pair_labels l
+             JOIN articles x ON x.id = l.a JOIN feeds fx ON fx.id = x.feed_id
+             JOIN articles y ON y.id = l.b JOIN feeds fy ON fy.id = y.feed_id
+             WHERE l.source = ?2 AND fx.folder_id = ?1 AND fy.folder_id = ?1",
+            params![folder_id, source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
     }
 
     /// The pairs `source` has labelled, smaller id first.
@@ -1186,9 +1217,10 @@ impl Database {
         Ok(rows)
     }
 
-    /// The stories dated `since` or later, plus any of `ids` from before, to
-    /// compare (as for grouping, but whatever their group: it's left out).
-    pub fn story_texts(&self, since: &str, ids: &[i64]) -> Result<Vec<crate::story_groups::StoryText>> {
+    /// Folder `folder_id`'s stories dated `since` or later, plus any of
+    /// `ids` from before, to compare (as for grouping, but whatever their
+    /// group: it's left out).
+    pub fn story_texts(&self, since: &str, folder_id: i64, ids: &[i64]) -> Result<Vec<crate::story_groups::StoryText>> {
         let conn = self.lock();
         const SHOWN: &str = "MIN(COALESCE(published_at, fetched_at), fetched_at)";
         let row = |r: &rusqlite::Row| -> rusqlite::Result<crate::story_groups::StoryText> {
@@ -1206,9 +1238,11 @@ impl Database {
             "id, feed_id, {SHOWN}, title, substr(COALESCE(content_text, ''), 1, {})",
             crate::story_groups::TEXT_CHARS + 200
         );
-        let mut stmt = conn.prepare(&format!("SELECT {columns} FROM articles WHERE {SHOWN} >= ?1"))?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {columns} FROM articles WHERE {SHOWN} >= ?1 AND feed_id IN (SELECT id FROM feeds WHERE folder_id = ?2)"
+        ))?;
         let mut stories: Vec<crate::story_groups::StoryText> =
-            stmt.query_map(params![since], row)?.collect::<rusqlite::Result<_>>()?;
+            stmt.query_map(params![since, folder_id], row)?.collect::<rusqlite::Result<_>>()?;
         let have: std::collections::HashSet<i64> = stories.iter().map(|s| s.id).collect();
         let mut stmt = conn.prepare(&format!("SELECT {columns} FROM articles WHERE id = ?1"))?;
         for &id in ids.iter().filter(|id| !have.contains(id)) {
@@ -1378,14 +1412,15 @@ impl Database {
         Ok(outside + mixed + orphaned)
     }
 
-    /// Takes away the groups of the stories dated `since` or later, to be
-    /// grouped again.
-    pub fn clear_groups_since(&self, since: &str) -> Result<usize> {
+    /// Takes away the groups of folder `folder_id`'s stories dated `since`
+    /// or later, to be grouped again.
+    pub fn clear_groups_since(&self, since: &str, folder_id: i64) -> Result<usize> {
         let conn = self.lock();
         Ok(conn.execute(
             "UPDATE articles SET group_id = NULL
-             WHERE group_id IS NOT NULL AND MIN(COALESCE(published_at, fetched_at), fetched_at) >= ?1",
-            params![since],
+             WHERE group_id IS NOT NULL AND MIN(COALESCE(published_at, fetched_at), fetched_at) >= ?1
+               AND feed_id IN (SELECT id FROM feeds WHERE folder_id = ?2)",
+            params![since, folder_id],
         )?)
     }
 

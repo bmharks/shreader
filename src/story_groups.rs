@@ -40,10 +40,6 @@ pub const TEXT_CHARS: usize = 400;
 /// Stories grouped per run: memory stays small however big the archive
 const BATCH: usize = 3000;
 
-/// Settings key of the learned grouping model (see `pair_model`), once
-/// there is one
-pub const MODEL_SETTING: &str = "grouping_model";
-
 /// Settings key of a folder's learned grouping model (see `pair_model`),
 /// once it has one
 pub fn model_setting(folder_id: i64) -> String {
@@ -70,13 +66,17 @@ pub fn group_new_stories(db: &crate::db::Database) -> anyhow::Result<usize> {
     group_unlocked(db)
 }
 
-/// Groups the recent stories again from scratch (after the model is
-/// retrained). Older stories keep their groups.
-pub fn regroup_recent(db: &crate::db::Database) -> anyhow::Result<usize> {
+/// Groups a folder's recent stories again from scratch (after its model is
+/// retrained). Older stories keep their groups, and other folders theirs.
+pub fn regroup_recent(db: &crate::db::Database, folder: i64) -> anyhow::Result<usize> {
     let _one_at_a_time = GROUPING.lock().unwrap_or_else(|p| p.into_inner());
     let since = chrono::Utc::now() - chrono::Duration::days(crate::embeddings::RECENT_DAYS);
-    db.clear_groups_since(&since.to_rfc3339())?;
-    group_unlocked(db)
+    db.clear_groups_since(&since.to_rfc3339(), folder)?;
+    db.tidy_groups()?;
+    if !db.grouping_folders()?.contains(&folder) {
+        return Ok(0);
+    }
+    group_folder(db, folder)
 }
 
 fn group_unlocked(db: &crate::db::Database) -> anyhow::Result<usize> {
@@ -96,7 +96,7 @@ fn group_folder(db: &crate::db::Database, folder: i64) -> anyhow::Result<usize> 
         .and_then(|json| crate::pair_model::PairModel::from_json(&json));
     let user_labels: HashMap<(i64, i64), bool> = match &model {
         Some(_) => db
-            .pair_labels()?
+            .pair_labels_in(folder)?
             .into_iter()
             .filter(|(_, _, source, _)| source == crate::training::SOURCE_USER)
             .map(|(a, b, _, same)| ((a, b), same))

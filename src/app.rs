@@ -70,6 +70,9 @@ const TOP_STORIES_SETTING: &str = "top_stories";
 /// Top stories: groups with a story from this many hours ago or since
 const TOP_STORIES_HOURS: i64 = 24;
 
+/// Setting: the folder Settings labels with Ollama
+const LABEL_FOLDER_SETTING: &str = "label_folder";
+
 /// Setting: the Ollama model that labels training examples
 const OLLAMA_MODEL_SETTING: &str = "ollama_model";
 
@@ -176,20 +179,24 @@ pub struct RssApp {
     ollama_models: Option<Result<Vec<String>, String>>,
     ollama_model: String,
     labelling: Option<Labelling>,
-    /// Pairs Ollama has labelled, and how many it judged the same story
+    /// The grouped folder Settings labels with Ollama and tells about
+    /// (`LABEL_FOLDER_SETTING`)
+    label_folder: Option<i64>,
+    /// Pairs of `label_folder`'s stories Ollama has labelled, and how many
+    /// it judged the same story
     ollama_labels: (i64, i64),
-    /// The learned grouping model, once trained (see `training`)
-    model_info: Option<crate::training::ModelInfo>,
-    /// The model is being trained (and recent stories regrouped)
-    training_model: bool,
+    /// Each folder's learned grouping model, once trained (see `training`)
+    model_info: HashMap<i64, crate::training::ModelInfo>,
+    /// Folders whose model is being trained (and recent stories regrouped)
+    training: HashSet<i64>,
     /// Choosing where to put a story or group (see `Joining`)
     joining: Option<Joining>,
     /// A feed changed folders: group stories again once this message is
     /// handled
     regroup_pending: bool,
     /// Corrections were made in the open group (known by its first story):
-    /// retrain once it's left
-    retrain_after: Option<i64>,
+    /// retrain its folder (the second) once it's left
+    retrain_after: Option<(i64, i64)>,
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -405,6 +412,10 @@ enum EmbeddingStatus {
 /// A labelling run in progress (see `training::label_with_ollama`)
 struct Labelling {
     status: crate::training::LabelEvent,
+    folder: i64,
+    /// The folder's Ollama label counts when it started (retrained after
+    /// if they changed)
+    before: (i64, i64),
     /// Dropping it stops the run
     _handle: iced::task::Handle,
 }
@@ -495,6 +506,19 @@ impl std::fmt::Display for FolderChoice {
     }
 }
 
+/// A grouped folder, in Settings' folder picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedFolder {
+    id: i64,
+    name: String,
+}
+
+impl std::fmt::Display for GroupedFolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
 /// How long URL typing must pause before the feed is looked up.
 const FEED_LOOKUP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -549,10 +573,13 @@ pub enum Message {
     StoriesEmbedded(Result<usize, String>),
     OllamaModels(Result<Vec<String>, String>),
     SetOllamaModel(String),
+    /// Settings: the folder to label and tell about
+    SetLabelFolder(GroupedFolder),
     StartLabelling,
     StopLabelling,
     Labelling(crate::training::LabelEvent),
-    ModelTrained(Result<Option<crate::training::ModelInfo>, String>),
+    /// A folder's model was trained (`None`: not enough examples yet)
+    ModelTrained(i64, Result<Option<crate::training::ModelInfo>, String>),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -690,7 +717,12 @@ impl RssApp {
     /// `tray`: whether the tray icon is showing (see `desktop::start_tray`).
     pub fn new(db: Database, tray: bool) -> (Self, Task<Message>) {
         let fetcher = Arc::new(FeedFetcher::new());
-        let model_info = crate::training::ModelInfo::load(&db);
+        let model_info: HashMap<i64, crate::training::ModelInfo> = db
+            .get_folders()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| Some((f.id, crate::training::ModelInfo::load(&db, f.id)?)))
+            .collect();
 
         let mut app = Self {
             db,
@@ -721,9 +753,10 @@ impl RssApp {
             ollama_models: None,
             ollama_model: crate::ollama::DEFAULT_MODEL.to_string(),
             labelling: None,
+            label_folder: None,
             ollama_labels: (0, 0),
             model_info,
-            training_model: false,
+            training: HashSet::new(),
             retrain_after: None,
             joining: None,
             regroup_pending: false,
@@ -785,6 +818,7 @@ impl RssApp {
         if let Ok(Some(model)) = app.db.get_setting(OLLAMA_MODEL_SETTING) {
             app.ollama_model = model;
         }
+        app.label_folder = app.db.get_setting(LABEL_FOLDER_SETTING).ok().flatten().and_then(|id| id.parse().ok());
         app.keep_in_tray = !matches!(app.db.get_setting(KEEP_IN_TRAY_SETTING), Ok(Some(on)) if on == "false");
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
@@ -844,21 +878,23 @@ impl RssApp {
             app.reload_articles();
         }
         let open_window = app.open_main_window();
-        // Groups stories not grouped yet (all of them, the first time). With
-        // labels but no usable model (one from an older version), it's
-        // trained first.
-        let has_model = app
+        // Groups stories not grouped yet (all of them, the first time). A
+        // folder with labels but no usable model (one from an older
+        // version) is trained first (grouping follows).
+        let untrained: Vec<i64> = app
             .db
-            .get_setting(crate::story_groups::MODEL_SETTING)
-            .ok()
-            .flatten()
-            .and_then(|json| crate::pair_model::PairModel::from_json(&json))
-            .is_some();
-        let labelled = app.db.pair_labels().map(|l| l.len()).unwrap_or(0);
-        let group = if !has_model && labelled >= crate::training::MIN_EXAMPLES {
-            app.train_model()
-        } else {
+            .grouping_folders()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|&folder| {
+                !crate::training::has_model(&app.db, folder)
+                    && app.db.pair_labels_in(folder).map(|l| l.len()).unwrap_or(0) >= crate::training::MIN_EXAMPLES
+            })
+            .collect();
+        let group = if untrained.is_empty() {
             app.group_stories()
+        } else {
+            Task::batch(untrained.into_iter().map(|folder| app.train_model(folder)).collect::<Vec<_>>())
         };
         (app, Task::batch([open_window, initial_task, group]))
     }
@@ -1115,32 +1151,54 @@ impl RssApp {
         embed.chain(group)
     }
 
-    /// Trains the grouping model on the labels so far and regroups recent
-    /// stories with it, in the background.
-    fn train_model(&mut self) -> Task<Message> {
-        if self.training_model {
-            return Task::none();
+    /// Trains a folder's grouping model on its labels so far and regroups
+    /// its recent stories with it, in the background.
+    fn train_model(&mut self, folder: i64) -> Task<Message> {
+        if !self.training.insert(folder) {
+            return Task::none(); // already training
         }
-        self.training_model = true;
         let db = self.db.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    crate::training::train_and_regroup(&db).map_err(|e| format!("{:#}", e))
+                    crate::training::train_and_regroup(&db, folder).map_err(|e| format!("{:#}", e))
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
             },
-            Message::ModelTrained,
+            move |result| Message::ModelTrained(folder, result),
         )
     }
 
-    /// After labelling: the counts brought up to date, and the model
-    /// retrained if there are new labels.
-    fn labelling_ended(&mut self) -> Task<Message> {
-        let before = self.ollama_labels;
-        self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
-        if self.ollama_labels != before { self.train_model() } else { Task::none() }
+    /// The folder a feed is in
+    fn folder_of_feed(&self, feed_id: i64) -> Option<i64> {
+        self.feeds.iter().find(|f| f.id == feed_id).and_then(|f| f.folder_id)
+    }
+
+    /// The grouped folders, as Settings offers them
+    fn grouping_folder_choices(&self) -> Vec<GroupedFolder> {
+        self.folders.iter().filter(|f| f.grouping).map(|f| GroupedFolder { id: f.id, name: f.name.clone() }).collect()
+    }
+
+    /// Settings' folder: the chosen one while it's grouped, or else the
+    /// first grouped folder; with its Ollama label counts.
+    fn refresh_label_folder(&mut self) {
+        let choices = self.grouping_folder_choices();
+        if !self.label_folder.is_some_and(|id| choices.iter().any(|c| c.id == id)) {
+            self.label_folder = choices.first().map(|c| c.id);
+        }
+        self.ollama_labels = match self.label_folder {
+            Some(folder) => self.db.pair_label_counts_in(folder, crate::training::SOURCE_OLLAMA).unwrap_or((0, 0)),
+            None => (0, 0),
+        };
+    }
+
+    /// After labelling a folder: the counts brought up to date, and its
+    /// model retrained if there are new labels.
+    fn labelling_ended(&mut self, folder: i64, before: (i64, i64)) -> Task<Message> {
+        self.refresh_label_folder();
+        let after = self.db.pair_label_counts_in(folder, crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+        if after != before { self.train_model(folder) } else { Task::none() }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -1156,10 +1214,16 @@ impl RssApp {
         let correcting = self.reader_group.as_ref().and_then(|g| g.stories.first()).map(|(a, _)| a.id);
         let corrected = self.reader_group.as_ref().is_some_and(|g| !g.corrections.undo.is_empty());
         if corrected {
-            self.retrain_after = correcting;
-        } else if self.retrain_after.is_some() && self.retrain_after != correcting {
+            let folder = self
+                .reader_group
+                .as_ref()
+                .and_then(|g| g.stories.first())
+                .and_then(|(a, _)| self.folder_of_feed(a.feed_id));
+            self.retrain_after = correcting.zip(folder);
+        } else if let Some((story, folder)) = self.retrain_after.filter(|(story, _)| Some(*story) != correcting) {
+            let _ = story;
             self.retrain_after = None;
-            task = Task::batch([task, self.train_model()]);
+            task = Task::batch([task, self.train_model(folder)]);
         } else if self.reader_group.is_some() {
             // All undone
             self.retrain_after = None;
@@ -1424,7 +1488,7 @@ impl RssApp {
                 Task::none()
             }
             Message::OpenSettings => {
-                self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+                self.refresh_label_folder();
                 if let (EmbeddingStatus::Idle, Ok(count)) = (&self.embeddings, self.db.embedding_count()) {
                     if count > 0 {
                         self.embeddings = EmbeddingStatus::Ready(count);
@@ -1467,10 +1531,18 @@ impl RssApp {
                 self.ollama_model = model;
                 Task::none()
             }
+            Message::SetLabelFolder(choice) => {
+                let _ = self.db.set_setting(LABEL_FOLDER_SETTING, &choice.id.to_string());
+                self.label_folder = Some(choice.id);
+                self.refresh_label_folder();
+                Task::none()
+            }
             Message::StartLabelling => {
                 if self.labelling.is_some() {
                     return Task::none();
                 }
+                let Some(folder) = self.label_folder else { return Task::none() };
+                let before = self.db.pair_label_counts_in(folder, crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
                 let db = self.db.clone();
                 let fetcher = self.fetcher.clone();
                 let dir = crate::embeddings::model_dir(db.path());
@@ -1491,25 +1563,28 @@ impl RssApp {
                 };
                 let (ollama, model) = (self.ollama.clone(), self.ollama_model.clone());
                 let events = iced::stream::channel(100, move |sender| {
-                    crate::training::label_with_ollama(db, ollama, model, prepare, sender)
+                    crate::training::label_with_ollama(db, ollama, model, folder, prepare, sender)
                 });
                 let (task, handle) = Task::run(events, Message::Labelling).abortable();
                 self.labelling = Some(Labelling {
                     status: crate::training::LabelEvent::Preparing,
+                    folder,
+                    before,
                     _handle: handle.abort_on_drop(),
                 });
                 task
             }
             Message::StopLabelling => {
-                self.labelling = None; // dropping the handle stops it
-                self.labelling_ended()
+                // Dropping the handle stops it
+                let Some(run) = self.labelling.take() else { return Task::none() };
+                self.labelling_ended(run.folder, run.before)
             }
-            Message::ModelTrained(result) => {
-                self.training_model = false;
+            Message::ModelTrained(folder, result) => {
+                self.training.remove(&folder);
                 match result {
                     Ok(Some(info)) => {
-                        tracing::info!("Grouping model trained on {} examples", info.examples);
-                        self.model_info = Some(info);
+                        tracing::info!("Grouping model for folder {} trained on {} examples", folder, info.examples);
+                        self.model_info.insert(folder, info);
                         if self.grouped {
                             self.reload_articles();
                         }
@@ -1531,8 +1606,8 @@ impl RssApp {
                     }
                 }
                 if let LabelEvent::Finished(result) = &event {
-                    self.labelling = None;
-                    let train = self.labelling_ended();
+                    let Some(run) = self.labelling.take() else { return Task::none() };
+                    let train = self.labelling_ended(run.folder, run.before);
                     self.status_message = Some(match result {
                         Ok(n) => (
                             format!("Ollama labelled {} {} of stories.", n, if *n == 1 { "pair" } else { "pairs" }),
@@ -2606,6 +2681,7 @@ impl RssApp {
                     .unwrap_or_else(|| ("Folder".to_string(), 0));
                 match self.db.delete_folder(folder_id) {
                     Ok(()) => {
+                        self.model_info.remove(&folder_id);
                         let moved = match feed_count {
                             0 => String::new(),
                             1 => "; its feed moved to Uncategorized".to_string(),
@@ -2652,6 +2728,9 @@ impl RssApp {
                 let name = self.folders.iter().find(|f| f.id == folder_id).map(|f| f.name.clone()).unwrap_or_default();
                 let result = if start_fresh { self.db.clear_grouping_data(folder_id) } else { Ok(()) }
                     .and_then(|()| self.db.set_folder_grouping(folder_id, on));
+                if start_fresh {
+                    self.model_info.remove(&folder_id);
+                }
                 if let Err(e) = result {
                     self.status_message = Some((format!("Couldn't change grouping for '{}': {}", name, e), true));
                     return Task::none();
@@ -3918,8 +3997,9 @@ impl RssApp {
                     }
                     LabelEvent::Finished(_) => String::new(),
                 };
+                let name = self.folders.iter().find(|f| f.id == labelling.folder).map_or("", |f| f.name.as_str());
                 row![
-                    text(progress).size(12).width(Length::Fill),
+                    text(format!("{} — {}", name, progress)).size(12).width(Length::Fill),
                     button(text("Stop").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::StopLabelling),
                 ]
                 .spacing(8)
@@ -3928,7 +4008,7 @@ impl RssApp {
             }
             None => row![
                 text(format!(
-                    "Examples from Ollama: {} pairs, {} the same story.",
+                    "Examples from Ollama in this folder: {} pairs, {} the same story.",
                     self.ollama_labels.0, self.ollama_labels.1
                 ))
                 .size(12)
@@ -3937,19 +4017,55 @@ impl RssApp {
                 button(text(format!("Label the last {} days", crate::training::LABEL_DAYS)).size(12))
                     .padding([4, 10])
                     .style(button::secondary)
-                    .on_press_maybe(can_label.then_some(Message::StartLabelling)),
+                    .on_press_maybe((can_label && self.label_folder.is_some()).then_some(Message::StartLabelling)),
             ]
             .spacing(8)
             .align_y(Alignment::Center)
             .into(),
+        };
+        let choices = self.grouping_folder_choices();
+        let selected = choices.iter().find(|c| Some(c.id) == self.label_folder).cloned();
+        let model_text = match self.label_folder {
+            Some(folder) if self.training.contains(&folder) => {
+                "Learning from the examples and regrouping this folder's recent stories…".to_string()
+            }
+            Some(folder) => match self.model_info.get(&folder) {
+                Some(info) => format!(
+                    "This folder's grouping uses what it learned from {} examples. Tested on {} it hadn't seen, it agreed with {:.0}% of them.",
+                    info.examples,
+                    info.tested,
+                    info.accuracy * 100.0
+                ),
+                None => format!(
+                    "This folder is grouped by shared words until it has at least {} examples to learn from.",
+                    crate::training::MIN_EXAMPLES
+                ),
+            },
+            None => String::new(),
+        };
+        // Labelling and learning are per folder: only with one grouped
+        let folder_part: Element<'_, Message> = if choices.is_empty() {
+            Space::with_height(0).into()
+        } else {
+            column![
+                row![
+                    text("Folder").size(12),
+                    pick_list(choices, selected, Message::SetLabelFolder).text_size(12).padding([3, 8]),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                ollama_row,
+                label_row,
+                text(model_text).size(12).style(text::secondary),
+            ]
+            .spacing(6)
+            .into()
         };
         let grouping_section = column![
             text("Story grouping").size(14),
             text(grouping_status)
                 .size(12)
                 .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
-            ollama_row,
-            label_row,
             text({
                 let grouped: Vec<&str> = self.folders.iter().filter(|f| f.grouping).map(|f| f.name.as_str()).collect();
                 let which = if grouped.is_empty() {
@@ -3964,24 +4080,8 @@ impl RssApp {
             })
             .size(12)
             .style(text::secondary),
-            text(if self.training_model {
-                "Learning from the examples and regrouping recent stories…".to_string()
-            } else if let Some(info) = &self.model_info {
-                format!(
-                    "Grouping uses what it learned from {} examples. Tested on {} it hadn't seen, it agreed with {:.0}% of them.",
-                    info.examples,
-                    info.tested,
-                    info.accuracy * 100.0
-                )
-            } else {
-                format!(
-                    "Grouping goes by shared words until there are at least {} examples to learn from.",
-                    crate::training::MIN_EXAMPLES
-                )
-            })
-            .size(12)
-            .style(text::secondary),
-            text("Ollama judges whether likely pairs of recent stories are the same news. Its answers are examples the grouping learns from, alongside your own corrections. A run continues where the last one stopped.")
+            folder_part,
+            text("Ollama judges whether likely pairs of a folder's recent stories are the same news. Its answers are examples that folder's grouping learns from, alongside your own corrections. A run continues where the last one stopped.")
                 .size(12)
                 .style(text::secondary),
         ]
@@ -6146,7 +6246,7 @@ mod tests {
         assert_eq!(user_label(&app.db, named, others[0]), Some(false));
         let sizes: Vec<usize> = app.story_groups.iter().map(|g| g.members.len()).collect();
         assert_eq!(sizes.iter().filter(|&&n| n == 2).count(), 1, "the other two still a group: {:?}", sizes);
-        assert_eq!(app.retrain_after, Some(open.stories[0].0.id));
+        assert_eq!(app.retrain_after, Some((open.stories[0].0.id, news)), "its folder, once left");
 
         // Undo puts it back
         let _ = app.update(super::Message::UndoGroupCorrection);
@@ -6159,12 +6259,12 @@ mod tests {
         let _ = app.update(super::Message::ConfirmGroup);
         assert!(app.reader_group.as_ref().unwrap().corrections.confirmed);
         assert_eq!(user_label(&app.db, others[0], others[1]), Some(true));
-        assert!(!app.training_model);
+        assert!(app.training.is_empty());
 
         // Leaving the group retrains
         let ipad = app.story_groups.iter().find(|g| g.members.len() == 1).unwrap().members[0].id;
         let _ = app.update(super::Message::SelectArticle(ipad));
-        assert!(app.training_model, "retraining on leaving");
+        assert_eq!(app.training, std::collections::HashSet::from([news]), "retraining its folder on leaving");
         assert_eq!(app.retrain_after, None);
     }
 
