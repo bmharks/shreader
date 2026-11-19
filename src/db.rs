@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{Article, ArticleFilter, Feed, Folder, IngestionResult};
+use crate::models::{Article, ArticleFilter, Feed, Folder, IngestionResult, TagView};
 
 /// The archive to open: `new`, after moving an archive from `legacy` there
 /// if only `legacy` has one. If it can't be moved (in use, another disk),
@@ -361,7 +361,17 @@ impl Database {
             "#,
         )?;
 
+        // 4. Tags (see the shreader-tags crate): which stories are sorted
+        // out of their folders into tag views, and what the trainer learned
+        shreader_tags::store::ensure_schema(&conn)?;
+
         Ok(())
+    }
+
+    /// The connection, for the tags crate's functions (see
+    /// `shreader_tags::store`). Held while `f` runs.
+    pub fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        f(&self.lock())
     }
 
     // --- Folder Operations ---
@@ -493,7 +503,7 @@ impl Database {
                 COALESCE(COUNT(a.id), 0) as total_count
             FROM folders fo
             LEFT JOIN feeds fe ON fe.folder_id = fo.id
-            LEFT JOIN articles a ON a.feed_id = fe.id
+            LEFT JOIN articles a ON a.feed_id = fe.id AND NOT EXISTS (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)
             GROUP BY fo.id, fo.name
             ORDER BY fo.sort_order IS NULL, fo.sort_order, fo.name COLLATE NOCASE ASC
             "#,
@@ -607,8 +617,10 @@ impl Database {
             SELECT 
                 f.id, f.url, f.title, f.description, f.site_url,
                 f.last_fetched_at, f.etag, f.last_modified, f.created_at,
-                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0) as unread_count,
-                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id) as total_count,
+                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0 AND NOT EXISTS
+                    (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)) as unread_count,
+                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND NOT EXISTS
+                    (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)) as total_count,
                 f.folder_id
             FROM feeds f
             ORDER BY f.sort_order IS NULL, f.sort_order, f.title COLLATE NOCASE ASC
@@ -651,8 +663,10 @@ impl Database {
             SELECT 
                 f.id, f.url, f.title, f.description, f.site_url,
                 f.last_fetched_at, f.etag, f.last_modified, f.created_at,
-                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0) as unread_count,
-                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id) as total_count,
+                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0 AND NOT EXISTS
+                    (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)) as unread_count,
+                (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND NOT EXISTS
+                    (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)) as total_count,
                 f.folder_id
             FROM feeds f
             WHERE f.id = ?1
@@ -929,6 +943,14 @@ impl Database {
             params_vec.push(Box::new(article_id));
         }
 
+        let searching = filter.search_query.as_ref().is_some_and(|q| !q.trim().is_empty());
+        if let Some(tag_id) = filter.tag_id {
+            clause.push_str(" AND a.id IN (SELECT article_id FROM story_tags WHERE tag_id = ?)");
+            params_vec.push(Box::new(tag_id));
+        } else if !searching && !filter.starred_only {
+            clause.push_str(" AND NOT EXISTS (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)");
+        }
+
         if filter.unread_only {
             clause.push_str(" AND a.is_read = 0");
         }
@@ -1012,7 +1034,8 @@ impl Database {
             SELECT
                 a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
                 a.title, a.url, a.author, NULL, NULL, NULL,
-                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
+                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred,
+                (SELECT tag_id FROM story_tags WHERE article_id = a.id)
             FROM articles a
             JOIN feeds f ON f.id = a.feed_id
             WHERE {}
@@ -1056,6 +1079,7 @@ impl Database {
                     .unwrap_or_else(|_| Utc::now()),
                 is_read: row.get::<_, i64>(14)? != 0,
                 is_starred: row.get::<_, i64>(15)? != 0,
+                tag_id: row.get(16)?,
             })
         })?;
 
@@ -1073,7 +1097,8 @@ impl Database {
             SELECT 
                 a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
                 a.title, a.url, a.author, a.summary, a.content_html, a.content_text,
-                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
+                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred,
+                (SELECT tag_id FROM story_tags WHERE article_id = a.id)
             FROM articles a
             JOIN feeds f ON f.id = a.feed_id
             WHERE a.id = ?1
@@ -1104,6 +1129,7 @@ impl Database {
                     .unwrap_or_else(|_| Utc::now()),
                 is_read: row.get::<_, i64>(14)? != 0,
                 is_starred: row.get::<_, i64>(15)? != 0,
+                tag_id: row.get(16)?,
             })
         }).optional()?;
 
@@ -1128,7 +1154,8 @@ impl Database {
     }
 
     /// Marks every story in a feed, else a folder, else everywhere, as read or
-    /// unread.
+    /// unread. Stories sorted into a tag aren't shown there, so they're left
+    /// as they are (see `set_tag_read`).
     pub fn set_articles_read_state(
         &self,
         feed_id: Option<i64>,
@@ -1137,19 +1164,61 @@ impl Database {
     ) -> Result<()> {
         let conn = self.lock();
         let is_read = is_read as i64;
+        const UNTAGGED: &str = "NOT EXISTS (SELECT 1 FROM story_tags s WHERE s.article_id = articles.id)";
         if let Some(feed_id) = feed_id {
             conn.execute(
-                "UPDATE articles SET is_read = ?1 WHERE feed_id = ?2 AND is_read != ?1",
+                &format!("UPDATE articles SET is_read = ?1 WHERE feed_id = ?2 AND is_read != ?1 AND {}", UNTAGGED),
                 params![is_read, feed_id],
             )?;
         } else if let Some(folder_id) = folder_id {
             conn.execute(
-                "UPDATE articles SET is_read = ?1 WHERE feed_id IN (SELECT id FROM feeds WHERE folder_id = ?2) AND is_read != ?1",
+                &format!(
+                    "UPDATE articles SET is_read = ?1 WHERE feed_id IN (SELECT id FROM feeds WHERE folder_id = ?2) AND is_read != ?1 AND {}",
+                    UNTAGGED
+                ),
                 params![is_read, folder_id],
             )?;
         } else {
-            conn.execute("UPDATE articles SET is_read = ?1 WHERE is_read != ?1", params![is_read])?;
+            conn.execute(&format!("UPDATE articles SET is_read = ?1 WHERE is_read != ?1 AND {}", UNTAGGED), params![is_read])?;
         }
+        Ok(())
+    }
+
+    /// Marks every story sorted into a tag as read.
+    pub fn set_tag_read(&self, tag_id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE articles SET is_read = 1 WHERE is_read = 0 AND id IN (SELECT article_id FROM story_tags WHERE tag_id = ?1)",
+            [tag_id],
+        )?;
+        Ok(())
+    }
+
+    /// The tags in use (turned on for a folder), in order, with how many of
+    /// their stories are unread and in all
+    pub fn tag_views(&self) -> Result<Vec<TagView>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name,
+                    (SELECT COUNT(*) FROM story_tags s JOIN articles a ON a.id = s.article_id WHERE s.tag_id = t.id AND a.is_read = 0),
+                    (SELECT COUNT(*) FROM story_tags s WHERE s.tag_id = t.id)
+             FROM tags t
+             WHERE t.removed = 0 AND EXISTS (SELECT 1 FROM folder_tags ft WHERE ft.tag_id = t.id)
+             ORDER BY t.sort_order, t.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TagView { id: r.get(0)?, name: r.get(1)?, unread_count: r.get(2)?, total_count: r.get(3)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Corrects a story's tag while reading: it is (`true`) or isn't in `tag`.
+    /// Recorded as the user's answer, for the trainer to learn from, and the
+    /// story is sorted again at once.
+    pub fn correct_tag(&self, article_id: i64, tag_id: i64, is_tag: bool) -> Result<()> {
+        let conn = self.lock();
+        shreader_tags::store::set_label(&conn, article_id, tag_id, Some(is_tag), shreader_tags::store::Source::Reader)?;
+        shreader_tags::store::sort_into_tags(&conn)?;
         Ok(())
     }
 
@@ -1167,10 +1236,10 @@ impl Database {
         let conn = self.lock();
         let (total_feeds, total_articles, unread_articles) = conn.query_row(
             r#"
-            SELECT 
+            SELECT
                 (SELECT COUNT(*) FROM feeds),
-                (SELECT COUNT(*) FROM articles),
-                (SELECT COUNT(*) FROM articles WHERE is_read = 0)
+                (SELECT COUNT(*) FROM articles a WHERE NOT EXISTS (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)),
+                (SELECT COUNT(*) FROM articles a WHERE is_read = 0 AND NOT EXISTS (SELECT 1 FROM story_tags s WHERE s.article_id = a.id))
             "#,
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1605,5 +1674,50 @@ mod tests {
         // News should still have 1 unread
         let news_folder_after = tech_folders_after.iter().find(|f| f.id == news_id).unwrap();
         assert_eq!(news_folder_after.unread_count, 1);
+    }
+
+    /// Stories sorted into a tag are left out of their feed and folder, and
+    /// of All and Unread, but are found by searching and among starred
+    #[test]
+    fn tagged_stories_are_kept_apart() {
+        use shreader_tags::store;
+        let db = Database::open_in_memory().unwrap();
+        let folder = db.create_folder("Tech").unwrap();
+        let feed = db.add_or_update_feed("https://t.example/rss", "T", None, None, Some(folder)).unwrap();
+        for title in ["Coupon codes for laptops", "Chip news"] {
+            db.upsert_article(feed, None, title, title, None, None, None, Some(title), None, None, None).unwrap();
+        }
+        let promo = db.get_articles(&ArticleFilter::default()).unwrap().iter().find(|a| a.title.starts_with("Coupon")).unwrap().id;
+        let tag = db.with_conn(|c| {
+            let tag = store::create_tag(c, "Promotions").unwrap();
+            store::set_folder_tag(c, folder, tag, true).unwrap();
+            store::set_label(c, promo, tag, Some(true), store::Source::Trainer).unwrap();
+            store::sort_into_tags(c).unwrap();
+            tag
+        });
+        let count = |filter: ArticleFilter| db.count_articles(&filter).unwrap();
+        assert_eq!(count(ArticleFilter::default()), 1);
+        assert_eq!(count(ArticleFilter { unread_only: true, ..Default::default() }), 1);
+        assert_eq!(count(ArticleFilter { folder_id: Some(folder), ..Default::default() }), 1);
+        assert_eq!(count(ArticleFilter { feed_id: Some(feed), ..Default::default() }), 1);
+        assert_eq!(count(ArticleFilter { tag_id: Some(tag), ..Default::default() }), 1);
+        assert_eq!(count(ArticleFilter { search_query: Some("coupon".into()), ..Default::default() }), 1);
+        db.toggle_article_starred(promo).unwrap();
+        assert_eq!(count(ArticleFilter { starred_only: true, ..Default::default() }), 1);
+        assert_eq!(db.get_article(promo).unwrap().unwrap().tag_id, Some(tag));
+        assert_eq!(db.get_total_stats().unwrap(), (1, 1, 1));
+        assert_eq!(db.get_folders().unwrap()[0].total_count, 1);
+        assert_eq!(db.get_feeds().unwrap()[0].unread_count, 1);
+
+        // Marking the folder read leaves the tag's story; the tag has its own
+        db.set_all_articles_read(None, Some(folder)).unwrap();
+        assert_eq!(db.tag_views().unwrap()[0].unread_count, 1);
+        db.set_tag_read(tag).unwrap();
+        assert_eq!(db.tag_views().unwrap()[0].unread_count, 0);
+
+        // Corrected while reading: back in the folder
+        db.correct_tag(promo, tag, false).unwrap();
+        assert_eq!(count(ArticleFilter { folder_id: Some(folder), ..Default::default() }), 2);
+        assert_eq!(db.tag_views().unwrap()[0].total_count, 0);
     }
 }

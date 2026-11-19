@@ -9,6 +9,16 @@ pub struct Folder {
     pub total_count: i64,
 }
 
+/// A tag in use, as the sidebar lists it (see `shreader_tags`): stories
+/// sorted out of their folders, such as promotions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagView {
+    pub id: i64,
+    pub name: String,
+    pub unread_count: i64,
+    pub total_count: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Feed {
     pub id: i64,
@@ -43,6 +53,8 @@ pub struct Article {
     pub fetched_at: DateTime<Utc>,
     pub is_read: bool,
     pub is_starred: bool,
+    /// The tag it's sorted into, if any (see `shreader_tags::store`)
+    pub tag_id: Option<i64>,
 }
 
 impl Article {
@@ -63,6 +75,10 @@ pub struct ArticleFilter {
     pub unread_only: bool,
     pub starred_only: bool,
     pub search_query: Option<String>,
+    /// Only stories sorted into this tag. Without it, tagged stories are
+    /// left out (they're shown in their tag instead), except when searching
+    /// and among starred stories, which include everything.
+    pub tag_id: Option<i64>,
     /// Only this story (to check whether it's part of a view)
     pub article_id: Option<i64>,
     /// Unread stories before read ones (each newest first)

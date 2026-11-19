@@ -32,7 +32,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             name TEXT NOT NULL UNIQUE COLLATE NOCASE,
             -- The order tags are tried in
             sort_order INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- Deleted (see `delete_tag`): hidden, its answers and model kept
+            removed INTEGER NOT NULL DEFAULT 0
         );
         -- The tags each folder's stories are sorted into
         CREATE TABLE IF NOT EXISTS folder_tags (
@@ -67,6 +69,8 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         ",
     )
     .context("creating the tag tables")?;
+    // Tags tables made before deleting was possible
+    let _ = conn.execute("ALTER TABLE tags ADD COLUMN removed INTEGER NOT NULL DEFAULT 0", []);
     Ok(())
 }
 
@@ -94,23 +98,46 @@ pub struct Tag {
     pub name: String,
 }
 
-/// Every tag, in the order they're tried
+/// Every tag (deleted ones aside), in the order they're tried
 pub fn tags(conn: &Connection) -> Result<Vec<Tag>> {
-    let mut stmt = conn.prepare("SELECT id, name FROM tags ORDER BY sort_order, id")?;
+    let mut stmt = conn.prepare("SELECT id, name FROM tags WHERE removed = 0 ORDER BY sort_order, id")?;
     let rows = stmt.query_map([], |r| Ok(Tag { id: r.get(0)?, name: r.get(1)? }))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Adds a tag, tried after the existing ones. Its id.
+/// Adds a tag, tried after the existing ones. Its id. A deleted tag of the
+/// same name comes back instead, with its answers and model (but no
+/// folders: those are chosen again).
 pub fn create_tag(conn: &Connection, name: &str) -> Result<i64> {
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "a tag needs a name");
+    let deleted: Option<i64> = conn
+        .query_row("SELECT id FROM tags WHERE name = ?1 AND removed = 1", [name], |r| r.get(0))
+        .optional()?;
+    if let Some(id) = deleted {
+        conn.execute(
+            "UPDATE tags SET removed = 0, name = ?2, sort_order = (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tags)
+             WHERE id = ?1",
+            params![id, name],
+        )?;
+        return Ok(id);
+    }
     conn.execute(
         "INSERT INTO tags (name, sort_order) VALUES (?1, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM tags))",
         [name],
     )
     .with_context(|| format!("there's already a tag called {:?}", name))?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Deletes a tag: its stories go back to their folders, and it's no longer
+/// used or listed. The user's answers about it and its model are kept, in
+/// case a tag of the same name is made again (see `create_tag`).
+pub fn delete_tag(conn: &Connection, tag: i64) -> Result<()> {
+    conn.execute("UPDATE tags SET removed = 1 WHERE id = ?1", [tag])?;
+    conn.execute("DELETE FROM folder_tags WHERE tag_id = ?1", [tag])?;
+    sort_into_tags(conn)?;
+    Ok(())
 }
 
 /// (folder, tag) for every tag turned on for a folder
@@ -326,8 +353,8 @@ where
 {
     const BATCH: usize = 32;
     let since = (chrono::Utc::now() - chrono::Duration::days(RECENT_DAYS)).to_rfc3339();
-    let guard = embedder::shared(model_dir)?;
-    let model = guard.as_ref().expect("just loaded");
+    // Loaded only once there's something to embed
+    let mut guard = None;
     let mut embedded = 0;
     loop {
         let mut stories = Vec::new();
@@ -339,7 +366,10 @@ where
             return Ok(embedded);
         }
         let texts: Vec<String> = stories.iter().map(|(_, text)| text.clone()).collect();
-        let vectors = model.embed(&texts)?;
+        if guard.is_none() {
+            guard = Some(embedder::shared(model_dir)?);
+        }
+        let vectors = guard.as_ref().and_then(|g| g.as_ref()).expect("just loaded").embed(&texts)?;
         let rows: Vec<(i64, Vec<f32>)> = stories.iter().map(|(id, _)| *id).zip(vectors).collect();
         with_conn(&mut |conn| set_embeddings(conn, &rows))?;
         embedded += rows.len();
@@ -507,15 +537,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_deleted_tag_takes_its_data_with_it() {
+    fn a_deleted_tag_keeps_its_answers_and_model_for_next_time() {
+        let conn = archive();
+        let promos = create_tag(&conn, "Promotions").unwrap();
+        let security = create_tag(&conn, "Security").unwrap();
+        add_story(&conn, 1, 10, "Story");
+        set_folder_tag(&conn, 1, promos, true).unwrap();
+        set_label(&conn, 1, promos, Some(true), Source::Trainer).unwrap();
+        sort_into_tags(&conn).unwrap();
+        assert_eq!(tag_of(&conn, 1), Some(promos));
+        delete_tag(&conn, promos).unwrap();
+        assert_eq!(tag_of(&conn, 1), None, "its stories go back to their folders");
+        assert_eq!(tags(&conn).unwrap(), [Tag { id: security, name: "Security".into() }]);
+        assert!(folder_tags(&conn).unwrap().is_empty());
+        // Made again (whatever the case): the same tag, answers and all, last in order
+        assert_eq!(create_tag(&conn, "PROMOTIONS").unwrap(), promos);
+        let names: Vec<String> = tags(&conn).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["Security", "PROMOTIONS"]);
+        assert_eq!(label(&conn, 1, promos).unwrap(), Some(true));
+        assert!(create_tag(&conn, "Promotions").is_err(), "it's back, so the name is taken");
+    }
+
+    #[test]
+    fn a_deleted_story_takes_its_data_with_it() {
         let conn = archive();
         let promos = create_tag(&conn, "Promotions").unwrap();
         add_story(&conn, 1, 10, "Story");
         set_folder_tag(&conn, 1, promos, true).unwrap();
         set_label(&conn, 1, promos, Some(true), Source::Trainer).unwrap();
+        set_embeddings(&conn, &[(1, vec![0.0; crate::embedder::DIMENSIONS])]).unwrap();
         sort_into_tags(&conn).unwrap();
-        conn.execute("DELETE FROM tags WHERE id = ?1", [promos]).unwrap();
-        for table in ["folder_tags", "tag_labels", "story_tags"] {
+        conn.execute("DELETE FROM articles WHERE id = 1", []).unwrap();
+        for table in ["tag_labels", "story_tags", "story_embeddings"] {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0)).unwrap();
             assert_eq!(n, 0, "{}", table);
         }

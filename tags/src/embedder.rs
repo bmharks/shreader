@@ -157,15 +157,23 @@ pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+static EMBEDDER: OnceLock<Mutex<Option<Embedder>>> = OnceLock::new();
+
 /// The loaded model, shared by everything in this program (loading takes a
-/// moment, so it's kept once loaded). Locked while in use.
+/// moment, so it's kept once loaded, until `release`). Locked while in use.
 pub fn shared(dir: &Path) -> Result<std::sync::MutexGuard<'static, Option<Embedder>>> {
-    static EMBEDDER: OnceLock<Mutex<Option<Embedder>>> = OnceLock::new();
     let mut guard = EMBEDDER.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
         *guard = Some(Embedder::load(dir)?);
     }
     Ok(guard)
+}
+
+/// Unloads the model (about 90 MB), if it's loaded.
+pub fn release() {
+    if let Some(embedder) = EMBEDDER.get() {
+        *embedder.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 #[cfg(test)]

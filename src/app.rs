@@ -22,7 +22,7 @@ use crate::icons::{icon, Icon, Tint};
 use crate::spinner::spinner;
 use crate::split::split;
 use crate::on_escape::on_escape;
-use crate::models::{Article, ArticleFilter, Feed, Folder, FeedSyncSummary};
+use crate::models::{Article, ArticleFilter, Feed, Folder, FeedSyncSummary, TagView};
 
 const FOLDER_INPUT_ID: &str = "new_folder_input_id";
 const RENAME_FEED_INPUT_ID: &str = "rename_feed_input_id";
@@ -112,6 +112,8 @@ pub enum ActiveFilter {
     Starred,
     Folder(i64),
     Feed(i64),
+    /// The stories sorted into a tag (see `shreader_tags`)
+    Tag(i64),
 }
 
 pub struct RssApp {
@@ -129,6 +131,10 @@ pub struct RssApp {
     open_article: Option<Article>,
     expanded_folders: HashSet<i64>,
     active_filter: ActiveFilter,
+    /// The tags in use, for the sidebar
+    tag_views: Vec<TagView>,
+    /// (folder, tag) for every tag a folder's stories are sorted into
+    folder_tags: Vec<(i64, i64)>,
     selected_article_id: Option<i64>,
     /// The selected story split into text and images, converted once when
     /// it's opened (too slow to redo on every view rebuild)
@@ -364,6 +370,11 @@ enum InsertEdge {
 pub enum Message {
     SelectFilter(ActiveFilter),
     SelectArticle(i64),
+    /// Stories were sorted into tags in the background (after a refresh):
+    /// how many are in one
+    TagsSorted(Result<usize, String>),
+    /// From the reader: a story is (`true`) or isn't in a tag
+    CorrectTag(i64, i64, bool),
     /// Left/Right arrow: open the previous (`false`) or next (`true`) story
     /// in the list
     SelectAdjacentStory(bool),
@@ -522,6 +533,8 @@ impl RssApp {
             open_article: None,
             expanded_folders: HashSet::new(),
             active_filter: ActiveFilter::All,
+            tag_views: Vec::new(),
+            folder_tags: Vec::new(),
             selected_article_id: None,
             reader_body: None,
             story_images: HashMap::new(),
@@ -640,7 +653,8 @@ impl RssApp {
         };
 
         let open_window = app.open_main_window();
-        (app, Task::batch([open_window, initial_task]))
+        let sort = app.sort_into_tags();
+        (app, Task::batch([open_window, initial_task, sort]))
     }
 
     /// Opens the main window (it's closed while the app runs in the tray).
@@ -678,6 +692,14 @@ impl RssApp {
     }
 
     fn reload_data(&mut self) {
+        self.tag_views = self.db.tag_views().unwrap_or_default();
+        self.folder_tags = self.db.with_conn(|c| shreader_tags::store::folder_tags(c)).unwrap_or_default();
+        if let ActiveFilter::Tag(tag) = self.active_filter {
+            // Deleted in the trainer, or no longer used by any folder
+            if !self.tag_views.iter().any(|t| t.id == tag) {
+                self.active_filter = ActiveFilter::All;
+            }
+        }
         self.folders = self.db.get_folders().unwrap_or_default();
         self.feeds = self.db.get_feeds().unwrap_or_default();
         self.stats = self.db.get_total_stats().unwrap_or((0, 0, 0));
@@ -698,6 +720,7 @@ impl RssApp {
             ActiveFilter::Starred => filter.starred_only = true,
             ActiveFilter::Folder(folder_id) => filter.folder_id = Some(folder_id),
             ActiveFilter::Feed(feed_id) => filter.feed_id = Some(feed_id),
+            ActiveFilter::Tag(tag_id) => filter.tag_id = Some(tag_id),
         }
         filter
     }
@@ -763,6 +786,33 @@ impl RssApp {
 
     fn handle_message(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::TagsSorted(result) => {
+                match result {
+                    Ok(_) => self.reload_data(),
+                    Err(e) => tracing::warn!("Sorting stories into tags failed: {}", e),
+                }
+                Task::none()
+            }
+            Message::CorrectTag(article_id, tag_id, is_tag) => {
+                let name = self.tag_views.iter().find(|t| t.id == tag_id).map(|t| t.name.clone()).unwrap_or_default();
+                match self.db.correct_tag(article_id, tag_id, is_tag) {
+                    Ok(()) => {
+                        self.reload_data();
+                        // It has likely left this view; it stays open to read
+                        if self.open_article.is_none() && self.selected_article_id == Some(article_id) {
+                            self.open_article = self.db.get_article(article_id).ok().flatten();
+                        }
+                        let message = if is_tag {
+                            format!("Moved to {}. The trainer will learn from this.", name)
+                        } else {
+                            format!("Taken out of {}. The trainer will learn from this.", name)
+                        };
+                        self.status_message = Some((message, false));
+                    }
+                    Err(e) => self.status_message = Some((format!("Couldn't change the story's tag: {}", e), true)),
+                }
+                Task::none()
+            }
             Message::SelectFilter(filter) => {
                 self.active_filter = filter;
                 self.article_render_limit = ARTICLE_PAGE_SIZE;
@@ -1486,6 +1536,7 @@ impl RssApp {
                         message += &held_back_note(&summaries);
                         self.status_message = Some((message, !failed.is_empty()));
                         self.reload_data();
+                        return self.sort_into_tags();
                     }
                     Err(e) => {
                         self.status_message = Some((format!("Sync failed: {}", e), true));
@@ -1615,7 +1666,7 @@ impl RssApp {
                     }
                     Err(e) => (format!("Couldn't refresh {}: {}", name, e), true),
                 });
-                Task::none()
+                self.sort_into_tags()
             }
             Message::MarkAllRead => {
                 let (target_feed, target_folder) = match self.active_filter {
@@ -1623,7 +1674,11 @@ impl RssApp {
                     ActiveFilter::Folder(foid) => (None, Some(foid)),
                     _ => (None, None),
                 };
-                let _ = self.db.set_all_articles_read(target_feed, target_folder);
+                if let ActiveFilter::Tag(tag) = self.active_filter {
+                    let _ = self.db.set_tag_read(tag);
+                } else {
+                    let _ = self.db.set_all_articles_read(target_feed, target_folder);
+                }
                 self.reload_data();
                 Task::none()
             }
@@ -2079,6 +2134,21 @@ impl RssApp {
     /// Fetches the given feeds in the background; reports with
     /// `PartialRefreshFinished`. Shares the "syncing" state with Refresh All,
     /// so the two never run at once.
+    /// Embeds new stories in folders with tags and sorts stories into tags,
+    /// in the background (see `sort_stories`). After every refresh, and at
+    /// start (the trainer may have put a new model to use).
+    fn sort_into_tags(&self) -> Task<Message> {
+        let db = self.db.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || sort_stories(&db).map_err(|e| format!("{:#}", e)))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::TagsSorted,
+        )
+    }
+
     fn refresh_feeds(&mut self, name: String, feed_ids: Vec<i64>) -> Task<Message> {
         if self.is_syncing() {
             self.status_message =
@@ -2114,6 +2184,13 @@ impl RssApp {
         article.is_read = true;
         let feed_id = article.feed_id;
 
+        // A tagged story counts in its tag, not its feed and folder
+        if let Some(tag_id) = article.tag_id {
+            if let Some(tag) = self.tag_views.iter_mut().find(|t| t.id == tag_id) {
+                tag.unread_count = (tag.unread_count - 1).max(0);
+            }
+            return;
+        }
         self.stats.2 = (self.stats.2 - 1).max(0);
         if let Some(feed) = self.feeds.iter_mut().find(|f| f.id == feed_id) {
             feed.unread_count = (feed.unread_count - 1).max(0);
@@ -3511,7 +3588,15 @@ impl RssApp {
             &self.starred_total.to_string(),
         );
 
-        let categories = column![all_btn, unread_btn, starred_btn].spacing(4);
+        let mut categories = column![all_btn, unread_btn, starred_btn].spacing(4);
+        // Stories sorted out of their folders (see the trainer)
+        if !self.tag_views.is_empty() {
+            categories = categories.push(text("TAGS").size(11).style(text::secondary));
+            for tag in &self.tag_views {
+                let badge = if tag.unread_count > 0 { tag.unread_count.to_string() } else { String::new() };
+                categories = categories.push(self.filter_button(ActiveFilter::Tag(tag.id), Some(Icon::Tag), &tag.name, &badge));
+            }
+        }
 
         // Subscriptions & Folders Header
         let subscriptions_header = row![
@@ -3889,11 +3974,18 @@ impl RssApp {
                     .unwrap_or("Feed");
                 format!("{} ({})", name, self.article_total)
             }
+            ActiveFilter::Tag(tid) => {
+                let name = self.tag_views.iter().find(|t| t.id == tid).map(|t| t.name.as_str()).unwrap_or("Tag");
+                format!("{} ({})", name, self.article_total)
+            }
         };
 
         let mut header_label = row![].spacing(6).align_y(Alignment::Center).width(Length::Fill);
         if matches!(self.active_filter, ActiveFilter::Folder(_)) {
             header_label = header_label.push(icon(Icon::Folder, 14.0, Tint::Text));
+        }
+        if matches!(self.active_filter, ActiveFilter::Tag(_)) {
+            header_label = header_label.push(icon(Icon::Tag, 14.0, Tint::Text));
         }
         header_label = header_label.push(text(list_header_label).size(14));
 
@@ -4111,6 +4203,40 @@ impl RssApp {
                 ]
                 .spacing(8);
 
+                // Correcting its tag: taking it out of the one it's in, or
+                // moving it into one its folder uses
+                let story_folder = feed.and_then(|f| f.folder_id);
+                match art.tag_id.and_then(|t| self.tag_views.iter().find(|v| v.id == t)) {
+                    Some(tag) => {
+                        action_row = action_row.push(
+                            button(
+                                row![icon(Icon::Tag, 12.0, Tint::OnSecondary), text(format!("Not in {}", tag.name)).size(12)]
+                                    .spacing(5)
+                                    .align_y(Alignment::Center),
+                            )
+                            .padding([4, 10])
+                            .style(button::secondary)
+                            .on_press(Message::CorrectTag(art.id, tag.id, false)),
+                        );
+                    }
+                    None => {
+                        for tag in self.tag_views.iter().filter(|t| {
+                            story_folder.is_some_and(|f| self.folder_tags.contains(&(f, t.id)))
+                        }) {
+                            action_row = action_row.push(
+                                button(
+                                    row![icon(Icon::Tag, 12.0, Tint::OnSecondary), text(format!("Move to {}", tag.name)).size(12)]
+                                        .spacing(5)
+                                        .align_y(Alignment::Center),
+                                )
+                                .padding([4, 10])
+                                .style(button::secondary)
+                                .on_press(Message::CorrectTag(art.id, tag.id, true)),
+                            );
+                        }
+                    }
+                }
+
                 if let Some(url) = art.url {
                     let open_btn = button(
                         row![
@@ -4201,6 +4327,23 @@ impl RssApp {
     pub fn theme(&self, _window: iced::window::Id) -> Theme {
         Theme::Dark
     }
+}
+
+/// Embeds the stories in folders with tags that need it, then sorts stories
+/// into tags (see `shreader_tags::store`). Embedding needs the language
+/// model, which the trainer downloads; without it, stories are sorted by
+/// your answers and the embeddings there are. The model is unloaded after
+/// (about 90 MB, only needed for a moment after each refresh).
+fn sort_stories(db: &Database) -> anyhow::Result<usize> {
+    use shreader_tags::{embedder, store};
+    let has_tags = !db.with_conn(|c| store::folder_tags(c))?.is_empty();
+    let dir = embedder::model_dir(db.path());
+    if has_tags && embedder::model_present(&dir) {
+        let embedded = store::embed_new_stories(|f| db.with_conn(|c| f(c)), &dir);
+        embedder::release();
+        embedded?;
+    }
+    db.with_conn(|c| store::sort_into_tags(c))
 }
 
 fn format_date(dt: DateTime<Utc>) -> String {
@@ -4774,6 +4917,74 @@ mod tests {
         assert_eq!(label(720), "12 hours");
         assert_eq!(label(1440), "1 day");
         assert_eq!(label(2880), "2 days");
+    }
+
+    /// A tagged story is shown in its tag instead of its folder, and
+    /// correcting it from the reader moves it, keeping it open.
+    #[tokio::test]
+    async fn tagged_stories_leave_their_folder_for_the_tag() {
+        use shreader_tags::store;
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let folder = db.create_folder("Tech").unwrap();
+        let feed = db.add_or_update_feed("https://t.example/rss", "T", None, None, Some(folder)).unwrap();
+        for n in 0..4 {
+            let hash = format!("story-{}", n);
+            db.upsert_article(feed, None, &hash, &hash, None, None, None, None, None, None, None).unwrap();
+        }
+        let ids: Vec<i64> = db.get_articles(&Default::default()).unwrap().iter().map(|a| a.id).collect();
+        let tag = db.with_conn(|c| {
+            let tag = store::create_tag(c, "Promotions").unwrap();
+            store::set_folder_tag(c, folder, tag, true).unwrap();
+            store::set_label(c, ids[0], tag, Some(true), store::Source::Trainer).unwrap();
+            store::sort_into_tags(c).unwrap();
+            tag
+        });
+
+        let (mut app, _) = RssApp::new(db.clone(), false);
+        assert_eq!(app.active_filter, super::ActiveFilter::Folder(folder));
+        assert_eq!(app.articles.len(), 3);
+        assert!(app.articles.iter().all(|a| a.id != ids[0]));
+        assert_eq!((app.folders[0].unread_count, app.folders[0].total_count), (3, 3));
+        assert_eq!(app.stats.1, 3, "All Stories leaves it out too");
+        assert_eq!(app.tag_views.len(), 1);
+        assert_eq!((app.tag_views[0].name.as_str(), app.tag_views[0].unread_count), ("Promotions", 1));
+
+        // Reading it there counts against the tag, not the folder
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::Tag(tag)));
+        assert_eq!(app.articles.iter().map(|a| a.id).collect::<Vec<_>>(), [ids[0]]);
+        let _ = app.update(super::Message::SelectArticle(ids[0]));
+        assert_eq!(app.tag_views[0].unread_count, 0);
+        assert_eq!(app.folders[0].unread_count, 3);
+
+        // "Not in Promotions": back in its folder, still open, and remembered
+        let _ = app.update(super::Message::CorrectTag(ids[0], tag, false));
+        assert!(app.articles.is_empty());
+        assert_eq!(app.open_article.as_ref().map(|a| a.id), Some(ids[0]));
+        assert_eq!(db.with_conn(|c| store::label(c, ids[0], tag)).unwrap(), Some(false));
+        assert_eq!(app.folders[0].total_count, 4);
+
+        // "Move to Promotions" on a story in the folder
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::Folder(folder)));
+        let _ = app.update(super::Message::SelectArticle(ids[2]));
+        let _ = app.update(super::Message::CorrectTag(ids[2], tag, true));
+        assert_eq!(app.articles.len(), 3);
+        assert_eq!(app.tag_views[0].total_count, 1);
+        assert_eq!(app.open_article.as_ref().map(|a| (a.id, a.tag_id)), Some((ids[2], Some(tag))));
+
+        // Mark All Read in the folder leaves the tag's story alone
+        let _ = app.update(super::Message::MarkAllRead);
+        assert_eq!(app.folders[0].unread_count, 0);
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::Tag(tag)));
+        let _ = app.update(super::Message::MarkAllRead);
+        assert_eq!(app.tag_views[0].unread_count, 0);
+
+        // A tag no folder uses any more goes from the sidebar (and its view)
+        db.with_conn(|c| store::set_folder_tag(c, folder, tag, false)).unwrap();
+        let _ = app.update(super::Message::TagsSorted(Ok(0)));
+        let _ = app.update(super::Message::TagsSorted(db.with_conn(|c| store::sort_into_tags(c)).map_err(|e| e.to_string())));
+        assert!(app.tag_views.is_empty());
+        assert_eq!(app.active_filter, super::ActiveFilter::All);
+        assert_eq!(app.articles.len(), 4);
     }
 }
 

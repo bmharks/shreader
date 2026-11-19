@@ -35,6 +35,8 @@ pub struct Trainer {
     tag: Option<i64>,
     /// The name being typed for a new tag
     new_tag: Option<String>,
+    /// Asking whether to delete the tag
+    confirm_delete: bool,
     folders: Vec<Folder>,
     folder_tags: Vec<(i64, i64)>,
     /// The tag's stories still to review (newest first), with embeddings
@@ -97,6 +99,10 @@ pub enum Message {
     CreateTag,
     CancelNewTag,
     TagCreated(Result<i64, String>),
+    AskDeleteTag,
+    CancelDeleteTag,
+    DeleteTag,
+    TagDeleted(Result<(), String>),
     ToggleFolder(i64, bool),
     FolderToggled(Result<(), String>),
     TagLoaded(Result<TagData, String>),
@@ -146,6 +152,7 @@ impl Trainer {
             tags: Vec::new(),
             tag: None,
             new_tag: None,
+            confirm_delete: false,
             folders: Vec::new(),
             folder_tags: Vec::new(),
             candidates: Vec::new(),
@@ -317,6 +324,7 @@ impl Trainer {
                 self.load_tag()
             }
             Message::PickTag(TagChoice(tag)) => {
+                self.confirm_delete = false;
                 if self.tag != Some(tag.id) {
                     self.tag = Some(tag.id);
                     self.draft = None;
@@ -354,6 +362,35 @@ impl Trainer {
                 self.current = None;
                 self.pending = None;
                 self.queue.clear();
+                self.load()
+            }
+            Message::AskDeleteTag => {
+                self.confirm_delete = true;
+                Task::none()
+            }
+            Message::CancelDeleteTag => {
+                self.confirm_delete = false;
+                Task::none()
+            }
+            Message::DeleteTag => {
+                self.confirm_delete = false;
+                let Some(tag) = self.tag else { return Task::none() };
+                let archive = self.archive.clone();
+                blocking(move || store::delete_tag(&archive.lock(), tag), Message::TagDeleted)
+            }
+            Message::TagDeleted(Ok(())) => {
+                self.notice = Some(format!(
+                    "Deleted {}. Its stories are back in their folders. Your answers and its model are kept: make a tag called {} again to get them back.",
+                    self.tag_name(),
+                    self.tag_name()
+                ));
+                self.tag = None;
+                self.draft = None;
+                self.undo.clear();
+                self.current = None;
+                self.pending = None;
+                self.queue.clear();
+                self.candidates.clear();
                 self.load()
             }
             Message::ToggleFolder(folder, on) => {
@@ -520,6 +557,7 @@ impl Trainer {
             }
             Message::Loaded(Err(e))
             | Message::TagCreated(Err(e))
+            | Message::TagDeleted(Err(e))
             | Message::FolderToggled(Err(e))
             | Message::TagLoaded(Err(e))
             | Message::Searched(Err(e))
@@ -609,6 +647,31 @@ impl Trainer {
             let on = self.folder_tags.contains(&(folder.id, tag));
             side = side.push(checkbox(&folder.name, on).on_toggle(move |on| Message::ToggleFolder(folder.id, on)).size(16).text_size(14));
         }
+
+        side = side.push(if self.confirm_delete {
+            Element::from(
+                column![
+                    text(format!(
+                        "Delete {}? Its stories go back to their folders. Your answers and its model are kept, and come back if you make a tag called {} again.",
+                        self.tag_name(),
+                        self.tag_name()
+                    ))
+                    .size(13),
+                    row![
+                        button(text("Delete")).style(button::danger).on_press(Message::DeleteTag),
+                        button(text("Cancel")).style(button::secondary).on_press(Message::CancelDeleteTag),
+                    ]
+                    .spacing(6),
+                ]
+                .spacing(6),
+            )
+        } else {
+            button(text("Delete this tag…").size(13).style(text::secondary))
+                .style(button::text)
+                .padding([2, 0])
+                .on_press(Message::AskDeleteTag)
+                .into()
+        });
 
         side = side
             .push(Space::with_height(8))
