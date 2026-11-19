@@ -101,8 +101,10 @@ pub enum Message {
     TagCreated(Result<i64, String>),
     AskDeleteTag,
     CancelDeleteTag,
-    DeleteTag,
-    TagDeleted(Result<(), String>),
+    /// Deletes the tag; `true`: keeping the answers about it and its model
+    DeleteTag(bool),
+    /// Whether the answers and model were kept
+    TagDeleted(Result<bool, String>),
     ToggleFolder(i64, bool),
     FolderToggled(Result<(), String>),
     TagLoaded(Result<TagData, String>),
@@ -372,18 +374,33 @@ impl Trainer {
                 self.confirm_delete = false;
                 Task::none()
             }
-            Message::DeleteTag => {
+            Message::DeleteTag(keep_training) => {
                 self.confirm_delete = false;
                 let Some(tag) = self.tag else { return Task::none() };
                 let archive = self.archive.clone();
-                blocking(move || store::delete_tag(&archive.lock(), tag), Message::TagDeleted)
+                blocking(
+                    move || {
+                        let conn = archive.lock();
+                        if keep_training {
+                            store::delete_tag(&conn, tag)?;
+                        } else {
+                            store::delete_tag_and_training(&conn, tag)?;
+                        }
+                        Ok(keep_training)
+                    },
+                    Message::TagDeleted,
+                )
             }
-            Message::TagDeleted(Ok(())) => {
-                self.notice = Some(format!(
-                    "Deleted {}. Its stories are back in their folders. Your answers and its model are kept: make a tag called {} again to get them back.",
-                    self.tag_name(),
-                    self.tag_name()
-                ));
+            Message::TagDeleted(Ok(kept)) => {
+                self.notice = Some(if kept {
+                    format!(
+                        "Deleted {}. Its stories are back in their folders. Your answers and its model are kept: make a tag called {} again to get them back.",
+                        self.tag_name(),
+                        self.tag_name()
+                    )
+                } else {
+                    format!("Deleted {}, your answers about it and its model. Its stories are back in their folders.", self.tag_name())
+                });
                 self.tag = None;
                 self.draft = None;
                 self.undo.clear();
@@ -652,16 +669,21 @@ impl Trainer {
             Element::from(
                 column![
                     text(format!(
-                        "Delete {}? Its stories go back to their folders. Your answers and its model are kept, and come back if you make a tag called {} again.",
-                        self.tag_name(),
+                        "Delete {}? Its stories go back to their folders (no stories are deleted).",
                         self.tag_name()
                     ))
                     .size(13),
-                    row![
-                        button(text("Delete")).style(button::danger).on_press(Message::DeleteTag),
-                        button(text("Cancel")).style(button::secondary).on_press(Message::CancelDeleteTag),
-                    ]
-                    .spacing(6),
+                    button(text("Delete the tag, keep its answers and model").size(13))
+                        .width(Length::Fill)
+                        .style(button::secondary)
+                        .on_press(Message::DeleteTag(true)),
+                    text(format!("Making a tag called {} again brings them back.", self.tag_name())).size(12).style(text::secondary),
+                    button(text("Delete the tag, its answers and its model").size(13))
+                        .width(Length::Fill)
+                        .style(button::danger)
+                        .on_press(Message::DeleteTag(false)),
+                    text("For good: a new tag would start from nothing.").size(12).style(text::secondary),
+                    button(text("Cancel").size(13)).style(button::text).on_press(Message::CancelDeleteTag),
                 ]
                 .spacing(6),
             )

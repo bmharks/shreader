@@ -208,6 +208,7 @@ pub struct RssApp {
 
     // Folder context menu (right click) and in-place rename
     folder_menu: Option<FolderMenu>,
+    tag_menu: Option<TagMenu>,
     renaming_folder: Option<(i64, String)>,     // (folder_id, edited name)
     drag_hover_target: Option<DropTarget>,
 }
@@ -244,6 +245,14 @@ struct FolderMenu {
     folder_id: i64,
     /// Showing the "are you sure?" step for Delete
     confirm_delete: bool,
+}
+
+/// The open right-click menu for a tag in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TagMenu {
+    tag_id: i64,
+    /// Asking how to delete it: how many answers the user has given about it
+    confirm_delete: Option<i64>,
 }
 
 /// State of the "Edit feed" dialog.
@@ -466,6 +475,13 @@ pub enum Message {
     NewFolderInputChanged(String),
     CreateFolderClicked,
     DeleteFolder(i64),
+    OpenTagMenu(i64),
+    CloseTagMenu,
+    AskDeleteTag(i64),
+    /// Deletes a tag; `keep_training`: keep the user's answers about it and
+    /// its model (they come back with a tag of the same name)
+    DeleteTag { tag_id: i64, keep_training: bool },
+    SetTagRead(i64),
     OpenFolderMenu(i64),
     CloseFolderMenu,
     AskDeleteFolder(i64),
@@ -573,6 +589,7 @@ impl RssApp {
             article_menu: None,
             article_list_width: ARTICLE_LIST_DEFAULT_WIDTH,
             folder_menu: None,
+            tag_menu: None,
             renaming_folder: None,
             drag_hover_target: None,
         };
@@ -905,6 +922,7 @@ impl RssApp {
                 };
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 let id = self.articles[target].id;
                 let from = current.map(|i| self.articles[i].id);
@@ -954,6 +972,7 @@ impl RssApp {
             Message::OpenReaderTextMenu(index, position) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = Some(index);
                 self.pressed_link = None;
@@ -1048,6 +1067,7 @@ impl RssApp {
             Message::OpenSettings => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = None;
                 self.settings = Some(SettingsState {
@@ -1267,6 +1287,7 @@ impl RssApp {
             Message::OpenAddFeed => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 let folder_id = self.default_new_feed_folder();
                 self.add_feed = Some(AddFeedDialog {
@@ -1454,6 +1475,7 @@ impl RssApp {
                 }
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = None;
                 match self.main_window.take() {
@@ -1565,6 +1587,7 @@ impl RssApp {
             Message::OpenArticleMenu(article_id) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.reader_text_menu = None;
                 self.article_menu = Some(article_id);
                 Task::none()
@@ -1595,6 +1618,7 @@ impl RssApp {
             }
             Message::SetFolderRead(folder_id, is_read) => {
                 self.folder_menu = None;
+                self.tag_menu = None;
                 if let Err(e) = self.db.set_articles_read_state(None, Some(folder_id), is_read) {
                     self.status_message = Some((format!("Failed to update stories: {}", e), true));
                 }
@@ -1613,6 +1637,7 @@ impl RssApp {
             }
             Message::RefreshFolder(folder_id) => {
                 self.folder_menu = None;
+                self.tag_menu = None;
                 let name = self
                     .folders
                     .iter()
@@ -1710,6 +1735,7 @@ impl RssApp {
             }
             Message::OpenFeedMenu(feed_id) => {
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = None;
                 self.feed_menu = Some(FeedMenu { feed_id, page: FeedMenuPage::Main });
@@ -1854,6 +1880,9 @@ impl RssApp {
                         .confirm_delete
                         .then_some(FolderMenu { confirm_delete: false, ..menu });
                 }
+                if let Some(menu) = self.tag_menu {
+                    self.tag_menu = menu.confirm_delete.map(|_| TagMenu { confirm_delete: None, ..menu });
+                }
                 Task::none()
             }
             Message::OpenUrl(url) => {
@@ -1924,6 +1953,7 @@ impl RssApp {
             }
             Message::DeleteFolder(folder_id) => {
                 self.folder_menu = None;
+                self.tag_menu = None;
                 if self.renaming_folder.as_ref().is_some_and(|(id, _)| *id == folder_id) {
                     self.renaming_folder = None;
                 }
@@ -1955,8 +1985,59 @@ impl RssApp {
                 self.reload_data();
                 Task::none()
             }
+            Message::OpenTagMenu(tag_id) => {
+                self.feed_menu = None;
+                self.folder_menu = None;
+                self.article_menu = None;
+                self.reader_text_menu = None;
+                self.tag_menu = Some(TagMenu { tag_id, confirm_delete: None });
+                Task::none()
+            }
+            Message::CloseTagMenu => {
+                self.tag_menu = None;
+                Task::none()
+            }
+            Message::AskDeleteTag(tag_id) => {
+                let answers = self.db.with_conn(|c| shreader_tags::store::answer_count(c, tag_id)).unwrap_or(0);
+                self.tag_menu = Some(TagMenu { tag_id, confirm_delete: Some(answers) });
+                Task::none()
+            }
+            Message::DeleteTag { tag_id, keep_training } => {
+                self.tag_menu = None;
+                let name = self.tag_views.iter().find(|t| t.id == tag_id).map(|t| t.name.clone()).unwrap_or_default();
+                let result = self.db.with_conn(|c| {
+                    if keep_training {
+                        shreader_tags::store::delete_tag(c, tag_id)
+                    } else {
+                        shreader_tags::store::delete_tag_and_training(c, tag_id)
+                    }
+                });
+                self.status_message = Some(match result {
+                    Ok(()) if keep_training => (
+                        format!(
+                            "Deleted the {} tag; its stories are back in their folders. Its answers and model are kept: make a tag called {} in the trainer to get them back.",
+                            name, name
+                        ),
+                        false,
+                    ),
+                    Ok(()) => (
+                        format!("Deleted the {} tag, its answers and its model; its stories are back in their folders.", name),
+                        false,
+                    ),
+                    Err(e) => (format!("Couldn't delete the {} tag: {}", name, e), true),
+                });
+                self.reload_data();
+                Task::none()
+            }
+            Message::SetTagRead(tag_id) => {
+                self.tag_menu = None;
+                let _ = self.db.set_tag_read(tag_id);
+                self.reload_data();
+                Task::none()
+            }
             Message::OpenFolderMenu(folder_id) => {
                 self.feed_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = None;
                 self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false });
@@ -1964,6 +2045,7 @@ impl RssApp {
             }
             Message::CloseFolderMenu => {
                 self.folder_menu = None;
+                self.tag_menu = None;
                 Task::none()
             }
             Message::AskDeleteFolder(folder_id) => {
@@ -1972,6 +2054,7 @@ impl RssApp {
             }
             Message::StartRenameFolder(folder_id) => {
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.renaming_feed = None;
                 let name = self
                     .folders
@@ -2025,6 +2108,7 @@ impl RssApp {
             Message::DragFeedStarted(feed_id) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.dragging_feed = Some(feed_id);
                 self.drag_hover_target = None;
@@ -2035,6 +2119,7 @@ impl RssApp {
             Message::DragFolderStarted(folder_id) => {
                 self.feed_menu = None;
                 self.folder_menu = None;
+                self.tag_menu = None;
                 self.article_menu = None;
                 self.dragging_folder = Some(folder_id);
                 self.drag_hover_target = None;
@@ -3305,6 +3390,72 @@ impl RssApp {
         )
     }
 
+    /// Contents of a tag's right-click menu. Deleting asks whether to keep
+    /// the answers and model (`confirm_delete`: how many answers there are).
+    fn tag_menu_view<'a>(&'a self, tag: &'a TagView, confirm_delete: Option<i64>) -> Element<'a, Message> {
+        if let Some(answers) = confirm_delete {
+            let answers_text = match answers {
+                0 => "You haven't answered about any stories for it yet.".to_string(),
+                1 => "You've answered about 1 story for it, in the trainer or here.".to_string(),
+                n => format!("You've answered about {} stories for it, in the trainer or here.", n),
+            };
+            let body = column![
+                text(format!("Delete the {} tag?", tag.name)).size(13),
+                text(format!("Its {} stories go back to their folders. No stories are deleted.", tag.total_count))
+                    .size(11)
+                    .style(text::secondary),
+                text(answers_text).size(11).style(text::secondary),
+                button(
+                    column![
+                        text("Delete the tag, keep its answers and model").size(12),
+                        text(format!("Making a tag called {} in the trainer brings them back", tag.name)).size(11),
+                    ]
+                    .spacing(2),
+                )
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(button::secondary)
+                .on_press(Message::DeleteTag { tag_id: tag.id, keep_training: true }),
+                button(
+                    column![
+                        text("Delete the tag, its answers and its model").size(12),
+                        text("For good: a new tag would start from nothing").size(11),
+                    ]
+                    .spacing(2),
+                )
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(button::danger)
+                .on_press(Message::DeleteTag { tag_id: tag.id, keep_training: false }),
+                row![
+                    horizontal_space(),
+                    button(text("Cancel").size(12))
+                        .padding([4, 10])
+                        .style(button::text)
+                        .on_press(Message::CloseTagMenu),
+                ],
+            ]
+            .spacing(8)
+            .padding(8);
+            return menu_card(body, 300.0);
+        }
+        let body = column![
+            button(text("Mark as read").size(13))
+                .width(Length::Fill)
+                .padding([5, 10])
+                .style(button::text)
+                .on_press_maybe((tag.unread_count > 0).then_some(Message::SetTagRead(tag.id))),
+            horizontal_rule(1),
+            button(text("Delete…").size(13))
+                .width(Length::Fill)
+                .padding([5, 10])
+                .style(button::text)
+                .on_press(Message::AskDeleteTag(tag.id)),
+        ]
+        .spacing(2);
+        menu_card(body, 160.0)
+    }
+
     /// Contents of a folder's right-click menu.
     fn folder_menu_view<'a>(&'a self, folder: &'a Folder, confirm_delete: bool) -> Element<'a, Message> {
         if confirm_delete {
@@ -3594,7 +3745,14 @@ impl RssApp {
             categories = categories.push(text("TAGS").size(11).style(text::secondary));
             for tag in &self.tag_views {
                 let badge = if tag.unread_count > 0 { tag.unread_count.to_string() } else { String::new() };
-                categories = categories.push(self.filter_button(ActiveFilter::Tag(tag.id), Some(Icon::Tag), &tag.name, &badge));
+                let menu = self.tag_menu.filter(|m| m.tag_id == tag.id).map(|m| self.tag_menu_view(tag, m.confirm_delete));
+                categories = categories.push(
+                    context_menu(self.filter_button(ActiveFilter::Tag(tag.id), Some(Icon::Tag), &tag.name, &badge))
+                        .menu(menu)
+                        .on_dismiss(Message::CloseTagMenu)
+                        .on_escape(Message::EscapePressed)
+                        .on_right_press(Message::OpenTagMenu(tag.id)),
+                );
             }
         }
 
@@ -4985,6 +5143,38 @@ mod tests {
         assert!(app.tag_views.is_empty());
         assert_eq!(app.active_filter, super::ActiveFilter::All);
         assert_eq!(app.articles.len(), 4);
+
+        // Deleting from its right-click menu, keeping its answers and model
+        db.with_conn(|c| {
+            store::set_folder_tag(c, folder, tag, true).unwrap();
+            store::sort_into_tags(c).unwrap();
+        });
+        let _ = app.update(super::Message::TagsSorted(Ok(1)));
+        assert_eq!(app.tag_views.len(), 1);
+        let _ = app.update(super::Message::OpenTagMenu(tag));
+        let _ = app.update(super::Message::AskDeleteTag(tag));
+        assert_eq!(app.tag_menu.and_then(|m| m.confirm_delete), Some(2), "two answers: one from the trainer, one here");
+        let _ = app.update(super::Message::EscapePressed);
+        assert_eq!(app.tag_menu.map(|m| m.confirm_delete), Some(None), "Esc goes back to the menu");
+        let _ = app.update(super::Message::DeleteTag { tag_id: tag, keep_training: true });
+        assert!(app.tag_views.is_empty() && app.tag_menu.is_none());
+        assert_eq!(app.active_filter, super::ActiveFilter::All);
+        assert_eq!(app.articles.len(), 4, "its story is back");
+        assert_eq!(db.with_conn(|c| store::answer_count(c, tag)).unwrap(), 2);
+        // Made again (as in the trainer): back, answers and all; then deleted for good
+        let again = db.with_conn(|c| {
+            let again = store::create_tag(c, "Promotions").unwrap();
+            store::set_folder_tag(c, folder, again, true).unwrap();
+            store::sort_into_tags(c).unwrap();
+            again
+        });
+        assert_eq!(again, tag);
+        let _ = app.update(super::Message::TagsSorted(Ok(1)));
+        assert_eq!(app.tag_views[0].total_count, 1);
+        let _ = app.update(super::Message::DeleteTag { tag_id: tag, keep_training: false });
+        assert!(app.tag_views.is_empty());
+        assert_eq!(db.with_conn(|c| store::answer_count(c, tag)).unwrap(), 0);
+        assert_eq!(db.get_articles(&Default::default()).unwrap().len(), 4, "no stories deleted");
     }
 }
 

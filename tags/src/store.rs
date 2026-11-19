@@ -140,6 +140,20 @@ pub fn delete_tag(conn: &Connection, tag: i64) -> Result<()> {
     Ok(())
 }
 
+/// Deletes a tag for good, with the user's answers about it and its model.
+/// Its stories go back to their folders (the stories themselves stay).
+pub fn delete_tag_and_training(conn: &Connection, tag: i64) -> Result<()> {
+    // The answers, model, folders and sorted stories go with it (cascade)
+    conn.execute("DELETE FROM tags WHERE id = ?1", [tag])?;
+    sort_into_tags(conn)?;
+    Ok(())
+}
+
+/// How many answers the user has given about a tag
+pub fn answer_count(conn: &Connection, tag: i64) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM tag_labels WHERE tag_id = ?1", [tag], |r| r.get(0))?)
+}
+
 /// (folder, tag) for every tag turned on for a folder
 pub fn folder_tags(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     let mut stmt = conn.prepare("SELECT folder_id, tag_id FROM folder_tags")?;
@@ -556,6 +570,39 @@ pub(crate) mod tests {
         assert_eq!(names, ["Security", "PROMOTIONS"]);
         assert_eq!(label(&conn, 1, promos).unwrap(), Some(true));
         assert!(create_tag(&conn, "Promotions").is_err(), "it's back, so the name is taken");
+    }
+
+    #[test]
+    fn a_tag_can_be_deleted_with_its_answers_and_model() {
+        let conn = archive();
+        let promos = create_tag(&conn, "Promotions").unwrap();
+        let security = create_tag(&conn, "Security").unwrap();
+        for id in 1..=2 {
+            add_story(&conn, id, 10, "Story");
+        }
+        set_folder_tag(&conn, 1, promos, true).unwrap();
+        set_label(&conn, 1, promos, Some(true), Source::Trainer).unwrap();
+        set_label(&conn, 2, security, Some(true), Source::Trainer).unwrap();
+        // A plain model that tags nothing (threshold above any score)
+        let mut bytes = b"SHTAG1\x00".to_vec();
+        for v in [2.0f32, 0.0].into_iter().chain(std::iter::repeat_n(0.0, crate::embedder::DIMENSIONS)) {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        conn.execute("INSERT INTO tag_models (tag_id, model, summary) VALUES (?1, ?2, '')", params![promos, bytes]).unwrap();
+        assert!(model(&conn, promos).unwrap().is_some());
+        sort_into_tags(&conn).unwrap();
+        assert_eq!(answer_count(&conn, promos).unwrap(), 1);
+        delete_tag_and_training(&conn, promos).unwrap();
+        assert_eq!(tag_of(&conn, 1), None);
+        assert_eq!(answer_count(&conn, promos).unwrap(), 0);
+        assert!(model(&conn, promos).unwrap().is_none());
+        assert_eq!(label(&conn, 2, security).unwrap(), Some(true), "other tags' answers stay");
+        let stories: i64 = conn.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0)).unwrap();
+        assert_eq!(stories, 2);
+        // A new tag of the name starts afresh
+        let again = create_tag(&conn, "Promotions").unwrap();
+        assert_ne!(again, promos);
+        assert_eq!(answer_count(&conn, again).unwrap(), 0);
     }
 
     #[test]
