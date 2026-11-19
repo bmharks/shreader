@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 pub struct Folder {
     pub id: i64,
     pub name: String,
+    /// Its stories are grouped (only with each other)
+    pub grouping: bool,
     pub feed_count: i64,
     pub unread_count: i64,
     pub total_count: i64,

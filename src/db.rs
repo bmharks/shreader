@@ -344,6 +344,17 @@ impl Database {
         // Migration: each story's group (see story_groups.rs)
         let _ = conn.execute("ALTER TABLE articles ADD COLUMN group_id INTEGER", []);
         let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_group ON articles(group_id)", []);
+        // Migration: grouping is chosen per folder, and each folder's stories
+        // are compared only with each other. Labels, groups and the model
+        // from when every story was compared with every other don't carry
+        // over: cleared once (stories and their embeddings are kept).
+        if conn.execute("ALTER TABLE folders ADD COLUMN grouping INTEGER NOT NULL DEFAULT 0", []).is_ok() {
+            conn.execute_batch(
+                "DELETE FROM pair_labels;
+                 UPDATE articles SET group_id = NULL WHERE group_id IS NOT NULL;
+                 DELETE FROM settings WHERE key IN ('grouping_model', 'grouping_model_info');",
+            )?;
+        }
         // Migration: how much each feed has added today (UTC), for the daily
         // allowance that stops one feed from filling the disk
         let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_day TEXT", []);
@@ -462,12 +473,22 @@ impl Database {
         // Deleting the folder automatically unlinks feeds (folder_id becomes NULL),
         // preserving all feeds and archived stories.
         tx.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+        // What its grouping learned (its stories' groups and labels go with
+        // `tidy_groups` and their stories)
+        tx.execute(
+            "DELETE FROM settings WHERE key IN (?1, ?2)",
+            params![
+                crate::story_groups::model_setting(folder_id),
+                crate::story_groups::model_info_setting(folder_id)
+            ],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn set_feed_folder(&self, feed_id: i64, folder_id: Option<i64>) -> Result<()> {
         let conn = self.lock();
+        Self::leave_groups_if_moving(&conn, feed_id, folder_id)?;
         conn.execute(
             // Clearing sort_order places the feed after any manually arranged
             // feeds in its new folder (or alphabetically if none are arranged)
@@ -487,6 +508,7 @@ impl Database {
             let mut stmt =
                 tx.prepare("UPDATE feeds SET folder_id = ?1, sort_order = ?2 WHERE id = ?3")?;
             for (position, feed_id) in ordered_feed_ids.iter().enumerate() {
+                Self::leave_groups_if_moving(&tx, *feed_id, folder_id)?;
                 stmt.execute(params![folder_id, position as i64, feed_id])?;
             }
         }
@@ -508,19 +530,33 @@ impl Database {
         Ok(())
     }
 
+    /// Before feed `feed_id` moves to `folder_id`: if that's another folder,
+    /// its stories leave their groups, which are its old folder's (they're
+    /// grouped again in the new one, if it's grouped; see `tidy_groups` for
+    /// what's left of the groups).
+    fn leave_groups_if_moving(conn: &rusqlite::Connection, feed_id: i64, folder_id: Option<i64>) -> Result<()> {
+        conn.execute(
+            "UPDATE articles SET group_id = NULL
+             WHERE feed_id = ?1 AND group_id IS NOT NULL
+               AND (SELECT folder_id FROM feeds WHERE id = ?1) IS NOT ?2",
+            params![feed_id, folder_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_folders(&self) -> Result<Vec<Folder>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             r#"
             SELECT 
-                fo.id, fo.name,
+                fo.id, fo.name, fo.grouping,
                 COUNT(DISTINCT fe.id) as feed_count,
                 COALESCE(SUM(CASE WHEN a.is_read = 0 THEN 1 ELSE 0 END), 0) as unread_count,
                 COALESCE(COUNT(a.id), 0) as total_count
             FROM folders fo
             LEFT JOIN feeds fe ON fe.folder_id = fo.id
             LEFT JOIN articles a ON a.feed_id = fe.id
-            GROUP BY fo.id, fo.name
+            GROUP BY fo.id, fo.name, fo.grouping
             ORDER BY fo.sort_order IS NULL, fo.sort_order, fo.name COLLATE NOCASE ASC
             "#,
         )?;
@@ -529,9 +565,10 @@ impl Database {
             Ok(Folder {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                feed_count: row.get(2)?,
-                unread_count: row.get(3)?,
-                total_count: row.get(4)?,
+                grouping: row.get::<_, i64>(2)? != 0,
+                feed_count: row.get(3)?,
+                unread_count: row.get(4)?,
+                total_count: row.get(5)?,
             })
         })?;
 
@@ -553,6 +590,14 @@ impl Database {
         folder_id: Option<i64>,
     ) -> Result<i64> {
         let conn = self.lock();
+        // An existing feed given a folder (importing OPML) may be moving
+        if folder_id.is_some() {
+            let existing: Option<i64> =
+                conn.query_row("SELECT id FROM feeds WHERE url = ?1", params![url], |r| r.get(0)).optional()?;
+            if let Some(feed_id) = existing {
+                Self::leave_groups_if_moving(&conn, feed_id, folder_id)?;
+            }
+        }
         conn.execute(
             r#"
             INSERT INTO feeds (url, title, description, site_url, folder_id)
@@ -986,9 +1031,16 @@ impl Database {
     /// The oldest `limit` stories not grouped yet, plus (as context) the
     /// grouped stories from up to `window_seconds` before the first of them
     /// to the last of them, for `story_groups::assign_groups`.
-    pub fn stories_to_group(&self, limit: usize, window_seconds: i64) -> Result<Vec<crate::story_groups::StoryText>> {
+    pub fn stories_to_group(
+        &self,
+        folder_id: i64,
+        limit: usize,
+        window_seconds: i64,
+    ) -> Result<Vec<crate::story_groups::StoryText>> {
         let conn = self.lock();
         const SHOWN: &str = "MIN(COALESCE(published_at, fetched_at), fetched_at)";
+        // Only the folder's stories are compared (?1: the folder)
+        const IN_FOLDER: &str = "feed_id IN (SELECT id FROM feeds WHERE folder_id = ?1)";
         let row = |r: &rusqlite::Row| -> rusqlite::Result<crate::story_groups::StoryText> {
             let date: String = r.get(2)?;
             Ok(crate::story_groups::StoryText {
@@ -1005,10 +1057,10 @@ impl Database {
             crate::story_groups::TEXT_CHARS + 200
         );
         let mut stmt = conn.prepare(&format!(
-            "SELECT {columns} FROM articles WHERE group_id IS NULL ORDER BY {SHOWN}, id LIMIT ?1"
+            "SELECT {columns} FROM articles WHERE group_id IS NULL AND {IN_FOLDER} ORDER BY {SHOWN}, id LIMIT ?2"
         ))?;
         let mut stories: Vec<crate::story_groups::StoryText> =
-            stmt.query_map(params![limit as i64], row)?.collect::<rusqlite::Result<_>>()?;
+            stmt.query_map(params![folder_id, limit as i64], row)?.collect::<rusqlite::Result<_>>()?;
         let (Some(first), Some(last)) = (stories.first(), stories.last()) else {
             return Ok(stories);
         };
@@ -1016,22 +1068,23 @@ impl Database {
         let as_stored = |t: i64| DateTime::<Utc>::from_timestamp(t, 0).unwrap_or_default().to_rfc3339();
         let (from, to) = (as_stored(first.time - window_seconds), as_stored(last.time + 1));
         let mut stmt = conn.prepare(&format!(
-            "SELECT {columns} FROM articles WHERE group_id IS NOT NULL AND {SHOWN} >= ?1 AND {SHOWN} < ?2"
+            "SELECT {columns} FROM articles WHERE group_id IS NOT NULL AND {IN_FOLDER} AND {SHOWN} >= ?2 AND {SHOWN} < ?3"
         ))?;
         let context: Vec<crate::story_groups::StoryText> =
-            stmt.query_map(params![from, to], row)?.collect::<rusqlite::Result<_>>()?;
+            stmt.query_map(params![folder_id, from, to], row)?.collect::<rusqlite::Result<_>>()?;
         stories.extend(context);
         Ok(stories)
     }
 
-    /// Up to `limit` stories dated `since` or later (newest first) that have
-    /// no embedding yet: (id, title, start of text).
+    /// Up to `limit` stories in grouped folders dated `since` or later
+    /// (newest first) that have no embedding yet: (id, title, start of text).
     pub fn stories_to_embed(&self, since: &str, limit: usize) -> Result<Vec<(i64, String, String)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT a.id, a.title, substr(COALESCE(a.content_text, ''), 1, 600)
              FROM articles a LEFT JOIN story_embeddings e ON e.article_id = a.id
              WHERE e.article_id IS NULL
+               AND a.feed_id IN (SELECT fe.id FROM feeds fe JOIN folders fo ON fo.id = fe.folder_id WHERE fo.grouping = 1)
                AND MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1
              ORDER BY MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) DESC
              LIMIT ?2",
@@ -1214,6 +1267,115 @@ impl Database {
         }
         tx.commit()?;
         Ok(previous)
+    }
+
+    /// For tests: a new folder whose stories are grouped
+    #[cfg(test)]
+    pub fn test_grouping_folder(&self) -> i64 {
+        let folder = self.create_folder("Grouped").unwrap();
+        self.set_folder_grouping(folder, true).unwrap();
+        folder
+    }
+
+    /// The folders whose stories are grouped
+    pub fn grouping_folders(&self) -> Result<Vec<i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id FROM folders WHERE grouping = 1 ORDER BY id")?;
+        let ids = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// Turns grouping a folder's stories on or off. Off takes its stories
+    /// out of their groups (what it learned is kept: see
+    /// `has_grouping_data`).
+    pub fn set_folder_grouping(&self, folder_id: i64, on: bool) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE folders SET grouping = ?2 WHERE id = ?1", params![folder_id, on as i64])?;
+        if !on {
+            tx.execute(
+                "UPDATE articles SET group_id = NULL
+                 WHERE group_id IS NOT NULL AND feed_id IN (SELECT id FROM feeds WHERE folder_id = ?1)",
+                params![folder_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether grouping a folder has learned anything: labelled pairs of
+    /// its stories, or a model.
+    pub fn has_grouping_data(&self, folder_id: i64) -> Result<bool> {
+        let conn = self.lock();
+        let labels: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pair_labels
+                 WHERE a IN (SELECT a.id FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE f.folder_id = ?1)
+                   AND b IN (SELECT a.id FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE f.folder_id = ?1))",
+            params![folder_id],
+            |r| r.get(0),
+        )?;
+        let model: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM settings WHERE key IN (?1, ?2))",
+            params![crate::story_groups::model_setting(folder_id), crate::story_groups::model_info_setting(folder_id)],
+            |r| r.get(0),
+        )?;
+        Ok(labels || model)
+    }
+
+    /// Deletes what grouping a folder learned: labelled pairs of its stories
+    /// (from Ollama and the user) and its model. Its stories are kept, and
+    /// so are labels pairing one of them with a story elsewhere.
+    pub fn clear_grouping_data(&self, folder_id: i64) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM pair_labels
+             WHERE a IN (SELECT a.id FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE f.folder_id = ?1)
+               AND b IN (SELECT a.id FROM articles a JOIN feeds f ON f.id = a.feed_id WHERE f.folder_id = ?1)",
+            params![folder_id],
+        )?;
+        tx.execute(
+            "DELETE FROM settings WHERE key IN (?1, ?2)",
+            params![crate::story_groups::model_setting(folder_id), crate::story_groups::model_info_setting(folder_id)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Keeps groups within grouped folders, after feeds move between
+    /// folders, a folder is deleted, or its grouping is turned off: stories
+    /// outside grouped folders leave their groups, and a group whose
+    /// stories are now in different folders is broken up, to be grouped
+    /// again (each in its own folder). Returns how many stories it changed.
+    pub fn tidy_groups(&self) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let outside = tx.execute(
+            "UPDATE articles SET group_id = NULL
+             WHERE group_id IS NOT NULL AND feed_id NOT IN
+                 (SELECT fe.id FROM feeds fe JOIN folders fo ON fo.id = fe.folder_id WHERE fo.grouping = 1)",
+            [],
+        )?;
+        // Groups left with stories from more than one folder
+        let mixed = tx.execute(
+            "UPDATE articles SET group_id = NULL WHERE group_id IN (
+                 SELECT a.group_id FROM articles a JOIN feeds f ON f.id = a.feed_id
+                 WHERE a.group_id IS NOT NULL
+                 GROUP BY a.group_id HAVING COUNT(DISTINCT f.folder_id) > 1)",
+            [],
+        )?;
+        // A group named after a story that left it (moved away, then
+        // grouped in its new folder) is broken up too: the name must be one
+        // of its stories', or the two groups would read as one
+        let orphaned = tx.execute(
+            "UPDATE articles SET group_id = NULL WHERE group_id IN (
+                 SELECT DISTINCT a.group_id FROM articles a
+                 LEFT JOIN articles named ON named.id = a.group_id
+                 WHERE a.group_id IS NOT NULL AND (named.id IS NULL OR named.group_id IS NOT a.group_id))",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(outside + mixed + orphaned)
     }
 
     /// Takes away the groups of the stories dated `since` or later, to be

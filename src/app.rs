@@ -184,6 +184,9 @@ pub struct RssApp {
     training_model: bool,
     /// Choosing where to put a story or group (see `Joining`)
     joining: Option<Joining>,
+    /// A feed changed folders: group stories again once this message is
+    /// handled
+    regroup_pending: bool,
     /// Corrections were made in the open group (known by its first story):
     /// retrain once it's left
     retrain_after: Option<i64>,
@@ -278,6 +281,8 @@ struct FolderMenu {
     folder_id: i64,
     /// Showing the "are you sure?" step for Delete
     confirm_delete: bool,
+    /// Turning grouping back on: asking whether to keep what it learned
+    ask_grouping: bool,
 }
 
 /// State of the "Edit feed" dialog.
@@ -628,6 +633,11 @@ pub enum Message {
     OpenFolderMenu(i64),
     CloseFolderMenu,
     AskDeleteFolder(i64),
+    /// Group a folder's stories, or stop (from its menu)
+    ToggleFolderGrouping(i64),
+    /// Turn grouping a folder's stories on (true: deleting what it learned
+    /// before, to start fresh) or off
+    SetFolderGrouping { folder_id: i64, on: bool, start_fresh: bool },
     StartRenameFolder(i64),
     RenameFolderInputChanged(String),
     SubmitRenameFolder,
@@ -716,6 +726,7 @@ impl RssApp {
             training_model: false,
             retrain_after: None,
             joining: None,
+            regroup_pending: false,
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -1135,6 +1146,9 @@ impl RssApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let previous_status = self.status_message.clone();
         let mut task = self.handle_message(message);
+        if std::mem::take(&mut self.regroup_pending) {
+            task = Task::batch([task, self.group_stories()]);
+        }
 
         // Corrections made in an open group are learned from once it's left
         // (retraining regroups, which would reshuffle it while it's in use)
@@ -2610,21 +2624,52 @@ impl RssApp {
                     self.active_filter = ActiveFilter::All;
                 }
                 self.reload_data();
-                Task::none()
+                // Its stories leave their groups (see `Database::tidy_groups`)
+                self.group_stories()
             }
             Message::OpenFolderMenu(folder_id) => {
                 self.feed_menu = None;
                 self.article_menu = None;
                 self.reader_text_menu = None;
-                self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false });
+                self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false, ask_grouping: false });
                 Task::none()
             }
             Message::CloseFolderMenu => {
                 self.folder_menu = None;
                 Task::none()
             }
+            Message::ToggleFolderGrouping(folder_id) => {
+                let on = self.folders.iter().any(|f| f.id == folder_id && f.grouping);
+                // Back on after learning something: keep it, or start fresh?
+                if !on && self.db.has_grouping_data(folder_id).unwrap_or(false) {
+                    self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: false, ask_grouping: true });
+                    return Task::none();
+                }
+                self.update(Message::SetFolderGrouping { folder_id, on: !on, start_fresh: false })
+            }
+            Message::SetFolderGrouping { folder_id, on, start_fresh } => {
+                self.folder_menu = None;
+                let name = self.folders.iter().find(|f| f.id == folder_id).map(|f| f.name.clone()).unwrap_or_default();
+                let result = if start_fresh { self.db.clear_grouping_data(folder_id) } else { Ok(()) }
+                    .and_then(|()| self.db.set_folder_grouping(folder_id, on));
+                if let Err(e) = result {
+                    self.status_message = Some((format!("Couldn't change grouping for '{}': {}", name, e), true));
+                    return Task::none();
+                }
+                self.status_message = Some((
+                    if on {
+                        format!("Grouping the stories in '{}'", name)
+                    } else {
+                        format!("Stopped grouping the stories in '{}'", name)
+                    },
+                    false,
+                ));
+                self.reload_data();
+                // Its stories are grouped (and embedded) in the background
+                if on { self.group_stories() } else { Task::none() }
+            }
             Message::AskDeleteFolder(folder_id) => {
-                self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: true });
+                self.folder_menu = Some(FolderMenu { folder_id, confirm_delete: true, ask_grouping: false });
                 Task::none()
             }
             Message::StartRenameFolder(folder_id) => {
@@ -3532,6 +3577,9 @@ impl RssApp {
                         format!("Moved '{}' into {}", feed_title, self.folder_label(dest_folder)),
                         false,
                     ));
+                    // Its stories leave the old folder's groups, and join the
+                    // new one's (see `Database::tidy_groups`)
+                    self.regroup_pending = true;
                 }
             }
             Err(e) => {
@@ -3902,9 +3950,20 @@ impl RssApp {
                 .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
             ollama_row,
             label_row,
-            text("To correct a group, open it in the story list: the grouping learns from your corrections.")
-                .size(12)
-                .style(text::secondary),
+            text({
+                let grouped: Vec<&str> = self.folders.iter().filter(|f| f.grouping).map(|f| f.name.as_str()).collect();
+                let which = if grouped.is_empty() {
+                    "No folders are grouped yet.".to_string()
+                } else {
+                    format!("Grouped folders: {}.", grouped.join(", "))
+                };
+                format!(
+                    "{} Each folder's stories are grouped only with each other; choose which from a folder's right-click menu. To correct a group, open it in the story list: the grouping learns from your corrections.",
+                    which
+                )
+            })
+            .size(12)
+            .style(text::secondary),
             text(if self.training_model {
                 "Learning from the examples and regrouping recent stories…".to_string()
             } else if let Some(info) = &self.model_info {
@@ -4295,7 +4354,34 @@ impl RssApp {
     }
 
     /// Contents of a folder's right-click menu.
-    fn folder_menu_view<'a>(&'a self, folder: &'a Folder, confirm_delete: bool) -> Element<'a, Message> {
+    fn folder_menu_view<'a>(&'a self, folder: &'a Folder, confirm_delete: bool, ask_grouping: bool) -> Element<'a, Message> {
+        if ask_grouping {
+            let body = column![
+                text(format!("Group the stories in '{}' again?", folder.name)).size(13),
+                text("Its grouping learned from labels and corrections before. Keep them, or delete them and start fresh? No stories are deleted either way.")
+                    .size(11)
+                    .style(text::secondary),
+                row![
+                    horizontal_space(),
+                    button(text("Cancel").size(12))
+                        .padding([4, 10])
+                        .style(button::text)
+                        .on_press(Message::CloseFolderMenu),
+                    button(text("Start fresh").size(12))
+                        .padding([4, 10])
+                        .style(button::danger)
+                        .on_press(Message::SetFolderGrouping { folder_id: folder.id, on: true, start_fresh: true }),
+                    button(text("Keep").size(12))
+                        .padding([4, 10])
+                        .style(button::primary)
+                        .on_press(Message::SetFolderGrouping { folder_id: folder.id, on: true, start_fresh: false }),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8)
+            .padding(8);
+            return menu_card(body, 280.0);
+        }
         if confirm_delete {
             let body = column![
                 text(format!("Delete folder '{}'?", folder.name)).size(13),
@@ -4350,6 +4436,11 @@ impl RssApp {
                 "Mark as unread",
                 (folder.unread_count < folder.total_count)
                     .then_some(Message::SetFolderRead(folder.id, false)),
+            ),
+            horizontal_rule(1),
+            menu_item(
+                if folder.grouping { "Stop grouping stories" } else { "Group stories" },
+                Some(Message::ToggleFolderGrouping(folder.id)),
             ),
             horizontal_rule(1),
             menu_item("Rename", Some(Message::StartRenameFolder(folder.id))),
@@ -4686,6 +4777,10 @@ impl RssApp {
                             ),
                             text(&folder.name).size(13),
                         ]
+                        .push_maybe(folder.grouping.then(|| {
+                            // Its stories are grouped
+                            icon(Icon::Stack, 12.0, if is_folder_active { Tint::OnPrimary } else { Tint::Secondary })
+                        }))
                         .spacing(6)
                         .align_y(Alignment::Center)
                         .width(Length::Fill),
@@ -4771,7 +4866,7 @@ impl RssApp {
                 let menu = self
                     .folder_menu
                     .filter(|m| m.folder_id == folder.id && !is_dragging && !is_dragging_folder)
-                    .map(|m| self.folder_menu_view(folder, m.confirm_delete));
+                    .map(|m| self.folder_menu_view(folder, m.confirm_delete, m.ask_grouping));
 
                 let mut header_with_menu = context_menu(folder_drop_area)
                     .menu(menu)
@@ -5449,7 +5544,7 @@ impl RssApp {
 
         let footer = column![
             horizontal_rule(1),
-            text("Grouped by the words the stories share").size(11).style(text::secondary),
+            text("Grouped with the other stories in its folder").size(11).style(text::secondary),
         ]
         .spacing(4);
         self.reader_frame(header.into(), body.into(), footer.into())
@@ -5927,8 +6022,9 @@ mod tests {
     #[test]
     fn grouped_view_works() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
-        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let news = db.test_grouping_folder();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
         let base = chrono::Utc::now() - chrono::Duration::hours(10);
         let add = |feed: i64, hash: &str, hours: i64, title: &str| {
             db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
@@ -5966,8 +6062,9 @@ mod tests {
     #[test]
     fn group_stories_collapse() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
-        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let news = db.test_grouping_folder();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
         let base = chrono::Utc::now() - chrono::Duration::hours(10);
         let add = |feed: i64, hash: &str, hours: i64, title: &str, body: &str| {
             db.upsert_article(feed, None, hash, title, None, None, Some(body), None, Some(title),
@@ -6015,9 +6112,10 @@ mod tests {
     #[test]
     fn correcting_an_open_group() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
-        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
-        let ap = db.add_or_update_feed("https://ap.example/rss", "AP", None, None, None).unwrap();
+        let news = db.test_grouping_folder();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
+        let ap = db.add_or_update_feed("https://ap.example/rss", "AP", None, None, Some(news)).unwrap();
         let base = chrono::Utc::now() - chrono::Duration::hours(10);
         let add = |feed: i64, hash: &str, hours: i64, title: &str| {
             db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
@@ -6075,8 +6173,9 @@ mod tests {
     #[test]
     fn joining_groups_from_the_list() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
-        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let news = db.test_grouping_folder();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
         let base = chrono::Utc::now() - chrono::Duration::hours(10);
         let add = |feed: i64, hash: &str, hours: i64, title: &str| {
             db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
@@ -6138,13 +6237,69 @@ mod tests {
         assert!(app.joining.is_none());
     }
 
+    /// A folder's menu turns grouping on and off; turning it back on after
+    /// it learned something asks whether to keep that.
+    #[tokio::test]
+    async fn folder_grouping_from_its_menu() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let news = db.create_folder("News").unwrap();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let add = |feed: i64, hash: &str, hours: i64, title: &str| {
+            db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
+                Some(base + chrono::Duration::hours(hours)), None).unwrap();
+        };
+        add(reuters, "a", 0, "Spirit Airlines data sold to Google in bankruptcy sale");
+        add(verge, "b", 1, "Google buys Spirit Airlines data in bankruptcy deal");
+
+        let (mut app, _) = RssApp::new(db, false);
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::All));
+        let _ = app.update(super::Message::ToggleGrouped);
+        let grouping = |app: &RssApp| app.folders.iter().find(|f| f.id == news).unwrap().grouping;
+        assert!(!grouping(&app), "off at first");
+
+        // On (nothing learned yet: no question), then grouped
+        let _ = app.update(super::Message::ToggleFolderGrouping(news));
+        assert!(grouping(&app));
+        crate::story_groups::group_new_stories(&app.db).unwrap();
+        app.reload_articles();
+        assert_eq!(app.story_groups.len(), 1, "one group of two");
+
+        // Something learned: a correction
+        let _ = app.update(super::Message::SelectGroup(app.story_groups[0].group));
+        let _ = app.update(super::Message::ConfirmGroup);
+
+        // Off: its stories leave their groups
+        let _ = app.update(super::Message::ToggleFolderGrouping(news));
+        assert!(!grouping(&app));
+        assert_eq!(app.story_groups.len(), 2);
+
+        // Back on: asked first
+        let _ = app.update(super::Message::ToggleFolderGrouping(news));
+        assert!(app.folder_menu.is_some_and(|m| m.ask_grouping));
+        assert!(!grouping(&app));
+        let _ = app.update(super::Message::SetFolderGrouping { folder_id: news, on: true, start_fresh: false });
+        assert!(grouping(&app));
+        assert!(app.db.has_grouping_data(news).unwrap(), "kept");
+
+        // Off and on again, starting fresh this time
+        let _ = app.update(super::Message::ToggleFolderGrouping(news));
+        let _ = app.update(super::Message::ToggleFolderGrouping(news));
+        let _ = app.update(super::Message::SetFolderGrouping { folder_id: news, on: true, start_fresh: true });
+        assert!(grouping(&app));
+        assert!(!app.db.has_grouping_data(news).unwrap(), "deleted");
+        assert_eq!(app.db.get_articles(&Default::default()).unwrap().len(), 2, "stories kept");
+    }
+
     /// Top stories: groups with a story from the last day, most reported
     /// first, with their older stories; groups wholly older are left out.
     #[test]
     fn top_stories_rank_by_reports() {
         let db = crate::db::Database::open_in_memory().unwrap();
-        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
-        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let news = db.test_grouping_folder();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
         let now = chrono::Utc::now();
         let add = |feed: i64, hash: &str, hours_ago: i64, title: &str| {
             db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),

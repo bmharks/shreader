@@ -2,6 +2,10 @@
 //! group (the same event from several sources, or a site's follow-ups on a
 //! developing story).
 //!
+//! Only folders chosen for it are grouped (from their right-click menu), and
+//! each folder's stories are compared only with each other: a folder's
+//! groups, and what its grouping learns, are its own.
+//!
 //! Each story is described by its significant words, from the title and the
 //! start of its text: common English words are left out, and words are
 //! weighted by how rare they are among the stories being grouped (TF-IDF),
@@ -40,13 +44,27 @@ const BATCH: usize = 3000;
 /// there is one
 pub const MODEL_SETTING: &str = "grouping_model";
 
+/// Settings key of a folder's learned grouping model (see `pair_model`),
+/// once it has one
+pub fn model_setting(folder_id: i64) -> String {
+    format!("grouping_model:{}", folder_id)
+}
+
+/// Settings key of what's known about a folder's model (see
+/// `training::ModelInfo`)
+pub fn model_info_setting(folder_id: i64) -> String {
+    format!("grouping_model_info:{}", folder_id)
+}
+
 /// One grouping at a time: a refresh's grouping and a regrouping after
 /// training would otherwise both pick up the same ungrouped stories
 static GROUPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Groups every story not grouped yet, oldest first, in batches, with the
-/// learned model when there is one. Returns how many were grouped. Run after
-/// refreshes (and embedding), off the UI thread.
+/// Groups every story in grouped folders not grouped yet, oldest first, in
+/// batches, each folder on its own and with its learned model when it has
+/// one. First takes stories out of groups they no longer belong in (see
+/// `Database::tidy_groups`). Returns how many were grouped. Run after
+/// refreshes (and embedding), and after folders change, off the UI thread.
 pub fn group_new_stories(db: &crate::db::Database) -> anyhow::Result<usize> {
     let _one_at_a_time = GROUPING.lock().unwrap_or_else(|p| p.into_inner());
     group_unlocked(db)
@@ -62,8 +80,19 @@ pub fn regroup_recent(db: &crate::db::Database) -> anyhow::Result<usize> {
 }
 
 fn group_unlocked(db: &crate::db::Database) -> anyhow::Result<usize> {
+    db.tidy_groups()?;
+    let mut grouped = 0;
+    for folder in db.grouping_folders()? {
+        grouped += group_folder(db, folder)?;
+    }
+    Ok(grouped)
+}
+
+/// Groups a folder's stories not grouped yet, comparing them only with its
+/// own stories.
+fn group_folder(db: &crate::db::Database, folder: i64) -> anyhow::Result<usize> {
     let model = db
-        .get_setting(MODEL_SETTING)?
+        .get_setting(&model_setting(folder))?
         .and_then(|json| crate::pair_model::PairModel::from_json(&json));
     let user_labels: HashMap<(i64, i64), bool> = match &model {
         Some(_) => db
@@ -76,7 +105,7 @@ fn group_unlocked(db: &crate::db::Database) -> anyhow::Result<usize> {
     };
     let mut grouped = 0;
     loop {
-        let stories = db.stories_to_group(BATCH, WINDOW_SECONDS)?;
+        let stories = db.stories_to_group(folder, BATCH, WINDOW_SECONDS)?;
         let assigned = match &model {
             Some(model) => {
                 let ids: Vec<i64> = stories.iter().map(|s| s.id).collect();
@@ -479,6 +508,103 @@ mod tests {
         }
     }
 
+    /// Folders are grouped only when chosen, each with only its own
+    /// stories; moving a feed, turning grouping off and deleting a folder
+    /// keep groups within grouped folders.
+    #[test]
+    fn grouping_stays_within_folders() {
+        use crate::db::Database;
+        use crate::models::ArticleFilter;
+        let db = Database::open_in_memory().unwrap();
+        let news = db.test_grouping_folder();
+        let tech = db.create_folder("Tech").unwrap();
+        db.set_folder_grouping(tech, true).unwrap();
+        let other = db.create_folder("Other").unwrap();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let ap = db.add_or_update_feed("https://ap.example/rss", "AP", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(tech)).unwrap();
+        let blog = db.add_or_update_feed("https://blog.example/rss", "Blog", None, None, Some(other)).unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let add = |feed: i64, hash: &str, hours: i64, title: &str| {
+            db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
+                Some(base + chrono::Duration::hours(hours)), None).unwrap();
+        };
+        // The same news in every folder
+        add(reuters, "a", 0, "Spirit Airlines data sold to Google in bankruptcy sale");
+        add(ap, "b", 1, "Google buys Spirit Airlines data in bankruptcy deal");
+        add(verge, "c", 2, "Spirit Airlines bankruptcy sale sends data to Google");
+        add(blog, "d", 3, "Google gets Spirit Airlines data in bankruptcy sale");
+        group_new_stories(&db).unwrap();
+        let group_of = |hash: &str| {
+            let all = db.get_articles(&ArticleFilter::default()).unwrap();
+            let titles = ["a", "b", "c", "d"];
+            let n = titles.iter().position(|t| *t == hash).unwrap();
+            let mut by_date = all.clone();
+            by_date.sort_by_key(|a| a.shown_date());
+            by_date[n].group_id
+        };
+        assert_eq!(group_of("a"), group_of("b"), "together in News");
+        assert!(group_of("c").is_some() && group_of("c") != group_of("a"), "Tech's on its own");
+        assert_eq!(group_of("d"), None, "Other isn't grouped");
+
+        // The Verge moves to News: it leaves Tech, and joins News's group
+        db.set_feed_folder(verge, Some(news)).unwrap();
+        group_new_stories(&db).unwrap();
+        assert_eq!(group_of("c"), group_of("a"));
+
+        // AP moves to Other: its story leaves the group, the rest stay together
+        db.set_feed_folder(ap, Some(other)).unwrap();
+        group_new_stories(&db).unwrap();
+        assert_eq!(group_of("b"), None);
+        assert_eq!(group_of("a"), group_of("c"));
+
+        // Reuters, whose story names the group, moves to Tech: it's grouped
+        // there, and the Verge's story (alone in News) gets a group of its own
+        db.set_feed_folder(reuters, Some(tech)).unwrap();
+        group_new_stories(&db).unwrap();
+        assert_ne!(group_of("a"), group_of("c"));
+        assert!(group_of("a").is_some() && group_of("c").is_some());
+
+        // Turning News off, or deleting Tech, ungroups their stories
+        db.set_folder_grouping(news, false).unwrap();
+        db.delete_folder(tech).unwrap();
+        group_new_stories(&db).unwrap();
+        assert_eq!((group_of("a"), group_of("c")), (None, None));
+    }
+
+    /// What a folder's grouping learned: found, and deleted to start fresh,
+    /// without touching other folders'.
+    #[test]
+    fn a_folders_grouping_data() {
+        use crate::db::Database;
+        use crate::models::ArticleFilter;
+        let db = Database::open_in_memory().unwrap();
+        let news = db.test_grouping_folder();
+        let tech = db.create_folder("Tech").unwrap();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(tech)).unwrap();
+        for (feed, hash) in [(reuters, "a"), (reuters, "b"), (verge, "c"), (verge, "d")] {
+            db.upsert_article(feed, None, hash, hash, None, None, None, None, None, None, None).unwrap();
+        }
+        let id = |hash: &str| db.get_articles(&ArticleFilter::default()).unwrap().into_iter().find(|a| a.title == hash).unwrap().id;
+        let (a, b, c, d) = (id("a"), id("b"), id("c"), id("d"));
+        assert!(!db.has_grouping_data(news).unwrap());
+        db.set_pair_labels(&[((a, b), Some(true)), ((c, d), Some(false)), ((a, c), Some(false))], "user").unwrap();
+        db.set_setting(&model_setting(tech), "{}").unwrap();
+        assert!(db.has_grouping_data(news).unwrap(), "a pair of its stories");
+        assert!(db.has_grouping_data(tech).unwrap());
+
+        db.clear_grouping_data(news).unwrap();
+        assert!(!db.has_grouping_data(news).unwrap());
+        let left: Vec<(i64, i64)> = db.pair_labels().unwrap().into_iter().map(|l| (l.0, l.1)).collect();
+        assert_eq!(left.len(), 2, "Tech's pair, and the one across folders, stay: {:?}", left);
+        assert!(db.has_grouping_data(tech).unwrap());
+
+        // Deleting a folder deletes its model
+        db.delete_folder(tech).unwrap();
+        assert_eq!(db.get_setting(&model_setting(tech)).unwrap(), None);
+    }
+
     /// Grouping through the database: stories get groups, a later story
     /// joins its group, and a group's members can be fetched for a view.
     #[test]
@@ -486,8 +612,9 @@ mod tests {
         use crate::db::Database;
         use crate::models::ArticleFilter;
         let db = Database::open_in_memory().unwrap();
-        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
-        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let news = db.test_grouping_folder();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, Some(news)).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, Some(news)).unwrap();
         let base = chrono::Utc::now() - chrono::Duration::hours(10);
         let add = |feed: i64, hash: &str, hours: i64, title: &str, text: &str| {
             db.upsert_article(feed, None, hash, title, None, None, Some(text), None, Some(text),
