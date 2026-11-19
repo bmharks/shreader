@@ -60,6 +60,9 @@ const LOAD_IMAGES_SETTING: &str = "load_images";
 /// (default), refreshing in the background
 const KEEP_IN_TRAY_SETTING: &str = "keep_in_tray";
 
+/// Setting: the story list shows groups of stories about the same thing
+const GROUPED_SETTING: &str = "grouped_view";
+
 /// Setting: list unread stories before read ones
 const UNREAD_FIRST_SETTING: &str = "unread_first";
 
@@ -147,6 +150,12 @@ pub struct RssApp {
     notifications: bool,
     /// Whether the story list shows unread stories first (`UNREAD_FIRST_SETTING`)
     unread_first: bool,
+    /// Whether the story list is grouped (`GROUPED_SETTING`)
+    grouped: bool,
+    /// The loaded part of the list as groups, while `grouped`
+    story_groups: Vec<StoryGroupEntry>,
+    /// The group open in the reader (instead of a single story)
+    reader_group: Option<ReaderGroup>,
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -264,6 +273,33 @@ enum ImageState {
     Failed,
 }
 
+/// One entry of the grouped story list: a group's stories in the current
+/// view, newest first (one story when nothing else matched it)
+#[derive(Debug, Clone)]
+struct StoryGroupEntry {
+    group: i64,
+    members: Vec<Article>,
+}
+
+impl StoryGroupEntry {
+    /// The first report's headline
+    fn title(&self) -> &str {
+        self.members.last().map_or("", |a| a.title.as_str())
+    }
+
+    fn unread(&self) -> usize {
+        self.members.iter().filter(|a| !a.is_read).count()
+    }
+}
+
+/// A group open in the reader: its stories oldest first, with their bodies
+#[derive(Debug, Clone)]
+struct ReaderGroup {
+    group: i64,
+    title: String,
+    stories: Vec<(Article, Vec<Block>)>,
+}
+
 /// Find in story (Ctrl+F)
 #[derive(Debug, Clone, Default)]
 struct FindState {
@@ -378,6 +414,11 @@ pub enum Message {
     SetLoadImages(bool),
     SetNotifications(bool),
     ToggleUnreadFirst,
+    ToggleGrouped,
+    /// Open a group of stories in the reader
+    SelectGroup(i64),
+    /// Background grouping finished: how many stories it grouped
+    StoriesGrouped(Result<usize, String>),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -531,6 +572,9 @@ impl RssApp {
             load_images: true,
             notifications: true,
             unread_first: false,
+            grouped: false,
+            story_groups: Vec::new(),
+            reader_group: None,
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -584,6 +628,7 @@ impl RssApp {
             app.notifications = on != "false";
         }
         app.unread_first = matches!(app.db.get_setting(UNREAD_FIRST_SETTING), Ok(Some(on)) if on == "true");
+        app.grouped = matches!(app.db.get_setting(GROUPED_SETTING), Ok(Some(on)) if on == "true");
         app.keep_in_tray = !matches!(app.db.get_setting(KEEP_IN_TRAY_SETTING), Ok(Some(on)) if on == "false");
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
             app.auto_refresh = on != "false";
@@ -639,8 +684,13 @@ impl RssApp {
             Task::none()
         };
 
+        if app.grouped {
+            app.reload_articles();
+        }
         let open_window = app.open_main_window();
-        (app, Task::batch([open_window, initial_task]))
+        // Groups stories not grouped yet (all of them, the first time)
+        let group = app.group_stories();
+        (app, Task::batch([open_window, initial_task, group]))
     }
 
     /// Opens the main window (it's closed while the app runs in the tray).
@@ -711,6 +761,16 @@ impl RssApp {
         self.article_total = self.db.count_articles(&filter).unwrap_or(0);
         self.load_list_page(&filter);
 
+        // The open group's stories: their read and starred state may have changed
+        if let Some(group) = &mut self.reader_group {
+            for (story, _) in &mut group.stories {
+                if let Ok(Some(fresh)) = self.db.get_article(story.id) {
+                    story.is_read = fresh.is_read;
+                    story.is_starred = fresh.is_starred;
+                }
+            }
+        }
+
         // The open story stays open while it's part of this view, even if
         // newer stories pushed it past the loaded part: then the list loads
         // down to it, so the arrow keys continue from where it is.
@@ -736,6 +796,98 @@ impl RssApp {
     fn load_list_page(&mut self, filter: &ArticleFilter) {
         let page = ArticleFilter { limit: Some(self.article_render_limit), ..filter.clone() };
         self.articles = self.db.get_articles(&page).unwrap_or_default();
+        self.story_groups = if self.grouped { self.build_groups(filter) } else { Vec::new() };
+    }
+
+    /// The loaded stories as groups, in list order (a group goes where its
+    /// first story in the list is), each with all its stories in this view.
+    fn build_groups(&self, filter: &ArticleFilter) -> Vec<StoryGroupEntry> {
+        let mut order: Vec<i64> = Vec::new();
+        let mut seen = HashSet::new();
+        for article in &self.articles {
+            if seen.insert(article.group()) {
+                order.push(article.group());
+            }
+        }
+        let mut members: HashMap<i64, Vec<Article>> = HashMap::new();
+        // Groups of one need no lookup
+        let shared: Vec<i64> = order
+            .iter()
+            .copied()
+            .filter(|&group| self.articles.iter().any(|a| a.group() == group && a.group_id.is_some()))
+            .collect();
+        for article in self.db.group_members(filter, &shared).unwrap_or_default() {
+            members.entry(article.group()).or_default().push(article);
+        }
+        order
+            .into_iter()
+            .map(|group| {
+                let members = members.remove(&group).filter(|m| !m.is_empty()).unwrap_or_else(|| {
+                    self.articles.iter().filter(|a| a.group() == group).cloned().collect()
+                });
+                StoryGroupEntry { group, members }
+            })
+            .collect()
+    }
+
+    /// Left / Right in the grouped list: the previous or next group (or
+    /// lone story), moving the list by one like the plain list does.
+    fn select_adjacent_group(&mut self, forward: bool) -> Task<Message> {
+        // Which entry is open: a group, or a lone story
+        let position = |app: &Self| {
+            app.story_groups.iter().position(|entry| match (&app.reader_group, entry.members.as_slice()) {
+                (Some(open), _) => open.group == entry.group,
+                (None, [single]) => app.selected_article_id == Some(single.id),
+                _ => false,
+            })
+        };
+        // Stepping past the loaded part loads more
+        if forward
+            && position(self).is_some_and(|i| i + 1 == self.story_groups.len())
+            && self.articles.len() < self.article_total
+        {
+            self.article_render_limit += ARTICLE_PAGE_SIZE;
+            self.reload_articles();
+        }
+        let current = position(self);
+        let target = match (current, forward) {
+            (None, _) if !self.story_groups.is_empty() => 0,
+            (Some(i), true) if i + 1 < self.story_groups.len() => i + 1,
+            (Some(i), false) if i > 0 => i - 1,
+            _ => return Task::none(),
+        };
+        self.feed_menu = None;
+        self.folder_menu = None;
+        self.article_menu = None;
+        let card_id = |entry: &StoryGroupEntry| match entry.members.as_slice() {
+            [single] => story_card_id(single.id),
+            _ => group_card_id(entry.group),
+        };
+        let to = card_id(&self.story_groups[target]);
+        let from = current.map(|i| card_id(&self.story_groups[i]));
+        let select = match self.story_groups[target].members.as_slice() {
+            [single] => Message::SelectArticle(single.id),
+            _ => Message::SelectGroup(self.story_groups[target].group),
+        };
+        let select = self.update(select);
+        let scroll = match from {
+            Some(from) => scroll_by_step(article_list_scroll_id(), from, to),
+            None => scroll_into_view(article_list_scroll_id(), to),
+        };
+        Task::batch([select, then_redraw(scroll)])
+    }
+
+    /// Groups new stories in the background (see `story_groups`).
+    fn group_stories(&self) -> Task<Message> {
+        let db = self.db.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || crate::story_groups::group_new_stories(&db).map_err(|e| e.to_string()))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::StoriesGrouped,
+        )
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -770,7 +922,8 @@ impl RssApp {
                 Task::none()
             }
             Message::SelectArticle(article_id) => {
-                let other_story = self.selected_article_id != Some(article_id);
+                let other_story = self.selected_article_id != Some(article_id) || self.reader_group.is_some();
+                self.reader_group = None;
                 self.selected_article_id = Some(article_id);
                 self.mark_opened_story_read(article_id);
                 self.open_article = self.articles.iter().find(|a| a.id == article_id).cloned();
@@ -832,6 +985,9 @@ impl RssApp {
                     || self.articles.is_empty()
                 {
                     return Task::none();
+                }
+                if self.grouped {
+                    return self.select_adjacent_group(forward);
                 }
                 let position = |app: &Self| {
                     app.selected_article_id
@@ -983,7 +1139,8 @@ impl RssApp {
                         self.status_message = Some((e, true));
                     }
                 }
-                Task::none()
+                // New stories: group them in the background
+                self.group_stories()
             }
             Message::ArticleListResized(width) => {
                 self.article_list_width = width;
@@ -1364,7 +1521,7 @@ impl RssApp {
                 self.update(Message::RefreshClicked)
             }
             Message::OpenFind => {
-                if self.reader_body.is_none() {
+                if self.reader_body.is_none() && self.reader_group.is_none() {
                     return Task::none(); // no story open
                 }
                 if self.find.is_none() {
@@ -1421,6 +1578,77 @@ impl RssApp {
                 self.keep_in_tray = on;
                 let _ = self.db.set_setting(KEEP_IN_TRAY_SETTING, if on { "true" } else { "false" });
                 Task::none()
+            }
+            Message::ToggleGrouped => {
+                self.grouped = !self.grouped;
+                let _ = self.db.set_setting(GROUPED_SETTING, if self.grouped { "true" } else { "false" });
+                self.article_render_limit = ARTICLE_PAGE_SIZE;
+                self.reload_articles();
+                then_redraw(scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START))
+            }
+            Message::StoriesGrouped(result) => {
+                match result {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("Grouped {} stories", n);
+                        if self.grouped {
+                            self.reload_articles();
+                        }
+                    }
+                    Err(e) => tracing::warn!("Grouping stories failed: {}", e),
+                }
+                Task::none()
+            }
+            Message::SelectGroup(group) => {
+                let Some(entry) = self.story_groups.iter().find(|g| g.group == group).cloned() else {
+                    return Task::none();
+                };
+                // Opening the group reads all its stories
+                for member in entry.members.iter().filter(|m| !m.is_read) {
+                    self.mark_story_read(member);
+                }
+                // Oldest first: the story as it developed
+                let stories: Vec<(Article, Vec<Block>)> = entry
+                    .members
+                    .iter()
+                    .rev()
+                    .filter_map(|member| self.db.get_article(member.id).ok().flatten())
+                    .map(|article| {
+                        let blocks = reader_blocks(&article);
+                        (Article { summary: None, content_html: None, content_text: None, ..article }, blocks)
+                    })
+                    .collect();
+                let all_blocks: Vec<Block> = stories.iter().flat_map(|(_, blocks)| blocks.iter().cloned()).collect();
+                let had_images = !self.story_images.is_empty();
+                self.prune_story_images(&all_blocks);
+                (self.reader_texts, self.reader_links) = all_blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text, links } => Some((
+                            text_editor::Content::with_text(text),
+                            std::sync::Arc::new(links.clone()),
+                        )),
+                        Block::Image { .. } => None,
+                    })
+                    .unzip();
+                if self.reader_group.as_ref().is_none_or(|g| g.group != group) {
+                    self.find = None;
+                }
+                self.selected_article_id = None;
+                self.open_article = None;
+                self.reader_body = None;
+                self.pressed_link = None;
+                self.menu_link = None;
+                self.reader_text_menu = None;
+                self.reader_group = Some(ReaderGroup { group, title: entry.title().to_string(), stories });
+                self.update_find_matches();
+                let to_top = then_redraw(scrollable::snap_to(reader_scroll_id(), scrollable::RelativeOffset::START));
+                let downloads = self.start_image_downloads();
+                if had_images {
+                    Task::batch([to_top, downloads, release_memory_soon()])
+                } else {
+                    Task::batch([to_top, downloads])
+                }
             }
             Message::ToggleUnreadFirst => {
                 self.unread_first = !self.unread_first;
@@ -1491,7 +1719,8 @@ impl RssApp {
                         self.status_message = Some((format!("Sync failed: {}", e), true));
                     }
                 }
-                Task::none()
+                // New stories: group them in the background
+                self.group_stories()
             }
             Message::SearchChanged(query) => {
                 self.search_query = query;
@@ -1615,7 +1844,8 @@ impl RssApp {
                     }
                     Err(e) => (format!("Couldn't refresh {}: {}", name, e), true),
                 });
-                Task::none()
+                // New stories: group them in the background
+                self.group_stories()
             }
             Message::MarkAllRead => {
                 let (target_feed, target_folder) = match self.active_filter {
@@ -2100,6 +2330,29 @@ impl RssApp {
     /// Marks a story read when it's opened. Updates the counts in memory
     /// instead of reloading everything from the database, which took ~100 ms
     /// per click with a few thousand stories.
+    /// Marks a story read wherever it is (the open group's stories needn't be
+    /// in the loaded part of the list), keeping the counts right.
+    fn mark_story_read(&mut self, story: &Article) {
+        if let Err(e) = self.db.set_article_read(story.id, true) {
+            self.status_message = Some((format!("Failed to mark story read: {}", e), true));
+            return;
+        }
+        for article in self.articles.iter_mut().chain(self.story_groups.iter_mut().flat_map(|g| g.members.iter_mut())) {
+            if article.id == story.id {
+                article.is_read = true;
+            }
+        }
+        self.stats.2 = (self.stats.2 - 1).max(0);
+        if let Some(feed) = self.feeds.iter_mut().find(|f| f.id == story.feed_id) {
+            feed.unread_count = (feed.unread_count - 1).max(0);
+            if let Some(folder_id) = feed.folder_id {
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == folder_id) {
+                    folder.unread_count = (folder.unread_count - 1).max(0);
+                }
+            }
+        }
+    }
+
     fn mark_opened_story_read(&mut self, article_id: i64) {
         let Some(article) = self.articles.iter_mut().find(|a| a.id == article_id) else {
             return;
@@ -2113,6 +2366,12 @@ impl RssApp {
         }
         article.is_read = true;
         let feed_id = article.feed_id;
+        // The grouped list holds its own copies
+        for member in self.story_groups.iter_mut().flat_map(|g| g.members.iter_mut()) {
+            if member.id == article_id {
+                member.is_read = true;
+            }
+        }
 
         self.stats.2 = (self.stats.2 - 1).max(0);
         if let Some(feed) = self.feeds.iter_mut().find(|f| f.id == feed_id) {
@@ -2151,20 +2410,23 @@ impl RssApp {
     fn update_find_matches(&mut self) {
         let Some(find) = &mut self.find else { return };
         let mut limit = MAX_FIND_MATCHES;
-        find.matches = match &self.reader_body {
-            Some((_, blocks)) => blocks
-                .iter()
-                .filter_map(|block| match block {
-                    Block::Text { text, .. } => {
-                        let found = find_matches(text, find.query.trim(), limit);
-                        limit -= found.len();
-                        Some(found)
-                    }
-                    Block::Image { .. } => None,
-                })
-                .collect(),
-            None => Vec::new(),
+        // The open story's blocks, or every story's in an open group
+        let blocks: Vec<&Block> = match (&self.reader_group, &self.reader_body) {
+            (Some(group), _) => group.stories.iter().flat_map(|(_, blocks)| blocks).collect(),
+            (None, Some((_, blocks))) => blocks.iter().collect(),
+            (None, None) => Vec::new(),
         };
+        find.matches = blocks
+            .into_iter()
+            .filter_map(|block| match block {
+                Block::Text { text, .. } => {
+                    let found = find_matches(text, find.query.trim(), limit);
+                    limit -= found.len();
+                    Some(found)
+                }
+                Block::Image { .. } => None,
+            })
+            .collect();
         find.current = 0;
     }
 
@@ -2294,9 +2556,11 @@ impl RssApp {
     ///
     /// With `selectable`, text blocks are the read-only editors in
     /// `reader_texts` (one per text block, in order) so they can be copied.
-    fn story_body<'a>(&'a self, blocks: &'a [Block], selectable: bool) -> Element<'a, Message> {
+    /// `first_text` is the index in `reader_texts` of the first text block
+    /// (an open group's stories share one list).
+    fn story_body<'a>(&'a self, blocks: &'a [Block], selectable: bool, first_text: usize) -> Element<'a, Message> {
         let mut body = column![].spacing(14).width(Length::Fill);
-        let mut text_index = 0;
+        let mut text_index = first_text;
         for block in blocks {
             body = body.push(match block {
                 Block::Text { text: body_text, links } => {
@@ -2311,6 +2575,107 @@ impl RssApp {
             });
         }
         body.into()
+    }
+
+    /// A story's card in the story list.
+    fn story_list_card<'a>(&'a self, article: &'a Article) -> Element<'a, Message> {
+        let is_selected = self.selected_article_id == Some(article.id);
+
+        let feed_name = article.feed_title.as_deref().unwrap_or("RSS");
+        let date_str = article
+            .shown_date()
+            .map(format_date)
+            .unwrap_or_else(|| "Unknown date".to_string());
+
+        let star_btn = button(if article.is_starred {
+            icon(Icon::StarFilled, 14.0, Tint::Gold)
+        } else {
+            icon(Icon::Star, 14.0, Tint::Secondary)
+        })
+            .padding([2, 6])
+            .style(button::text)
+            .on_press(Message::ToggleStar(article.id));
+
+        let card_title = text(&article.title)
+            .size(13)
+            .color(if article.is_read { READ_TITLE } else { UNREAD_TITLE });
+
+        let meta_row = row![
+            text(feed_name).size(11).style(text::secondary),
+            text("•").size(11).style(text::secondary),
+            text(date_str).size(11).style(text::secondary),
+        ]
+        .spacing(4);
+
+        let card_content = column![card_title, meta_row].spacing(3).width(Length::Fill);
+
+        let item_btn = button(row![star_btn, card_content].spacing(6).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding(8)
+            .style(move |theme, status| story_card(theme, status, is_selected))
+            .on_press(Message::SelectArticle(article.id));
+
+        let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
+        let card = container(
+            context_menu(item_btn)
+                .menu(menu)
+                .on_right_press(Message::OpenArticleMenu(article.id))
+                .on_dismiss(Message::CloseArticleMenu),
+        );
+        // So the arrow keys can find the cards to scroll by
+        let card = card.id(story_card_id(article.id));
+        card.into()
+    }
+
+    /// A group's card in the grouped story list: its first report's
+    /// headline (green while any of its stories are unread), how many
+    /// stories, from where, and the latest one's time.
+    fn group_list_card<'a>(&'a self, entry: &'a StoryGroupEntry) -> Element<'a, Message> {
+        let is_selected = self.reader_group.as_ref().is_some_and(|g| g.group == entry.group);
+        let mut sources: Vec<&str> = Vec::new();
+        for member in &entry.members {
+            let name = member.feed_title.as_deref().unwrap_or("RSS");
+            if !sources.contains(&name) {
+                sources.push(name);
+            }
+        }
+        const NAMED: usize = 2;
+        let mut from = sources.iter().take(NAMED).copied().collect::<Vec<_>>().join(", ");
+        if sources.len() > NAMED {
+            from += &format!(" +{}", sources.len() - NAMED);
+        }
+        let latest = entry
+            .members
+            .first()
+            .and_then(Article::shown_date)
+            .map(format_date)
+            .unwrap_or_default();
+        let unread = entry.unread();
+        let count = if unread > 0 && unread < entry.members.len() {
+            format!("{} stories, {} unread", entry.members.len(), unread)
+        } else {
+            format!("{} stories", entry.members.len())
+        };
+        let content = column![
+            text(entry.title()).size(13).color(if unread > 0 { UNREAD_TITLE } else { READ_TITLE }),
+            row![
+                text(count).size(11).style(text::secondary),
+                text("•").size(11).style(text::secondary),
+                text(from).size(11).style(text::secondary),
+                text("•").size(11).style(text::secondary),
+                text(latest).size(11).style(text::secondary),
+            ]
+            .spacing(4)
+            .wrap(),
+        ]
+        .spacing(3)
+        .width(Length::Fill);
+        let card = button(row![icon(Icon::Stack, 14.0, Tint::Secondary), content].spacing(10).align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding(8)
+            .style(move |theme, status| story_card(theme, status, is_selected))
+            .on_press(Message::SelectGroup(entry.group));
+        container(card).id(group_card_id(entry.group)).into()
     }
 
     /// A story text block that can be selected (drag, double/triple click,
@@ -3899,6 +4264,12 @@ impl RssApp {
 
         let mut header_row = row![header_label].spacing(6).align_y(Alignment::Center);
         // Pointless in the Unread view, where everything is unread
+        header_row = header_row.push(
+            button(text("Grouped").size(12))
+                .padding([4, 8])
+                .style(if self.grouped { button::primary } else { button::secondary })
+                .on_press(Message::ToggleGrouped),
+        );
         if self.active_filter != ActiveFilter::Unread {
             header_row = header_row.push(
                 button(text("Unread first").size(12))
@@ -3933,53 +4304,17 @@ impl RssApp {
                     .center_x(Length::Fill),
             );
         } else {
-            for article in self.articles.iter().take(self.article_render_limit) {
-                let is_selected = self.selected_article_id == Some(article.id);
-
-                let feed_name = article.feed_title.as_deref().unwrap_or("RSS");
-                let date_str = article
-                    .shown_date()
-                    .map(format_date)
-                    .unwrap_or_else(|| "Unknown date".to_string());
-
-                let star_btn = button(if article.is_starred {
-                    icon(Icon::StarFilled, 14.0, Tint::Gold)
-                } else {
-                    icon(Icon::Star, 14.0, Tint::Secondary)
-                })
-                    .padding([2, 6])
-                    .style(button::text)
-                    .on_press(Message::ToggleStar(article.id));
-
-                let card_title = text(&article.title)
-                    .size(13)
-                    .color(if article.is_read { READ_TITLE } else { UNREAD_TITLE });
-
-                let meta_row = row![
-                    text(feed_name).size(11).style(text::secondary),
-                    text("•").size(11).style(text::secondary),
-                    text(date_str).size(11).style(text::secondary),
-                ]
-                .spacing(4);
-
-                let card_content = column![card_title, meta_row].spacing(3).width(Length::Fill);
-
-                let item_btn = button(row![star_btn, card_content].spacing(6).align_y(Alignment::Center))
-                    .width(Length::Fill)
-                    .padding(8)
-                    .style(move |theme, status| story_card(theme, status, is_selected))
-                    .on_press(Message::SelectArticle(article.id));
-
-                let menu = (self.article_menu == Some(article.id)).then(|| article_menu_view(article));
-                let card = container(
-                    context_menu(item_btn)
-                        .menu(menu)
-                        .on_right_press(Message::OpenArticleMenu(article.id))
-                        .on_dismiss(Message::CloseArticleMenu),
-                );
-                // So the arrow keys can find the cards to scroll by
-                let card = card.id(story_card_id(article.id));
-                article_items = article_items.push(card);
+            if self.grouped {
+                for entry in &self.story_groups {
+                    article_items = article_items.push(match entry.members.as_slice() {
+                        [single] => self.story_list_card(single),
+                        _ => self.group_list_card(entry),
+                    });
+                }
+            } else {
+                for article in self.articles.iter().take(self.article_render_limit) {
+                    article_items = article_items.push(self.story_list_card(article));
+                }
             }
 
             let remaining = self.article_total.saturating_sub(self.articles.len());
@@ -4021,6 +4356,9 @@ impl RssApp {
     }
 
     fn view_reader(&self) -> Element<'_, Message> {
+        if let Some(group) = &self.reader_group {
+            return self.view_reader_group(group);
+        }
         let selected_article = self.open_article.clone();
 
         match selected_article {
@@ -4044,7 +4382,7 @@ impl RssApp {
                 // Header details
                 // Before fields are moved out of `art` below
                 let body = match &self.reader_body {
-                    Some((id, blocks)) if *id == art.id => self.story_body(blocks, true),
+                    Some((id, blocks)) if *id == art.id => self.story_body(blocks, true, 0),
                     // Not prepared yet (bodies are loaded when a story is opened)
                     _ => Space::with_height(0).into(),
                 };
@@ -4130,16 +4468,6 @@ impl RssApp {
                 // as its text, which leaves the scrollbar mid-window for short stories
                 // The scrollable spans the reader (scrollbar at the window edge); the
                 // text inside it is a centered column
-                let body_scroll = scrollable(reading_column(
-                    column![body].spacing(10).padding([10, 0]),
-                ))
-                .id(reader_scroll_id())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .direction(scrollable::Direction::Vertical(
-                    scrollable::Scrollbar::new().width(10).scroller_width(10).spacing(4),
-                ));
-
                 // Footer with permanent archival info
                 let footer = column![
                     horizontal_rule(1),
@@ -4155,47 +4483,154 @@ impl RssApp {
                 ]
                 .spacing(4);
 
-                // The find bar goes in the header, not before it: widgets keep
-                // their state (the story's scroll position) by their place in
-                // the layout, so the scrollable's place mustn't change
-                let mut header = column![].spacing(12);
-                if let Some(find) = &self.find {
-                    header = header.push(self.find_bar(find));
-                }
-                // Wrap so a narrow reader moves items to a new line instead of squeezing them
-                let header = header.push(
-                    column![title, meta_items.wrap(), action_row.wrap(), horizontal_rule(1)].spacing(12),
-                );
-                let reader = container(
-                    column![gutter(reading_column(header)), body_scroll, gutter(reading_column(footer))]
-                        .spacing(12)
-                        .padding(20),
+                self.reader_frame(
+                    column![title, meta_items.wrap(), action_row.wrap(), horizontal_rule(1)].spacing(12).into(),
+                    body,
+                    footer.into(),
                 )
-                .width(Length::Fill)
-                .height(Length::Fill);
-                // While the find bar is open: Esc closes it, and F3 / Shift+F3
-                // or Shift+Enter go through matches, even while typing in it
-                // (its text field would otherwise keep those keys). Always in
-                // the layout, doing nothing while the bar is closed, so opening
-                // and closing it doesn't move the story's scroll position.
-                let find_open = self.find.is_some();
-                on_key_press(reader, move |key, modifiers| {
-                    use iced::keyboard::key::Named;
-                    if !find_open {
-                        return None;
-                    }
-                    match key.as_ref() {
-                        iced::keyboard::Key::Named(Named::Escape) => Some(Message::CloseFind),
-                        iced::keyboard::Key::Named(Named::F3) if modifiers.shift() => Some(Message::FindPrevious),
-                        iced::keyboard::Key::Named(Named::F3) => Some(Message::FindNext),
-                        iced::keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::FindPrevious),
-                        _ => None,
-                    }
-                })
-                .first()
-                .into()
             }
         }
+    }
+
+    /// The reader around a story (or group): the find bar when open, the
+    /// header, the scrolling body and the footer, plus the find keys.
+    fn reader_frame<'a>(
+        &'a self,
+        header: Element<'a, Message>,
+        body: Element<'a, Message>,
+        footer: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        // Fill the reader's width: a shrink-sized scrollable is only as wide
+        // as its text, which leaves the scrollbar mid-window for short stories
+        // The scrollable spans the reader (scrollbar at the window edge); the
+        // text inside it is a centered column
+        let body_scroll = scrollable(reading_column(column![body].spacing(10).padding([10, 0])))
+            .id(reader_scroll_id())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new().width(10).scroller_width(10).spacing(4),
+            ));
+
+        // The find bar goes in the header, not before it: widgets keep
+        // their state (the story's scroll position) by their place in
+        // the layout, so the scrollable's place mustn't change
+        let mut top = column![].spacing(12);
+        if let Some(find) = &self.find {
+            top = top.push(self.find_bar(find));
+        }
+        let top = top.push(header);
+        let reader = container(
+            column![gutter(reading_column(top)), body_scroll, gutter(reading_column(footer))]
+                .spacing(12)
+                .padding(20),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill);
+        // While the find bar is open: Esc closes it, and F3 / Shift+F3
+        // or Shift+Enter go through matches, even while typing in it
+        // (its text field would otherwise keep those keys). Always in
+        // the layout, doing nothing while the bar is closed, so opening
+        // and closing it doesn't move the story's scroll position.
+        let find_open = self.find.is_some();
+        on_key_press(reader, move |key, modifiers| {
+            use iced::keyboard::key::Named;
+            if !find_open {
+                return None;
+            }
+            match key.as_ref() {
+                iced::keyboard::Key::Named(Named::Escape) => Some(Message::CloseFind),
+                iced::keyboard::Key::Named(Named::F3) if modifiers.shift() => Some(Message::FindPrevious),
+                iced::keyboard::Key::Named(Named::F3) => Some(Message::FindNext),
+                iced::keyboard::Key::Named(Named::Enter) if modifiers.shift() => Some(Message::FindPrevious),
+                _ => None,
+            }
+        })
+        .first()
+        .into()
+    }
+
+    /// An open group in the reader: its stories one after another, oldest
+    /// first, each under its source's name.
+    fn view_reader_group<'a>(&'a self, group: &'a ReaderGroup) -> Element<'a, Message> {
+        let mut sources: Vec<&str> = Vec::new();
+        for (story, _) in &group.stories {
+            let name = story.feed_title.as_deref().unwrap_or("Feed");
+            if !sources.contains(&name) {
+                sources.push(name);
+            }
+        }
+        let header = column![
+            text(&group.title).size(22),
+            text(format!("{} stories from: {}", group.stories.len(), sources.join(", ")))
+                .size(12)
+                .style(text::secondary),
+            horizontal_rule(1),
+        ]
+        .spacing(12);
+
+        let mut body = column![].spacing(18).width(Length::Fill);
+        let mut first_text = 0;
+        for (index, (story, blocks)) in group.stories.iter().enumerate() {
+            if index > 0 {
+                body = body.push(horizontal_rule(1));
+            }
+            let mut source = row![
+                text(story.feed_title.as_deref().unwrap_or("Feed")).size(13),
+                text("•").size(12).style(text::secondary),
+                text(story.shown_date().map(format_date).unwrap_or_else(|| "Unknown date".to_string()))
+                    .size(12)
+                    .style(text::secondary),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            if let Some(author) = &story.author {
+                source = source.push(text("•").size(12).style(text::secondary));
+                source = source.push(text(format!("By: {}", author)).size(12).style(text::secondary));
+            }
+            let mut actions = row![
+                button(
+                    row![
+                        if story.is_starred {
+                            icon(Icon::StarFilled, 12.0, Tint::Gold)
+                        } else {
+                            icon(Icon::Star, 12.0, Tint::OnSecondary)
+                        },
+                        text(if story.is_starred { "Starred" } else { "Star" }).size(12),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                )
+                .padding([4, 10])
+                .style(button::secondary)
+                .on_press(Message::ToggleStar(story.id)),
+            ]
+            .spacing(8);
+            if let Some(url) = &story.url {
+                actions = actions.push(
+                    button(
+                        row![icon(Icon::ExternalLink, 12.0, Tint::OnPrimary), text("Open in Browser").size(12)]
+                            .spacing(5)
+                            .align_y(Alignment::Center),
+                    )
+                    .padding([4, 10])
+                    .style(button::primary)
+                    .on_press(Message::OpenUrl(url.clone())),
+                );
+            }
+            body = body.push(
+                column![source.wrap(), text(&story.title).size(17), actions.wrap(), self.story_body(blocks, true, first_text)]
+                    .spacing(10),
+            );
+            first_text += blocks.iter().filter(|b| matches!(b, Block::Text { .. })).count();
+        }
+
+        let footer = column![
+            horizontal_rule(1),
+            text("Grouped by the words the stories share").size(11).style(text::secondary),
+        ]
+        .spacing(4);
+        self.reader_frame(header.into(), body.into(), footer.into())
     }
 
     pub fn theme(&self, _window: iced::window::Id) -> Theme {
@@ -4519,7 +4954,7 @@ fn release_memory() {
     }
 }
 
-/// Story text size, and how it wraps (shared with `link_hover`, whose
+/// Story text size, and how it wraps (shared with `story_text`, whose
 /// layout has to match the text editor's exactly)
 const READER_TEXT_SIZE: f32 = 14.0;
 const READER_TEXT_WRAPPING: iced::widget::text::Wrapping = iced::widget::text::Wrapping::WordOrGlyph;
@@ -4617,6 +5052,11 @@ fn story_card_id(article_id: i64) -> container::Id {
     container::Id::new(format!("story-{}", article_id))
 }
 
+/// A group's card in the grouped list.
+fn group_card_id(group: i64) -> container::Id {
+    container::Id::new(format!("group-{}", group))
+}
+
 /// The current find match (reported by `story_text`, to scroll to it)
 fn find_match_id() -> container::Id {
     container::Id::new("find-match")
@@ -4658,6 +5098,45 @@ mod tests {
             let _ = app.update(super::Message::SelectFilter(filter.clone()));
             assert_eq!(app.starred_total, 2, "in {:?}", filter);
         }
+    }
+
+    /// The grouped view: a group's stories form one entry, opening it reads
+    /// them all and shows them oldest first, and the arrows step by entry.
+    #[test]
+    fn grouped_view_works() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let add = |feed: i64, hash: &str, hours: i64, title: &str| {
+            db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
+                Some(base + chrono::Duration::hours(hours)), None).unwrap();
+        };
+        add(reuters, "a", 0, "Spirit Airlines data sold to Google in bankruptcy sale");
+        add(verge, "b", 1, "Google buys Spirit Airlines data in bankruptcy deal");
+        add(verge, "c", 2, "Apple releases a new iPad with a faster chip");
+        crate::story_groups::group_new_stories(&db).unwrap();
+
+        let (mut app, _) = RssApp::new(db, false);
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::All));
+        let _ = app.update(super::Message::ToggleGrouped);
+        let sizes: Vec<usize> = app.story_groups.iter().map(|g| g.members.len()).collect();
+        assert_eq!(sizes, [1, 2], "the iPad story, then the Spirit group");
+        assert_eq!(app.story_groups[1].title(), "Spirit Airlines data sold to Google in bankruptcy sale");
+
+        let group = app.story_groups[1].group;
+        let _ = app.update(super::Message::SelectGroup(group));
+        let open = app.reader_group.as_ref().expect("group open");
+        let titles: Vec<&str> = open.stories.iter().map(|(a, _)| a.title.as_str()).collect();
+        assert_eq!(titles[0], "Spirit Airlines data sold to Google in bankruptcy sale", "oldest first");
+        assert_eq!(app.story_groups[1].unread(), 0, "opening the group read it");
+        assert_eq!(app.stats.2, 1, "one unread story left");
+
+        // Left goes back to the iPad story
+        let _ = app.update(super::Message::SelectAdjacentStory(false));
+        assert!(app.reader_group.is_none());
+        assert_eq!(app.open_article.as_ref().map(|a| a.title.as_str()), Some("Apple releases a new iPad with a faster chip"));
+        assert_eq!(app.story_groups[0].unread(), 0, "read in the grouped list too");
     }
 
     /// Opening a different story closes the find bar; reopening the same

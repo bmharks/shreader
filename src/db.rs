@@ -318,6 +318,9 @@ impl Database {
         // Migration: user-defined folder order (NULL = not yet arranged; those
         // sort alphabetically after arranged folders)
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER", []);
+        // Migration: each story's group (see story_groups.rs)
+        let _ = conn.execute("ALTER TABLE articles ADD COLUMN group_id INTEGER", []);
+        let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_group ON articles(group_id)", []);
         // Migration: how much each feed has added today (UTC), for the daily
         // allowance that stops one feed from filling the disk
         let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_day TEXT", []);
@@ -924,6 +927,14 @@ impl Database {
             params_vec.push(Box::new(folder_id));
         }
 
+        // Numbers only (from `group_members`), so safe to put in the query;
+        // matching the index on group_id
+        if let Some(groups) = &filter.groups {
+            if groups.split(',').all(|g| g.parse::<i64>().is_ok()) {
+                clause.push_str(&format!(" AND (a.group_id IN ({0}) OR (a.group_id IS NULL AND a.id IN ({0})))", groups));
+            }
+        }
+
         if let Some(article_id) = filter.article_id {
             clause.push_str(" AND a.id = ?");
             params_vec.push(Box::new(article_id));
@@ -947,6 +958,77 @@ impl Database {
         }
 
         (clause, params_vec)
+    }
+
+    /// The oldest `limit` stories not grouped yet, plus (as context) the
+    /// grouped stories from up to `window_seconds` before the first of them
+    /// to the last of them, for `story_groups::assign_groups`.
+    pub fn stories_to_group(&self, limit: usize, window_seconds: i64) -> Result<Vec<crate::story_groups::StoryText>> {
+        let conn = self.lock();
+        const SHOWN: &str = "MIN(COALESCE(published_at, fetched_at), fetched_at)";
+        let row = |r: &rusqlite::Row| -> rusqlite::Result<crate::story_groups::StoryText> {
+            let date: String = r.get(2)?;
+            Ok(crate::story_groups::StoryText {
+                id: r.get(0)?,
+                feed: r.get(1)?,
+                time: DateTime::parse_from_rfc3339(&date).map(|d| d.timestamp()).unwrap_or(0),
+                title: r.get(3)?,
+                text: r.get(4)?,
+                group: r.get(5)?,
+            })
+        };
+        let columns = format!(
+            "id, feed_id, {SHOWN}, title, substr(COALESCE(content_text, ''), 1, {}), group_id",
+            crate::story_groups::TEXT_CHARS + 200
+        );
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {columns} FROM articles WHERE group_id IS NULL ORDER BY {SHOWN}, id LIMIT ?1"
+        ))?;
+        let mut stories: Vec<crate::story_groups::StoryText> =
+            stmt.query_map(params![limit as i64], row)?.collect::<rusqlite::Result<_>>()?;
+        let (Some(first), Some(last)) = (stories.first(), stories.last()) else {
+            return Ok(stories);
+        };
+        // The dates as stored (UTC RFC 3339, which sorts as text)
+        let as_stored = |t: i64| DateTime::<Utc>::from_timestamp(t, 0).unwrap_or_default().to_rfc3339();
+        let (from, to) = (as_stored(first.time - window_seconds), as_stored(last.time + 1));
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {columns} FROM articles WHERE group_id IS NOT NULL AND {SHOWN} >= ?1 AND {SHOWN} < ?2"
+        ))?;
+        let context: Vec<crate::story_groups::StoryText> =
+            stmt.query_map(params![from, to], row)?.collect::<rusqlite::Result<_>>()?;
+        stories.extend(context);
+        Ok(stories)
+    }
+
+    /// Records stories' groups.
+    pub fn set_groups(&self, groups: &[(i64, i64)]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE articles SET group_id = ?2 WHERE id = ?1")?;
+            for (story, group) in groups {
+                stmt.execute(params![story, group])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The stories matching `filter` in any of `groups`, newest first: the
+    /// rest of each group shown on a page of the grouped view.
+    pub fn group_members(&self, filter: &ArticleFilter, groups: &[i64]) -> Result<Vec<Article>> {
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list: Vec<String> = groups.iter().map(i64::to_string).collect();
+        let filter = ArticleFilter {
+            groups: Some(list.join(",")),
+            limit: None,
+            offset: None,
+            ..filter.clone()
+        };
+        self.get_articles(&filter)
     }
 
     /// How many stories match `filter` (its limit and offset aside).
@@ -1012,7 +1094,7 @@ impl Database {
             SELECT
                 a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
                 a.title, a.url, a.author, NULL, NULL, NULL,
-                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
+                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred, a.group_id
             FROM articles a
             JOIN feeds f ON f.id = a.feed_id
             WHERE {}
@@ -1056,6 +1138,7 @@ impl Database {
                     .unwrap_or_else(|_| Utc::now()),
                 is_read: row.get::<_, i64>(14)? != 0,
                 is_starred: row.get::<_, i64>(15)? != 0,
+                group_id: row.get(16)?,
             })
         })?;
 
@@ -1073,7 +1156,7 @@ impl Database {
             SELECT 
                 a.id, a.feed_id, f.title as feed_title, a.guid, a.guid_hash,
                 a.title, a.url, a.author, a.summary, a.content_html, a.content_text,
-                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred
+                a.published_at, a.updated_at, a.fetched_at, a.is_read, a.is_starred, a.group_id
             FROM articles a
             JOIN feeds f ON f.id = a.feed_id
             WHERE a.id = ?1
@@ -1104,6 +1187,7 @@ impl Database {
                     .unwrap_or_else(|_| Utc::now()),
                 is_read: row.get::<_, i64>(14)? != 0,
                 is_starred: row.get::<_, i64>(15)? != 0,
+                group_id: row.get(16)?,
             })
         }).optional()?;
 

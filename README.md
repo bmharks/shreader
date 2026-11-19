@@ -26,6 +26,7 @@ To uninstall, run `packaging/install.sh --uninstall`. Your archive is left in pl
 - **Add a feed** with **+ Feed** above the feed list. Paste the feed's address; Shreader looks it up and fills in its name.
 - **Right-click** a feed or folder for more: refresh it, mark it read or unread, rename or delete it, or move a feed to another folder.
 - **Drag** feeds by their handle into another folder or position, and folders to reorder them.
+- **Grouped** (above the story list) gathers stories about the same thing, from any feed, into one entry; open it to read them all together, oldest first. Turn it off for the plain list.
 - **Settings** (the gear icon) has automatic refresh, image loading, OPML import and export, and clearing archived stories.
 - **Closing the window** keeps Shreader running in the system tray, so feeds keep refreshing. Click the tray icon to open it again; quit from the tray icon's menu or with Ctrl+Q. (On desktops without a system tray, closing the window quits.)
 

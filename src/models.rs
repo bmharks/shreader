@@ -43,9 +43,17 @@ pub struct Article {
     pub fetched_at: DateTime<Utc>,
     pub is_read: bool,
     pub is_starred: bool,
+    /// The story group it belongs to (see `story_groups`): `None` until it's
+    /// been grouped. A story alone in its group has its own id.
+    pub group_id: Option<i64>,
 }
 
 impl Article {
+    /// The group it's shown under: its group, or itself if not grouped yet
+    pub fn group(&self) -> i64 {
+        self.group_id.unwrap_or(self.id)
+    }
+
     /// The date shown for the story: its publication date, but never later
     /// than when it was downloaded. Some feeds date stories in the future
     /// (often a time zone mistake); taken at face value those read "1m ago"
@@ -67,6 +75,9 @@ pub struct ArticleFilter {
     pub article_id: Option<i64>,
     /// Unread stories before read ones (each newest first)
     pub unread_first: bool,
+    /// Only stories in these groups (comma-separated ids; see
+    /// `Database::group_members`)
+    pub groups: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }

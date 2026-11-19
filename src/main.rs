@@ -13,6 +13,7 @@ pub mod on_escape;
 pub mod opml;
 pub mod spinner;
 pub mod story_content;
+pub mod story_groups;
 pub mod story_text;
 pub mod split;
 
