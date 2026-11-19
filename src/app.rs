@@ -323,7 +323,7 @@ impl StoryGroupEntry {
     }
 }
 
-/// A group open in the reader: its stories oldest first, with their bodies
+/// A group open in the reader: its stories newest first, with their bodies
 #[derive(Debug, Clone)]
 struct ReaderGroup {
     group: i64,
@@ -2924,11 +2924,11 @@ impl RssApp {
                 self.mark_story_read(member);
             }
         }
-        // Oldest first: the story as it developed
-        let stories: Vec<(Article, Vec<Block>)> = entry
-            .members
+        // Newest first (by date alone: unread first doesn't apply here)
+        let mut members = entry.members.clone();
+        members.sort_by(|a, b| b.shown_date().cmp(&a.shown_date()).then(b.id.cmp(&a.id)));
+        let stories: Vec<(Article, Vec<Block>)> = members
             .iter()
-            .rev()
             .filter_map(|member| self.db.get_article(member.id).ok().flatten())
             .map(|article| {
                 let blocks = reader_blocks(&article);
@@ -5289,7 +5289,7 @@ impl RssApp {
         .into()
     }
 
-    /// An open group in the reader: its stories one after another, oldest
+    /// An open group in the reader: its stories one after another, newest
     /// first, each under its source's name.
     fn view_reader_group<'a>(&'a self, group: &'a ReaderGroup) -> Element<'a, Message> {
         let mut sources: Vec<&str> = Vec::new();
@@ -5923,7 +5923,7 @@ mod tests {
     }
 
     /// The grouped view: a group's stories form one entry, opening it reads
-    /// them all and shows them oldest first, and the arrows step by entry.
+    /// them all and shows them newest first, and the arrows step by entry.
     #[test]
     fn grouped_view_works() {
         let db = crate::db::Database::open_in_memory().unwrap();
@@ -5950,7 +5950,7 @@ mod tests {
         let _ = app.update(super::Message::SelectGroup(group));
         let open = app.reader_group.as_ref().expect("group open");
         let titles: Vec<&str> = open.stories.iter().map(|(a, _)| a.title.as_str()).collect();
-        assert_eq!(titles[0], "Spirit Airlines data sold to Google in bankruptcy sale", "oldest first");
+        assert_eq!(titles, ["Google buys Spirit Airlines data in bankruptcy deal", "Spirit Airlines data sold to Google in bankruptcy sale"], "newest first");
         assert_eq!(app.story_groups[1].unread(), 0, "opening the group read it");
         assert_eq!(app.stats.2, 1, "one unread story left");
 
@@ -5994,9 +5994,17 @@ mod tests {
         assert_eq!(expanded(&app), 2, "none shown: Expand all");
         let _ = app.update(super::Message::ToggleGroupStories);
 
-        // Finding "judge" shows the Verge story, where it is
+        // Finding "judge" shows the Verge story, where it is (the older
+        // Reuters story's text comes after it, and isn't shown)
+        let verge_story = app.reader_group.as_ref().unwrap().stories.iter().find(|(a, _)| a.title.starts_with("Google")).unwrap().0.id;
+        assert_eq!(ids[0], verge_story, "newest first");
         let _ = app.update(super::Message::OpenFind);
         let _ = app.update(super::Message::FindQueryChanged("judge".into()));
+        let open = app.reader_group.as_ref().unwrap();
+        assert_eq!(open.expanded.iter().copied().collect::<Vec<_>>(), [verge_story]);
+        // And "court" the Reuters story, the second
+        let _ = app.update(super::Message::ToggleGroupStories);
+        let _ = app.update(super::Message::FindQueryChanged("court".into()));
         let open = app.reader_group.as_ref().unwrap();
         assert_eq!(open.expanded.iter().copied().collect::<Vec<_>>(), [ids[1]]);
     }
