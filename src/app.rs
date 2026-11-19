@@ -173,6 +173,8 @@ pub struct RssApp {
     model_info: Option<crate::training::ModelInfo>,
     /// The model is being trained (and recent stories regrouped)
     training_model: bool,
+    /// Correcting groups by hand (replaces the main view while open)
+    group_editor: Option<crate::group_editor::GroupEditor>,
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -463,6 +465,8 @@ pub enum Message {
     StopLabelling,
     Labelling(crate::training::LabelEvent),
     ModelTrained(Result<Option<crate::training::ModelInfo>, String>),
+    OpenGroupEditor,
+    Editor(crate::group_editor::EditorMessage),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -628,6 +632,7 @@ impl RssApp {
             ollama_labels: (0, 0),
             model_info,
             training_model: false,
+            group_editor: None,
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -1361,6 +1366,38 @@ impl RssApp {
             Message::StopLabelling => {
                 self.labelling = None; // dropping the handle stops it
                 self.labelling_ended()
+            }
+            Message::OpenGroupEditor => {
+                match crate::group_editor::GroupEditor::load(&self.db) {
+                    Ok(editor) => {
+                        self.settings = None;
+                        self.group_editor = Some(editor);
+                    }
+                    Err(e) => self.status_message = Some((format!("Couldn't load the groups: {:#}", e), true)),
+                }
+                Task::none()
+            }
+            Message::Editor(crate::group_editor::EditorMessage::Done) => {
+                let Some(editor) = self.group_editor.take() else {
+                    return Task::none();
+                };
+                if !editor.changed {
+                    return Task::none();
+                }
+                // The corrections stand already; the model learns from them
+                // (and regroups the rest), if there's enough to learn from
+                if self.grouped {
+                    self.reload_articles();
+                }
+                self.train_model()
+            }
+            Message::Editor(message) => {
+                if let Some(editor) = &mut self.group_editor {
+                    if let Err(e) = editor.update(&self.db, message) {
+                        self.status_message = Some((format!("Couldn't save that change: {}", e), true));
+                    }
+                }
+                Task::none()
             }
             Message::ModelTrained(result) => {
                 self.training_model = false;
@@ -3560,6 +3597,18 @@ impl RssApp {
                 .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
             ollama_row,
             label_row,
+            row![
+                text("Check the last week's groups and correct them; the grouping learns from your corrections.")
+                    .size(12)
+                    .style(text::secondary)
+                    .width(Length::Fill),
+                button(text("Correct groups…").size(12))
+                    .padding([4, 10])
+                    .style(button::secondary)
+                    .on_press(Message::OpenGroupEditor),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
             text(if self.training_model {
                 "Learning from the examples and regrouping recent stories…".to_string()
             } else if let Some(info) = &self.model_info {
@@ -4016,19 +4065,20 @@ impl RssApp {
     }
 
     pub fn view(&self, _window: iced::window::Id) -> Element<'_, Message> {
-        let sidebar = self.view_sidebar();
-        let article_list = self.view_article_list();
-        let reader_view = self.view_reader();
-
-        let content = row![
-            sidebar,
-            vertical_rule(1),
-            split(article_list, reader_view, self.article_list_width, Message::ArticleListResized)
-                .min_widths(ARTICLE_LIST_MIN_WIDTH, READER_MIN_WIDTH)
-                .on_resize_end(Message::ArticleListResizeEnded),
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill);
+        let editing = self.group_editor.is_some();
+        let content: Element<'_, Message> = match &self.group_editor {
+            Some(editor) => editor.view().map(Message::Editor),
+            None => row![
+                self.view_sidebar(),
+                vertical_rule(1),
+                split(self.view_article_list(), self.view_reader(), self.article_list_width, Message::ArticleListResized)
+                    .min_widths(ARTICLE_LIST_MIN_WIDTH, READER_MIN_WIDTH)
+                    .on_resize_end(Message::ArticleListResizeEnded),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        };
 
         // Left/Right arrows step through the story list, Up/Down scroll the
         // open story. Only keys nothing else used: a focused search or rename
@@ -4037,7 +4087,9 @@ impl RssApp {
             use iced::keyboard::key::Named;
             match key.as_ref() {
                 // Ctrl+F: find in the story
-                iced::keyboard::Key::Character(c) if modifiers.command() && c.eq_ignore_ascii_case("f") => {
+                iced::keyboard::Key::Character(c)
+                    if modifiers.command() && c.eq_ignore_ascii_case("f") && !editing =>
+                {
                     return Some(Message::OpenFind);
                 }
                 // Ctrl+Q: quit, even when closing the window wouldn't
@@ -4046,7 +4098,8 @@ impl RssApp {
                 }
                 _ => {}
             }
-            if !modifiers.is_empty() {
+            // The story keys don't apply while correcting groups
+            if !modifiers.is_empty() || editing {
                 return None;
             }
             match key.as_ref() {
@@ -4994,7 +5047,7 @@ impl RssApp {
     }
 }
 
-fn format_date(dt: DateTime<Utc>) -> String {
+pub(crate) fn format_date(dt: DateTime<Utc>) -> String {
     let now = Utc::now();
     let diff = now.signed_duration_since(dt);
 

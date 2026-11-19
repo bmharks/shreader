@@ -1185,6 +1185,61 @@ impl Database {
         Ok(conn.query_row("SELECT COUNT(*) FROM story_embeddings", [], |r| r.get(0))?)
     }
 
+    /// The stories dated `since` or later, for correcting their groups:
+    /// (id, title, feed's title, date, start of text, group).
+    #[allow(clippy::type_complexity)]
+    pub fn stories_for_correcting(
+        &self,
+        since: &str,
+    ) -> Result<Vec<(i64, String, String, DateTime<Utc>, String, Option<i64>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.title, f.title, MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at),
+                    substr(COALESCE(a.content_text, ''), 1, 400), a.group_id
+             FROM articles a JOIN feeds f ON f.id = a.feed_id
+             WHERE MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                let date: String = r.get(3)?;
+                let date = DateTime::parse_from_rfc3339(&date).map(|d| d.with_timezone(&Utc)).unwrap_or_default();
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, date, r.get(4)?, r.get(5)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Sets (`Some`) or removes (`None`) `source`'s labels of these pairs,
+    /// all at once. Returns each pair's previous label, for undoing.
+    pub fn set_pair_labels(
+        &self,
+        labels: &[((i64, i64), Option<bool>)],
+        source: &str,
+    ) -> Result<Vec<((i64, i64), Option<bool>)>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut previous = Vec::with_capacity(labels.len());
+        {
+            let mut get = tx.prepare("SELECT same FROM pair_labels WHERE a = ?1 AND b = ?2 AND source = ?3")?;
+            let mut set = tx.prepare("INSERT OR REPLACE INTO pair_labels (a, b, source, same) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut remove = tx.prepare("DELETE FROM pair_labels WHERE a = ?1 AND b = ?2 AND source = ?3")?;
+            for &((a, b), same) in labels {
+                if a == b {
+                    continue;
+                }
+                let (a, b) = (a.min(b), a.max(b));
+                let before: Option<i64> = get.query_row(params![a, b, source], |r| r.get(0)).optional()?;
+                previous.push(((a, b), before.map(|v| v != 0)));
+                match same {
+                    Some(same) => set.execute(params![a, b, source, same as i64])?,
+                    None => remove.execute(params![a, b, source])?,
+                };
+            }
+        }
+        tx.commit()?;
+        Ok(previous)
+    }
+
     /// Takes away the groups of the stories dated `since` or later, to be
     /// grouped again.
     pub fn clear_groups_since(&self, since: &str) -> Result<usize> {
