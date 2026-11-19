@@ -187,8 +187,6 @@ pub struct RssApp {
     /// Corrections were made in the open group (known by its first story):
     /// retrain once it's left
     retrain_after: Option<i64>,
-    /// Correcting groups by hand (replaces the main view while open)
-    group_editor: Option<crate::group_editor::GroupEditor>,
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -354,7 +352,7 @@ struct GroupCorrections {
 /// A correction made to the open group, as it can be undone
 #[derive(Debug, Clone)]
 struct UndoStep {
-    correction: crate::group_editor::Correction,
+    correction: crate::group_corrections::Correction,
     /// The story it took out, which undoing puts back
     put_back: Option<i64>,
     /// The stories it brought in, which undoing takes out
@@ -550,8 +548,6 @@ pub enum Message {
     StopLabelling,
     Labelling(crate::training::LabelEvent),
     ModelTrained(Result<Option<crate::training::ModelInfo>, String>),
-    OpenGroupEditor,
-    Editor(crate::group_editor::EditorMessage),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -720,7 +716,6 @@ impl RssApp {
             training_model: false,
             retrain_after: None,
             joining: None,
-            group_editor: None,
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -1495,38 +1490,6 @@ impl RssApp {
                 self.labelling = None; // dropping the handle stops it
                 self.labelling_ended()
             }
-            Message::OpenGroupEditor => {
-                match crate::group_editor::GroupEditor::load(&self.db) {
-                    Ok(editor) => {
-                        self.settings = None;
-                        self.group_editor = Some(editor);
-                    }
-                    Err(e) => self.status_message = Some((format!("Couldn't load the groups: {:#}", e), true)),
-                }
-                Task::none()
-            }
-            Message::Editor(crate::group_editor::EditorMessage::Done) => {
-                let Some(editor) = self.group_editor.take() else {
-                    return Task::none();
-                };
-                if !editor.changed {
-                    return Task::none();
-                }
-                // The corrections stand already; the model learns from them
-                // (and regroups the rest), if there's enough to learn from
-                if self.grouped {
-                    self.reload_articles();
-                }
-                self.train_model()
-            }
-            Message::Editor(message) => {
-                if let Some(editor) = &mut self.group_editor {
-                    if let Err(e) = editor.update(&self.db, message) {
-                        self.status_message = Some((format!("Couldn't save that change: {}", e), true));
-                    }
-                }
-                Task::none()
-            }
             Message::ModelTrained(result) => {
                 self.training_model = false;
                 match result {
@@ -2053,7 +2016,7 @@ impl RssApp {
                     .iter()
                     .map(|a| a.id)
                     .collect();
-                match crate::group_editor::remove_from_group(&self.db, story, group, &members) {
+                match crate::group_corrections::remove_from_group(&self.db, story, group, &members) {
                     Ok((remaining, correction)) => {
                         let open = self.reader_group.as_mut().expect("open");
                         open.group = remaining;
@@ -2078,7 +2041,7 @@ impl RssApp {
                     .filter(|id| !open.corrections.removed.contains(id))
                     .collect();
                 let group = open.group;
-                match crate::group_editor::confirm_group(&self.db, &ids) {
+                match crate::group_corrections::confirm_group(&self.db, &ids) {
                     Ok(correction) => {
                         let corrections = &mut self.reader_group.as_mut().expect("open").corrections;
                         corrections.confirmed = true;
@@ -2091,7 +2054,7 @@ impl RssApp {
             Message::UndoGroupCorrection => {
                 let Some(open) = &mut self.reader_group else { return Task::none() };
                 let Some(step) = open.corrections.undo.pop() else { return Task::none() };
-                if let Err(e) = crate::group_editor::undo_correction(&self.db, &step.correction) {
+                if let Err(e) = crate::group_corrections::undo_correction(&self.db, &step.correction) {
                     open.corrections.undo.push(step);
                     self.status_message = Some((format!("Couldn't undo that: {}", e), true));
                     return Task::none();
@@ -2110,7 +2073,7 @@ impl RssApp {
                     .map(|(a, _)| a.id)
                     .filter(|id| !open.corrections.removed.contains(id))
                     .collect();
-                open.corrections.confirmed = crate::group_editor::all_confirmed(&self.db, &ids);
+                open.corrections.confirmed = crate::group_corrections::all_confirmed(&self.db, &ids);
                 self.reload_articles();
                 Task::none()
             }
@@ -2133,7 +2096,7 @@ impl RssApp {
                 let moving = self.db.group_members(&all, &[joining.group]).unwrap_or_default();
                 let staying: Vec<i64> =
                     self.db.group_members(&all, &[target]).unwrap_or_default().iter().map(|a| a.id).collect();
-                let correction = match crate::group_editor::join_groups(&self.db, &moving, target, &staying) {
+                let correction = match crate::group_corrections::join_groups(&self.db, &moving, target, &staying) {
                     Ok(correction) => correction,
                     Err(e) => {
                         self.status_message = Some((format!("Couldn't change the groups: {}", e), true));
@@ -2991,7 +2954,7 @@ impl RssApp {
             _ => {
                 self.find = None;
                 let ids: Vec<i64> = entry.members.iter().map(|m| m.id).collect();
-                let confirmed = crate::group_editor::all_confirmed(&self.db, &ids);
+                let confirmed = crate::group_corrections::all_confirmed(&self.db, &ids);
                 (HashSet::new(), GroupCorrections { confirmed, ..Default::default() })
             }
         };
@@ -3939,18 +3902,9 @@ impl RssApp {
                 .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
             ollama_row,
             label_row,
-            row![
-                text("Check the last week's groups and correct them; the grouping learns from your corrections.")
-                    .size(12)
-                    .style(text::secondary)
-                    .width(Length::Fill),
-                button(text("Correct groups…").size(12))
-                    .padding([4, 10])
-                    .style(button::secondary)
-                    .on_press(Message::OpenGroupEditor),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
+            text("To correct a group, open it in the story list: the grouping learns from your corrections.")
+                .size(12)
+                .style(text::secondary),
             text(if self.training_model {
                 "Learning from the examples and regrouping recent stories…".to_string()
             } else if let Some(info) = &self.model_info {
@@ -4407,21 +4361,17 @@ impl RssApp {
     }
 
     pub fn view(&self, _window: iced::window::Id) -> Element<'_, Message> {
-        let editing = self.group_editor.is_some();
         let joining = self.joining.is_some();
-        let content: Element<'_, Message> = match &self.group_editor {
-            Some(editor) => editor.view().map(Message::Editor),
-            None => row![
-                self.view_sidebar(),
-                vertical_rule(1),
-                split(self.view_article_list(), self.view_reader(), self.article_list_width, Message::ArticleListResized)
-                    .min_widths(ARTICLE_LIST_MIN_WIDTH, READER_MIN_WIDTH)
-                    .on_resize_end(Message::ArticleListResizeEnded),
-            ]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        };
+        let content: Element<'_, Message> = row![
+            self.view_sidebar(),
+            vertical_rule(1),
+            split(self.view_article_list(), self.view_reader(), self.article_list_width, Message::ArticleListResized)
+                .min_widths(ARTICLE_LIST_MIN_WIDTH, READER_MIN_WIDTH)
+                .on_resize_end(Message::ArticleListResizeEnded),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
 
         // Left/Right arrows step through the story list, Up/Down scroll the
         // open story. Only keys nothing else used: a focused search or rename
@@ -4431,7 +4381,7 @@ impl RssApp {
             match key.as_ref() {
                 // Ctrl+F: find in the story
                 iced::keyboard::Key::Character(c)
-                    if modifiers.command() && c.eq_ignore_ascii_case("f") && !editing =>
+                    if modifiers.command() && c.eq_ignore_ascii_case("f") =>
                 {
                     return Some(Message::OpenFind);
                 }
@@ -4446,8 +4396,7 @@ impl RssApp {
                 }
                 _ => {}
             }
-            // The story keys don't apply while correcting groups
-            if !modifiers.is_empty() || editing {
+            if !modifiers.is_empty() {
                 return None;
             }
             match key.as_ref() {

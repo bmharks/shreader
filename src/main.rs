@@ -5,7 +5,7 @@ pub mod desktop;
 pub mod embeddings;
 pub mod feed;
 pub mod follow_cursor;
-pub mod group_editor;
+pub mod group_corrections;
 pub mod key_press;
 pub mod lazy_load;
 pub mod icons;

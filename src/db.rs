@@ -1185,30 +1185,6 @@ impl Database {
         Ok(conn.query_row("SELECT COUNT(*) FROM story_embeddings", [], |r| r.get(0))?)
     }
 
-    /// The stories dated `since` or later, for correcting their groups:
-    /// (id, title, feed's title, date, start of text, group).
-    #[allow(clippy::type_complexity)]
-    pub fn stories_for_correcting(
-        &self,
-        since: &str,
-    ) -> Result<Vec<(i64, String, String, DateTime<Utc>, String, Option<i64>)>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT a.id, a.title, f.title, MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at),
-                    substr(COALESCE(a.content_text, ''), 1, 400), a.group_id
-             FROM articles a JOIN feeds f ON f.id = a.feed_id
-             WHERE MIN(COALESCE(a.published_at, a.fetched_at), a.fetched_at) >= ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![since], |r| {
-                let date: String = r.get(3)?;
-                let date = DateTime::parse_from_rfc3339(&date).map(|d| d.with_timezone(&Utc)).unwrap_or_default();
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, date, r.get(4)?, r.get(5)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
-    }
-
     /// Sets (`Some`) or removes (`None`) `source`'s labels of these pairs,
     /// all at once. Returns each pair's previous label, for undoing.
     pub fn set_pair_labels(
