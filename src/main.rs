@@ -13,6 +13,7 @@ pub mod models;
 pub mod ollama;
 pub mod on_escape;
 pub mod opml;
+pub mod pair_model;
 pub mod spinner;
 pub mod story_content;
 pub mod story_groups;

@@ -9,7 +9,7 @@
 //! few nearest neighbours by embedding, from around the same time. Pairs
 //! that far apart in meaning are different stories anyway.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures::stream::{self, StreamExt};
 
@@ -162,6 +162,125 @@ pub async fn label_with_ollama<P, Fut>(
     let _ = report.send(LabelEvent::Finished(Ok(done))).await;
 }
 
+/// Labelled pairs needed before the learned model is used for grouping
+pub const MIN_EXAMPLES: usize = 200;
+
+/// How much one of the user's answers counts, against one of Ollama's
+const USER_WEIGHT: f32 = 5.0;
+
+/// Every labelled pair as a training example (pairs whose stories are gone,
+/// or have no embedding, left out). The user's answer about a pair replaces
+/// Ollama's. Returns ((a, b), example).
+pub fn labelled_examples(db: &Database) -> anyhow::Result<Vec<((i64, i64), crate::pair_model::Example)>> {
+    let mut labels: HashMap<(i64, i64), (bool, f32)> = HashMap::new();
+    for (a, b, source, same) in db.pair_labels()? {
+        let weight = if source == SOURCE_USER { USER_WEIGHT } else { 1.0 };
+        let entry = labels.entry((a, b)).or_insert((same, weight));
+        if source == SOURCE_USER {
+            *entry = (same, weight);
+        }
+    }
+    let ids: Vec<i64> = labels.keys().flat_map(|&(a, b)| [a, b]).collect::<HashSet<_>>().into_iter().collect();
+    // Words are weighed against recent stories in general, as when grouping
+    let since = chrono::Utc::now() - chrono::Duration::days(crate::embeddings::RECENT_DAYS);
+    let stories = db.story_texts(&since.to_rfc3339(), &ids)?;
+    let embeddings = db.get_embeddings(&ids)?;
+    let vectors = crate::story_groups::word_vectors(&stories);
+    let titles: Vec<HashSet<String>> = stories.iter().map(|s| crate::story_groups::title_words(&s.title)).collect();
+    let index: HashMap<i64, usize> = stories.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
+    let pair_story = |id: i64| -> Option<crate::pair_model::PairStory> {
+        let i = *index.get(&id)?;
+        Some(crate::pair_model::PairStory {
+            story: &stories[i],
+            embedding: embeddings.get(&id)?,
+            words: &vectors[i],
+            title: &titles[i],
+        })
+    };
+    let mut examples: Vec<((i64, i64), crate::pair_model::Example)> = labels
+        .into_iter()
+        .filter_map(|((a, b), (same, weight))| {
+            let features = crate::pair_model::features(&pair_story(a)?, &pair_story(b)?);
+            Some(((a, b), crate::pair_model::Example { features, same, weight }))
+        })
+        .collect();
+    examples.sort_by_key(|(pair, _)| *pair);
+    Ok(examples)
+}
+
+/// Whether a pair is one of the fifth held back to test the model on
+/// (the same pairs every time)
+pub fn held_out(pair: (i64, i64)) -> bool {
+    (pair.0.wrapping_mul(31).wrapping_add(pair.1)).rem_euclid(5) == 0
+}
+
+/// A trained model, with how it did on examples held back from it
+#[derive(Debug, Clone)]
+pub struct Trained {
+    pub model: crate::pair_model::PairModel,
+    pub examples: usize,
+    pub score: crate::pair_model::Score,
+}
+
+/// Trains the grouping model on every label. `None` if there aren't enough
+/// yet. Tests it on a fifth of them first (trained without those), then
+/// learns from them all. CPU work: off the UI thread.
+pub fn train(db: &Database) -> anyhow::Result<Option<Trained>> {
+    use crate::pair_model::{Example, PairModel, Score};
+    let examples = labelled_examples(db)?;
+    if examples.len() < MIN_EXAMPLES {
+        return Ok(None);
+    }
+    let (test, learn): (Vec<_>, Vec<_>) = examples.iter().partition(|(pair, _)| held_out(*pair));
+    let learn: Vec<Example> = learn.into_iter().map(|(_, e)| e.clone()).collect();
+    let score = match PairModel::train(&learn) {
+        Some(model) => Score::of(test.iter().map(|(_, e)| (model.probability(&e.features) >= 0.5, e.same))),
+        None => Score::default(),
+    };
+    let all: Vec<Example> = examples.into_iter().map(|(_, e)| e).collect();
+    Ok(PairModel::train(&all).map(|model| Trained { model, examples: all.len(), score }))
+}
+
+/// Settings key of what's known about the trained model, for Settings
+pub const MODEL_INFO_SETTING: &str = "grouping_model_info";
+
+/// What Settings says about the trained model
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInfo {
+    pub examples: usize,
+    pub tested: usize,
+    pub accuracy: f32,
+}
+
+impl ModelInfo {
+    fn to_json(&self) -> String {
+        serde_json::json!({ "examples": self.examples, "tested": self.tested, "accuracy": self.accuracy }).to_string()
+    }
+
+    pub fn load(db: &Database) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(&db.get_setting(MODEL_INFO_SETTING).ok()??).ok()?;
+        Some(Self {
+            examples: value["examples"].as_u64()? as usize,
+            tested: value["tested"].as_u64()? as usize,
+            accuracy: value["accuracy"].as_f64()? as f32,
+        })
+    }
+}
+
+/// Trains the grouping model on every label and, if there are enough,
+/// stores it and groups the recent stories again with it. CPU work: off the
+/// UI thread.
+pub fn train_and_regroup(db: &Database) -> anyhow::Result<Option<ModelInfo>> {
+    let Some(trained) = train(db)? else {
+        return Ok(None);
+    };
+    let info = ModelInfo { examples: trained.examples, tested: trained.score.examples, accuracy: trained.score.accuracy() };
+    db.set_setting(crate::story_groups::MODEL_SETTING, &trained.model.to_json())?;
+    db.set_setting(MODEL_INFO_SETTING, &info.to_json())?;
+    crate::story_groups::regroup_recent(db)?;
+    Ok(Some(info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,3 +314,4 @@ mod tests {
         assert!(pairs.iter().all(|(a, b)| a < b));
     }
 }
+

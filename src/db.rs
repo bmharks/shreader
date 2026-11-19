@@ -1123,6 +1123,49 @@ impl Database {
         )?)
     }
 
+    /// Every label: (a, b, source, same), smaller id first.
+    pub fn pair_labels(&self) -> Result<Vec<(i64, i64, String, bool)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT a, b, source, same FROM pair_labels")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The stories dated `since` or later, plus any of `ids` from before, to
+    /// compare (as for grouping, but whatever their group: it's left out).
+    pub fn story_texts(&self, since: &str, ids: &[i64]) -> Result<Vec<crate::story_groups::StoryText>> {
+        let conn = self.lock();
+        const SHOWN: &str = "MIN(COALESCE(published_at, fetched_at), fetched_at)";
+        let row = |r: &rusqlite::Row| -> rusqlite::Result<crate::story_groups::StoryText> {
+            let date: String = r.get(2)?;
+            Ok(crate::story_groups::StoryText {
+                id: r.get(0)?,
+                feed: r.get(1)?,
+                time: DateTime::parse_from_rfc3339(&date).map(|d| d.timestamp()).unwrap_or(0),
+                title: r.get(3)?,
+                text: r.get(4)?,
+                group: None,
+            })
+        };
+        let columns = format!(
+            "id, feed_id, {SHOWN}, title, substr(COALESCE(content_text, ''), 1, {})",
+            crate::story_groups::TEXT_CHARS + 200
+        );
+        let mut stmt = conn.prepare(&format!("SELECT {columns} FROM articles WHERE {SHOWN} >= ?1"))?;
+        let mut stories: Vec<crate::story_groups::StoryText> =
+            stmt.query_map(params![since], row)?.collect::<rusqlite::Result<_>>()?;
+        let have: std::collections::HashSet<i64> = stories.iter().map(|s| s.id).collect();
+        let mut stmt = conn.prepare(&format!("SELECT {columns} FROM articles WHERE id = ?1"))?;
+        for &id in ids.iter().filter(|id| !have.contains(id)) {
+            if let Some(story) = stmt.query_row(params![id], row).optional()? {
+                stories.push(story);
+            }
+        }
+        Ok(stories)
+    }
+
     /// Titles of the given stories.
     pub fn titles(&self, ids: &[i64]) -> Result<std::collections::HashMap<i64, String>> {
         let conn = self.lock();
@@ -1140,6 +1183,17 @@ impl Database {
     pub fn embedding_count(&self) -> Result<i64> {
         let conn = self.lock();
         Ok(conn.query_row("SELECT COUNT(*) FROM story_embeddings", [], |r| r.get(0))?)
+    }
+
+    /// Takes away the groups of the stories dated `since` or later, to be
+    /// grouped again.
+    pub fn clear_groups_since(&self, since: &str) -> Result<usize> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "UPDATE articles SET group_id = NULL
+             WHERE group_id IS NOT NULL AND MIN(COALESCE(published_at, fetched_at), fetched_at) >= ?1",
+            params![since],
+        )?)
     }
 
     /// Records stories' groups.

@@ -169,6 +169,10 @@ pub struct RssApp {
     labelling: Option<Labelling>,
     /// Pairs Ollama has labelled, and how many it judged the same story
     ollama_labels: (i64, i64),
+    /// The learned grouping model, once trained (see `training`)
+    model_info: Option<crate::training::ModelInfo>,
+    /// The model is being trained (and recent stories regrouped)
+    training_model: bool,
     /// The main window, while it's open (it isn't while running in the tray)
     main_window: Option<iced::window::Id>,
     /// Whether the desktop shows Shreader's tray icon
@@ -458,6 +462,7 @@ pub enum Message {
     StartLabelling,
     StopLabelling,
     Labelling(crate::training::LabelEvent),
+    ModelTrained(Result<Option<crate::training::ModelInfo>, String>),
     /// The window's close button
     WindowCloseRequested,
     /// From the tray, or a second copy of the app
@@ -590,6 +595,7 @@ impl RssApp {
     /// `tray`: whether the tray icon is showing (see `desktop::start_tray`).
     pub fn new(db: Database, tray: bool) -> (Self, Task<Message>) {
         let fetcher = Arc::new(FeedFetcher::new());
+        let model_info = crate::training::ModelInfo::load(&db);
 
         let mut app = Self {
             db,
@@ -620,6 +626,8 @@ impl RssApp {
             ollama_model: crate::ollama::DEFAULT_MODEL.to_string(),
             labelling: None,
             ollama_labels: (0, 0),
+            model_info,
+            training_model: false,
             main_window: None,
             tray,
             keep_in_tray: true,
@@ -736,8 +744,22 @@ impl RssApp {
             app.reload_articles();
         }
         let open_window = app.open_main_window();
-        // Groups stories not grouped yet (all of them, the first time)
-        let group = app.group_stories();
+        // Groups stories not grouped yet (all of them, the first time). With
+        // labels but no usable model (one from an older version), it's
+        // trained first.
+        let has_model = app
+            .db
+            .get_setting(crate::story_groups::MODEL_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|json| crate::pair_model::PairModel::from_json(&json))
+            .is_some();
+        let labelled = app.db.pair_labels().map(|l| l.len()).unwrap_or(0);
+        let group = if !has_model && labelled >= crate::training::MIN_EXAMPLES {
+            app.train_model()
+        } else {
+            app.group_stories()
+        };
         (app, Task::batch([open_window, initial_task, group]))
     }
 
@@ -953,20 +975,48 @@ impl RssApp {
         )
     }
 
-    /// Groups new stories in the background (see `story_groups`), and
-    /// embeds them when grouping is in use.
+    /// Groups new stories in the background (see `story_groups`), embedding
+    /// them first when grouping is in use (the learned model needs them).
     fn group_stories(&mut self) -> Task<Message> {
         let embed = self.embed_stories();
         let db = self.db.clone();
-        Task::perform(
+        let group = Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || crate::story_groups::group_new_stories(&db).map_err(|e| e.to_string()))
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
             },
             Message::StoriesGrouped,
+        );
+        embed.chain(group)
+    }
+
+    /// Trains the grouping model on the labels so far and regroups recent
+    /// stories with it, in the background.
+    fn train_model(&mut self) -> Task<Message> {
+        if self.training_model {
+            return Task::none();
+        }
+        self.training_model = true;
+        let db = self.db.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    crate::training::train_and_regroup(&db).map_err(|e| format!("{:#}", e))
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::ModelTrained,
         )
-        .chain(embed)
+    }
+
+    /// After labelling: the counts brought up to date, and the model
+    /// retrained if there are new labels.
+    fn labelling_ended(&mut self) -> Task<Message> {
+        let before = self.ollama_labels;
+        self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+        if self.ollama_labels != before { self.train_model() } else { Task::none() }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -1310,8 +1360,26 @@ impl RssApp {
             }
             Message::StopLabelling => {
                 self.labelling = None; // dropping the handle stops it
-                self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
-                Task::none()
+                self.labelling_ended()
+            }
+            Message::ModelTrained(result) => {
+                self.training_model = false;
+                match result {
+                    Ok(Some(info)) => {
+                        tracing::info!("Grouping model trained on {} examples", info.examples);
+                        self.model_info = Some(info);
+                        if self.grouped {
+                            self.reload_articles();
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Training the grouping model failed: {}", e);
+                        self.status_message = Some((format!("Couldn't learn from the examples: {}", e), true));
+                    }
+                }
+                // Stories that arrived meanwhile
+                self.group_stories()
             }
             Message::Labelling(event) => {
                 use crate::training::LabelEvent;
@@ -1322,7 +1390,7 @@ impl RssApp {
                 }
                 if let LabelEvent::Finished(result) = &event {
                     self.labelling = None;
-                    self.ollama_labels = self.db.pair_label_counts(crate::training::SOURCE_OLLAMA).unwrap_or((0, 0));
+                    let train = self.labelling_ended();
                     self.status_message = Some(match result {
                         Ok(n) => (
                             format!("Ollama labelled {} {} of stories.", n, if *n == 1 { "pair" } else { "pairs" }),
@@ -1330,7 +1398,7 @@ impl RssApp {
                         ),
                         Err(e) => (format!("Labelling stopped: {}", e), true),
                     });
-                    return Task::none();
+                    return train;
                 }
                 if let Some(labelling) = &mut self.labelling {
                     labelling.status = event;
@@ -3492,6 +3560,23 @@ impl RssApp {
                 .style(if matches!(self.embeddings, EmbeddingStatus::Failed(_)) { text::danger } else { text::secondary }),
             ollama_row,
             label_row,
+            text(if self.training_model {
+                "Learning from the examples and regrouping recent stories…".to_string()
+            } else if let Some(info) = &self.model_info {
+                format!(
+                    "Grouping uses what it learned from {} examples. Tested on {} it hadn't seen, it agreed with {:.0}% of them.",
+                    info.examples,
+                    info.tested,
+                    info.accuracy * 100.0
+                )
+            } else {
+                format!(
+                    "Grouping goes by shared words until there are at least {} examples to learn from.",
+                    crate::training::MIN_EXAMPLES
+                )
+            })
+            .size(12)
+            .style(text::secondary),
             text("Ollama judges whether likely pairs of recent stories are the same news. Its answers are examples the grouping learns from, alongside your own corrections. A run continues where the last one stopped.")
                 .size(12)
                 .style(text::secondary),

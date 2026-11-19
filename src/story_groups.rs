@@ -36,13 +36,56 @@ pub const TEXT_CHARS: usize = 400;
 /// Stories grouped per run: memory stays small however big the archive
 const BATCH: usize = 3000;
 
-/// Groups every story not grouped yet, oldest first, in batches. Returns how
-/// many were grouped. Run after refreshes, off the UI thread.
+/// Settings key of the learned grouping model (see `pair_model`), once
+/// there is one
+pub const MODEL_SETTING: &str = "grouping_model";
+
+/// One grouping at a time: a refresh's grouping and a regrouping after
+/// training would otherwise both pick up the same ungrouped stories
+static GROUPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Groups every story not grouped yet, oldest first, in batches, with the
+/// learned model when there is one. Returns how many were grouped. Run after
+/// refreshes (and embedding), off the UI thread.
 pub fn group_new_stories(db: &crate::db::Database) -> anyhow::Result<usize> {
+    let _one_at_a_time = GROUPING.lock().unwrap_or_else(|p| p.into_inner());
+    group_unlocked(db)
+}
+
+/// Groups the recent stories again from scratch (after the model is
+/// retrained). Older stories keep their groups.
+pub fn regroup_recent(db: &crate::db::Database) -> anyhow::Result<usize> {
+    let _one_at_a_time = GROUPING.lock().unwrap_or_else(|p| p.into_inner());
+    let since = chrono::Utc::now() - chrono::Duration::days(crate::embeddings::RECENT_DAYS);
+    db.clear_groups_since(&since.to_rfc3339())?;
+    group_unlocked(db)
+}
+
+fn group_unlocked(db: &crate::db::Database) -> anyhow::Result<usize> {
+    let model = db
+        .get_setting(MODEL_SETTING)?
+        .and_then(|json| crate::pair_model::PairModel::from_json(&json));
+    let user_labels: HashMap<(i64, i64), bool> = match &model {
+        Some(_) => db
+            .pair_labels()?
+            .into_iter()
+            .filter(|(_, _, source, _)| source == crate::training::SOURCE_USER)
+            .map(|(a, b, _, same)| ((a, b), same))
+            .collect(),
+        None => HashMap::new(),
+    };
     let mut grouped = 0;
     loop {
         let stories = db.stories_to_group(BATCH, WINDOW_SECONDS)?;
-        let assigned = assign_groups(&stories);
+        let assigned = match &model {
+            Some(model) => {
+                let ids: Vec<i64> = stories.iter().map(|s| s.id).collect();
+                let embeddings = db.get_embeddings(&ids)?;
+                let judge = Judge { model, embeddings: &embeddings, user_labels: &user_labels };
+                assign_groups_judged(&stories, Some(&judge))
+            }
+            None => assign_groups(&stories),
+        };
         if assigned.is_empty() {
             return Ok(grouped);
         }
@@ -76,6 +119,12 @@ pub struct StoryText {
 /// for the newly grouped ones; a story starting its own group gets its own
 /// id as the group.
 pub fn assign_groups(stories: &[StoryText]) -> Vec<(i64, i64)> {
+    assign_groups_judged(stories, None)
+}
+
+/// Each story's weighted words (TF-IDF over `stories`, its feed's
+/// boilerplate left out, scaled to length 1), in the same order.
+pub fn word_vectors(stories: &[StoryText]) -> Vec<HashMap<String, f32>> {
     // Words of each story (less its feed's boilerplate), and how many
     // stories each word appears in
     let mut words: Vec<HashMap<String, f32>> = stories.iter().map(story_words).collect();
@@ -94,8 +143,7 @@ pub fn assign_groups(stories: &[StoryText]) -> Vec<(i64, i64)> {
     let total = stories.len() as f32;
     let idf = |word: &str| ((total + 1.0) / (document_frequency.get(word).copied().unwrap_or(0) as f32 + 1.0)).ln() + 1.0;
 
-    // Each story as a normalized weighted-word vector
-    let vectors: Vec<HashMap<String, f32>> = words
+    words
         .iter()
         .map(|story_words| {
             let mut vector: HashMap<String, f32> =
@@ -103,7 +151,32 @@ pub fn assign_groups(stories: &[StoryText]) -> Vec<(i64, i64)> {
             normalize(&mut vector);
             vector
         })
-        .collect();
+        .collect()
+}
+
+/// The learned judge of whether two stories are the same news (see
+/// `pair_model`), with what it needs. Stories without an embedding are
+/// grouped by words alone.
+pub struct Judge<'a> {
+    pub model: &'a crate::pair_model::PairModel,
+    pub embeddings: &'a HashMap<i64, Vec<f32>>,
+    /// The user's own answers, which stand whatever the model thinks
+    pub user_labels: &'a HashMap<(i64, i64), bool>,
+}
+
+/// A story joins a group (by the learned judge) if it's the same news as
+/// this many of the group's recent members, on average: as much like the
+/// group as a whole as like any one member, so loosely related stories
+/// don't chain into one ever-growing group
+const LINKAGE: usize = 2;
+
+/// How sure the judge must be that a story belongs with a group to put it there
+const JOIN_CHANCE: f32 = 0.5;
+
+/// As `assign_groups`, judging with `judge` when there is one.
+pub fn assign_groups_judged(stories: &[StoryText], judge: Option<&Judge>) -> Vec<(i64, i64)> {
+    let vectors = word_vectors(stories);
+    let titles: Vec<HashSet<String>> = stories.iter().map(|s| title_words(&s.title)).collect();
 
     struct Group {
         id: i64,
@@ -125,6 +198,8 @@ pub fn assign_groups(stories: &[StoryText]) -> Vec<(i64, i64)> {
     let mut order: Vec<usize> = (0..stories.len()).collect();
     order.sort_by_key(|&i| (stories[i].time, stories[i].id));
 
+    // Stories placed so far, in time order, with their group's slot
+    let mut placed: Vec<(usize, usize)> = Vec::new();
     let mut assigned = Vec::new();
     for i in order {
         let story = &stories[i];
@@ -139,6 +214,57 @@ pub fn assign_groups(stories: &[StoryText]) -> Vec<(i64, i64)> {
                     groups.len() - 1
                 }
             },
+            None if judge.is_some_and(|j| j.embeddings.contains_key(&story.id)) => {
+                let judge = judge.expect("checked");
+                let pair = |j: usize| crate::pair_model::PairStory {
+                    story: &stories[j],
+                    embedding: &judge.embeddings[&stories[j].id],
+                    words: &vectors[j],
+                    title: &titles[j],
+                };
+                let this = pair(i);
+                // Each open group's recent members' chances of being the
+                // same news as this story (unlikely ones not worked out)
+                let mut chances: HashMap<usize, (usize, Vec<f32>)> = HashMap::new();
+                for &(j, slot) in placed.iter().rev() {
+                    if story.time - stories[j].time > WINDOW_SECONDS {
+                        break;
+                    }
+                    if !judge.embeddings.contains_key(&stories[j].id) {
+                        continue;
+                    }
+                    let (members, found) = chances.entry(slot).or_default();
+                    *members += 1;
+                    let key = (story.id.min(stories[j].id), story.id.max(stories[j].id));
+                    let chance = match judge.user_labels.get(&key) {
+                        Some(&same) => same as u8 as f32,
+                        None => judge.model.probability_if_close(&this, &pair(j)),
+                    };
+                    if chance > 0.0 {
+                        found.push(chance);
+                    }
+                }
+                let best = chances
+                    .into_iter()
+                    .filter(|(_, (_, found))| !found.is_empty())
+                    .map(|(slot, (members, mut found))| {
+                        found.sort_by(|a, b| b.total_cmp(a));
+                        let k = LINKAGE.min(members);
+                        (slot, found.iter().take(k).sum::<f32>() / k as f32)
+                    })
+                    .filter(|(_, chance)| *chance >= JOIN_CHANCE)
+                    .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)));
+                let slot = match best {
+                    Some((slot, _)) => slot,
+                    None => {
+                        groups.push(Group { id: story.id, centroid: HashMap::new(), latest: story.time });
+                        group_index.insert(story.id, groups.len() - 1);
+                        groups.len() - 1
+                    }
+                };
+                assigned.push((story.id, groups[slot].id));
+                slot
+            }
             None => {
                 // The most similar open group sharing at least one word
                 let candidates: HashSet<usize> = vector
@@ -170,6 +296,7 @@ pub fn assign_groups(stories: &[StoryText]) -> Vec<(i64, i64)> {
             }
         };
         add_to(&mut groups[group_slot], vector, story.time);
+        placed.push((i, group_slot));
         for word in vector.keys() {
             by_word.entry(word.clone()).or_default().insert(group_slot);
         }
@@ -207,6 +334,11 @@ fn feed_boilerplate(stories: &[StoryText], words: &[HashMap<String, f32>]) -> Ha
             (feed, common)
         })
         .collect()
+}
+
+/// A headline's significant words
+pub fn title_words(title: &str) -> HashSet<String> {
+    words(title).collect()
 }
 
 /// A story's significant words and how much each counts (title words twice)
@@ -257,7 +389,7 @@ fn normalize(vector: &mut HashMap<String, f32>) {
     }
 }
 
-fn cosine(a: &HashMap<String, f32>, b: &HashMap<String, f32>) -> f32 {
+pub fn cosine(a: &HashMap<String, f32>, b: &HashMap<String, f32>) -> f32 {
     let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     let dot: f32 = small.iter().filter_map(|(word, weight)| large.get(word).map(|other| weight * other)).sum();
     let b_length = b.values().map(|w| w * w).sum::<f32>().sqrt();
@@ -394,6 +526,40 @@ mod tests {
         ];
         let groups: HashMap<i64, i64> = assign_groups(&stories).into_iter().collect();
         assert_eq!((groups[&1], groups[&2], groups[&3]), (1, 2, 3));
+    }
+
+    /// With the learned judge: alike stories group, unlike ones don't, and
+    /// the user's own answer about a pair stands whatever the model thinks
+    #[test]
+    fn judged_grouping_follows_the_user() {
+        use crate::pair_model::{Example, PairModel};
+        let mut examples = Vec::new();
+        for i in 0..20 {
+            let j = i as f32 * 0.01;
+            examples.push(Example { features: [0.9 - j, 0.6, 0.5, 0.2, 0.0], same: true, weight: 1.0 });
+            examples.push(Example { features: [0.5 + j, 0.05, 0.0, 0.5, 0.0], same: false, weight: 1.0 });
+        }
+        let model = PairModel::train(&examples).unwrap();
+        let unit = |v: [f32; 3]| {
+            let l = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / l).collect::<Vec<f32>>()
+        };
+        let stories = vec![
+            story(1, 0, "Spirit Airlines data sold to Google in bankruptcy sale", "A judge approved the sale."),
+            story(2, 1, "Judge approves Google purchase of Spirit Airlines data", "Google pays for Spirit data."),
+            story(3, 2, "Local bakery wins award for sourdough", "The bakery on Main Street won."),
+        ];
+        let embeddings: HashMap<i64, Vec<f32>> =
+            [(1, unit([1.0, 0.1, 0.0])), (2, unit([1.0, 0.12, 0.0])), (3, unit([0.0, 0.2, 1.0]))].into();
+        let mut user_labels = HashMap::new();
+        let judge = Judge { model: &model, embeddings: &embeddings, user_labels: &user_labels };
+        let groups: HashMap<i64, i64> = assign_groups_judged(&stories, Some(&judge)).into_iter().collect();
+        assert_eq!((groups[&1], groups[&2], groups[&3]), (1, 1, 3));
+        // The user says 1 and 2 are different stories
+        user_labels.insert((1, 2), false);
+        let judge = Judge { model: &model, embeddings: &embeddings, user_labels: &user_labels };
+        let groups: HashMap<i64, i64> = assign_groups_judged(&stories, Some(&judge)).into_iter().collect();
+        assert_eq!((groups[&1], groups[&2]), (1, 2));
     }
 
     #[test]
