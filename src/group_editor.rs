@@ -32,6 +32,7 @@ pub struct Story {
 
 /// One change, as it can be undone: stories' previous groups and the
 /// previous labels of the pairs it labelled
+#[derive(Debug, Clone)]
 struct Change {
     groups: Vec<(i64, i64)>,
     labels: Vec<((i64, i64), Option<bool>)>,
@@ -82,6 +83,69 @@ enum Picked {
 
 fn pair(a: i64, b: i64) -> (i64, i64) {
     (a.min(b), a.max(b))
+}
+
+/// A correction made outside this view (in an open group), as it can be
+/// undone
+#[derive(Debug, Clone)]
+pub struct Correction(Change);
+
+/// Takes `story` out of its group, whose stories are `members` (all of
+/// them, `story` included, oldest last): it's recorded as a different story
+/// from each of the others. Returns the group the others are now in (if it
+/// was named after `story`, it takes the oldest remaining story's id), and
+/// how to undo it.
+pub fn remove_from_group(db: &Database, story: i64, group: i64, members: &[i64]) -> Result<(i64, Correction), String> {
+    let others: Vec<i64> = members.iter().copied().filter(|&id| id != story).collect();
+    let mut groups = vec![(story, story)];
+    let mut previous = vec![(story, group)];
+    let mut remaining = group;
+    if group == story {
+        if let Some(&oldest) = others.last() {
+            remaining = oldest;
+            groups.extend(others.iter().map(|&id| (id, oldest)));
+            previous.extend(others.iter().map(|&id| (id, group)));
+        }
+    }
+    let labels: Vec<((i64, i64), Option<bool>)> = others.iter().map(|&other| (pair(story, other), Some(false))).collect();
+    db.set_groups(&groups).map_err(|e| e.to_string())?;
+    let previous_labels = db.set_pair_labels(&labels, SOURCE_USER).map_err(|e| e.to_string())?;
+    Ok((remaining, Correction(Change { groups: previous, labels: previous_labels })))
+}
+
+/// Records every pair of `members` as the same story.
+pub fn confirm_group(db: &Database, members: &[i64]) -> Result<Correction, String> {
+    let labels: Vec<((i64, i64), Option<bool>)> = members
+        .iter()
+        .enumerate()
+        .flat_map(|(n, &a)| members[n + 1..].iter().map(move |&b| (pair(a, b), Some(true))))
+        .collect();
+    let previous_labels = db.set_pair_labels(&labels, SOURCE_USER).map_err(|e| e.to_string())?;
+    Ok(Correction(Change { groups: Vec::new(), labels: previous_labels }))
+}
+
+/// Undoes a correction: stories go back to their groups, and the pairs it
+/// labelled to what they were.
+pub fn undo_correction(db: &Database, correction: &Correction) -> Result<(), String> {
+    db.set_groups(&correction.0.groups).map_err(|e| e.to_string())?;
+    db.set_pair_labels(&correction.0.labels, SOURCE_USER).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether the user has said every pair of `members` is the same story
+pub fn all_confirmed(db: &Database, members: &[i64]) -> bool {
+    if members.len() < 2 {
+        return false;
+    }
+    let ids: HashSet<i64> = members.iter().copied().collect();
+    let same: HashSet<(i64, i64)> = db
+        .pair_labels()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(a, b, source, same)| source == SOURCE_USER && *same && ids.contains(a) && ids.contains(b))
+        .map(|(a, b, _, _)| (a, b))
+        .collect();
+    members.iter().enumerate().all(|(n, &a)| members[n + 1..].iter().all(|&b| same.contains(&pair(a, b))))
 }
 
 impl GroupEditor {

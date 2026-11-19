@@ -182,6 +182,9 @@ pub struct RssApp {
     model_info: Option<crate::training::ModelInfo>,
     /// The model is being trained (and recent stories regrouped)
     training_model: bool,
+    /// Corrections were made in the open group (known by its first story):
+    /// retrain once it's left
+    retrain_after: Option<i64>,
     /// Correcting groups by hand (replaces the main view while open)
     group_editor: Option<crate::group_editor::GroupEditor>,
     /// The main window, while it's open (it isn't while running in the tray)
@@ -329,6 +332,22 @@ struct ReaderGroup {
     /// The stories shown in full; the rest show just their outlet and
     /// headline (all of them at first, to check they're the same news)
     expanded: HashSet<i64>,
+    /// Corrections made here (see `GroupCorrections`)
+    corrections: GroupCorrections,
+}
+
+/// Corrections made to the open group, kept while it's open (and when it's
+/// reopened)
+#[derive(Debug, Clone, Default)]
+struct GroupCorrections {
+    /// Stories taken out of the group (still shown, dimmed, until it's
+    /// opened again)
+    removed: HashSet<i64>,
+    /// The user said its stories are all the same news
+    confirmed: bool,
+    /// Newest last: each correction, the story it took out (if any) and
+    /// the group's id before it
+    undo: Vec<(crate::group_editor::Correction, Option<i64>, i64)>,
 }
 
 impl ReaderGroup {
@@ -484,6 +503,12 @@ pub enum Message {
     ToggleGroupStory(i64),
     /// In an open group: show all its stories in full, or all as headlines
     ToggleGroupStories,
+    /// In an open group: this story isn't the same news as the rest
+    RemoveFromGroup(i64),
+    /// In an open group: its stories are all the same news
+    ConfirmGroup,
+    /// In an open group: undo the last correction made to it
+    UndoGroupCorrection,
     /// Open a group of stories in the reader
     SelectGroup(i64),
     /// Background grouping finished: how many stories it grouped
@@ -664,6 +689,7 @@ impl RssApp {
             ollama_labels: (0, 0),
             model_info,
             training_model: false,
+            retrain_after: None,
             group_editor: None,
             main_window: None,
             tray,
@@ -1083,7 +1109,22 @@ impl RssApp {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let previous_status = self.status_message.clone();
-        let task = self.handle_message(message);
+        let mut task = self.handle_message(message);
+
+        // Corrections made in an open group are learned from once it's left
+        // (retraining regroups, which would reshuffle it while it's in use)
+        // (Known by its first story: a correction can change the group's id)
+        let correcting = self.reader_group.as_ref().and_then(|g| g.stories.first()).map(|(a, _)| a.id);
+        let corrected = self.reader_group.as_ref().is_some_and(|g| !g.corrections.undo.is_empty());
+        if corrected {
+            self.retrain_after = correcting;
+        } else if self.retrain_after.is_some() && self.retrain_after != correcting {
+            self.retrain_after = None;
+            task = Task::batch([task, self.train_model()]);
+        } else if self.reader_group.is_some() {
+            // All undone
+            self.retrain_after = None;
+        }
 
         // Notifications off: every message is dropped here, wherever it came from
         if !self.notifications {
@@ -1985,12 +2026,14 @@ impl RssApp {
                         Block::Image { .. } => None,
                     })
                     .unzip();
-                // Reopening the same group keeps what was expanded
-                let expanded = match &self.reader_group {
-                    Some(open) if open.group == group => open.expanded.clone(),
+                // Reopening the same group keeps what was expanded, and its corrections
+                let (expanded, corrections) = match &self.reader_group {
+                    Some(open) if open.group == group => (open.expanded.clone(), open.corrections.clone()),
                     _ => {
                         self.find = None;
-                        HashSet::new()
+                        let ids: Vec<i64> = entry.members.iter().map(|m| m.id).collect();
+                        let confirmed = crate::group_editor::all_confirmed(&self.db, &ids);
+                        (HashSet::new(), GroupCorrections { confirmed, ..Default::default() })
                     }
                 };
                 self.selected_article_id = None;
@@ -1999,7 +2042,8 @@ impl RssApp {
                 self.pressed_link = None;
                 self.menu_link = None;
                 self.reader_text_menu = None;
-                self.reader_group = Some(ReaderGroup { group, title: entry.title().to_string(), stories, expanded });
+                self.reader_group =
+                    Some(ReaderGroup { group, title: entry.title().to_string(), stories, expanded, corrections });
                 self.update_find_matches();
                 let to_top = then_redraw(scrollable::snap_to(reader_scroll_id(), scrollable::RelativeOffset::START));
                 let downloads = self.start_image_downloads();
@@ -2025,6 +2069,73 @@ impl RssApp {
                         group.expanded.clear();
                     }
                 }
+                Task::none()
+            }
+            Message::RemoveFromGroup(story) => {
+                let Some(open) = &self.reader_group else { return Task::none() };
+                let group = open.group;
+                let members: Vec<i64> = self
+                    .db
+                    .group_members(&ArticleFilter::default(), &[group])
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|a| a.id)
+                    .collect();
+                match crate::group_editor::remove_from_group(&self.db, story, group, &members) {
+                    Ok((remaining, correction)) => {
+                        let open = self.reader_group.as_mut().expect("open");
+                        open.group = remaining;
+                        open.expanded.remove(&story);
+                        let corrections = &mut open.corrections;
+                        corrections.removed.insert(story);
+                        corrections.confirmed = false;
+                        corrections.undo.push((correction, Some(story), group));
+                        self.reload_articles();
+                    }
+                    Err(e) => self.status_message = Some((format!("Couldn't change the group: {}", e), true)),
+                }
+                Task::none()
+            }
+            Message::ConfirmGroup => {
+                let Some(open) = &self.reader_group else { return Task::none() };
+                // The stories shown here: the ones the user checked
+                let ids: Vec<i64> = open
+                    .stories
+                    .iter()
+                    .map(|(a, _)| a.id)
+                    .filter(|id| !open.corrections.removed.contains(id))
+                    .collect();
+                let group = open.group;
+                match crate::group_editor::confirm_group(&self.db, &ids) {
+                    Ok(correction) => {
+                        let corrections = &mut self.reader_group.as_mut().expect("open").corrections;
+                        corrections.confirmed = true;
+                        corrections.undo.push((correction, None, group));
+                    }
+                    Err(e) => self.status_message = Some((format!("Couldn't save that: {}", e), true)),
+                }
+                Task::none()
+            }
+            Message::UndoGroupCorrection => {
+                let Some(open) = &mut self.reader_group else { return Task::none() };
+                let Some((correction, removed, group)) = open.corrections.undo.pop() else { return Task::none() };
+                if let Err(e) = crate::group_editor::undo_correction(&self.db, &correction) {
+                    open.corrections.undo.push((correction, removed, group));
+                    self.status_message = Some((format!("Couldn't undo that: {}", e), true));
+                    return Task::none();
+                }
+                open.group = group;
+                if let Some(story) = removed {
+                    open.corrections.removed.remove(&story);
+                }
+                let ids: Vec<i64> = open
+                    .stories
+                    .iter()
+                    .map(|(a, _)| a.id)
+                    .filter(|id| !open.corrections.removed.contains(id))
+                    .collect();
+                open.corrections.confirmed = crate::group_editor::all_confirmed(&self.db, &ids);
+                self.reload_articles();
                 Task::none()
             }
             Message::ToggleTopStories => {
@@ -5083,13 +5194,34 @@ impl RssApp {
     /// first, each under its source's name.
     fn view_reader_group<'a>(&'a self, group: &'a ReaderGroup) -> Element<'a, Message> {
         let mut sources: Vec<&str> = Vec::new();
-        for (story, _) in &group.stories {
+        for (story, _) in group.stories.iter().filter(|(a, _)| !group.corrections.removed.contains(&a.id)) {
             let name = story.feed_title.as_deref().unwrap_or("Feed");
             if !sources.contains(&name) {
                 sources.push(name);
             }
         }
         let all_collapsed = group.expanded.is_empty();
+        let corrections = &group.corrections;
+        let staying = group.stories.iter().filter(|(a, _)| !corrections.removed.contains(&a.id)).count();
+        // Correcting the group: in the archive at once, learned from once it's left
+        let mut correct_row = row![
+            text("Same story?").size(12).style(text::secondary),
+            if corrections.confirmed {
+                button(text("Confirmed").size(12)).padding([4, 10]).style(button::secondary)
+            } else {
+                button(text("Looks right").size(12))
+                    .padding([4, 10])
+                    .style(button::secondary)
+                    .on_press_maybe((staying > 1).then_some(Message::ConfirmGroup))
+            },
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if !corrections.undo.is_empty() {
+            correct_row = correct_row.push(
+                button(text("Undo").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::UndoGroupCorrection),
+            );
+        }
         let header = column![
             row![
                 text(&group.title).size(22).width(Length::Fill),
@@ -5100,9 +5232,10 @@ impl RssApp {
             ]
             .spacing(12)
             .align_y(Alignment::Center),
-            text(format!("{} stories from: {}", group.stories.len(), sources.join(", ")))
+            text(format!("{} stories from: {}", staying, sources.join(", ")))
                 .size(12)
                 .style(text::secondary),
+            correct_row.wrap(),
             horizontal_rule(1),
         ]
         .spacing(12);
@@ -5128,6 +5261,22 @@ impl RssApp {
                 source = source.push(text("•").size(12).style(text::secondary));
                 source = source.push(text(format!("By: {}", author)).size(12).style(text::secondary));
             }
+            // Taken out: shown dimmed, for reference (Undo puts it back)
+            if corrections.removed.contains(&story.id) {
+                body = body.push(
+                    row![
+                        column![source.wrap(), text(&story.title).size(15).style(text::secondary)]
+                            .spacing(4)
+                            .width(Length::Fill),
+                        text("Taken out").size(12).style(text::secondary),
+                    ]
+                    .spacing(12)
+                    .padding([4, 6])
+                    .align_y(Alignment::Center),
+                );
+                first_text += text_blocks;
+                continue;
+            }
             // The outlet and headline: clicking shows or hides the story
             let heading = button(
                 row![
@@ -5143,6 +5292,11 @@ impl RssApp {
             .padding([4, 6])
             .style(button::text)
             .on_press(Message::ToggleGroupStory(story.id));
+            let not_this = button(text("Not this story").size(12))
+                .padding([4, 10])
+                .style(button::secondary)
+                .on_press_maybe((staying > 1).then_some(Message::RemoveFromGroup(story.id)));
+            let heading = row![heading, not_this].spacing(8).align_y(Alignment::Center);
             if !expanded {
                 body = body.push(heading);
                 first_text += text_blocks;
@@ -5736,6 +5890,67 @@ mod tests {
         let _ = app.update(super::Message::FindQueryChanged("judge".into()));
         let open = app.reader_group.as_ref().unwrap();
         assert_eq!(open.expanded.iter().copied().collect::<Vec<_>>(), [ids[1]]);
+    }
+
+    /// Correcting an open group: taking a story out (even the one the group
+    /// is named after), undoing it, confirming the rest; leaving the group
+    /// retrains.
+    #[test]
+    fn correcting_an_open_group() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let reuters = db.add_or_update_feed("https://reuters.example/rss", "Reuters", None, None, None).unwrap();
+        let verge = db.add_or_update_feed("https://verge.example/rss", "The Verge", None, None, None).unwrap();
+        let ap = db.add_or_update_feed("https://ap.example/rss", "AP", None, None, None).unwrap();
+        let base = chrono::Utc::now() - chrono::Duration::hours(10);
+        let add = |feed: i64, hash: &str, hours: i64, title: &str| {
+            db.upsert_article(feed, None, hash, title, None, None, Some(title), None, Some(title),
+                Some(base + chrono::Duration::hours(hours)), None).unwrap();
+        };
+        add(reuters, "a", 0, "Spirit Airlines data sold to Google in bankruptcy sale");
+        add(verge, "b", 1, "Google buys Spirit Airlines data in bankruptcy deal");
+        add(ap, "c", 2, "Spirit Airlines bankruptcy sale sends data to Google");
+        add(verge, "d", 3, "Apple releases a new iPad with a faster chip");
+        crate::story_groups::group_new_stories(&db).unwrap();
+        let user_label = |db: &crate::db::Database, a: i64, b: i64| {
+            db.pair_labels().unwrap().into_iter().find(|l| (l.0, l.1) == (a.min(b), a.max(b)) && l.2 == "user").map(|l| l.3)
+        };
+
+        let (mut app, _) = RssApp::new(db, false);
+        let _ = app.update(super::Message::SelectFilter(super::ActiveFilter::All));
+        let _ = app.update(super::Message::ToggleGrouped);
+        let entry = app.story_groups.iter().find(|g| g.members.len() == 3).expect("the Spirit group").clone();
+        let _ = app.update(super::Message::SelectGroup(entry.group));
+        let named = entry.group;
+        let others: Vec<i64> = entry.members.iter().map(|a| a.id).filter(|&id| id != named).collect();
+
+        // Take out the story the group is named after: the rest stay together
+        let _ = app.update(super::Message::RemoveFromGroup(named));
+        let open = app.reader_group.as_ref().unwrap();
+        assert_ne!(open.group, named, "renamed");
+        assert!(open.corrections.removed.contains(&named));
+        assert_eq!(user_label(&app.db, named, others[0]), Some(false));
+        let sizes: Vec<usize> = app.story_groups.iter().map(|g| g.members.len()).collect();
+        assert_eq!(sizes.iter().filter(|&&n| n == 2).count(), 1, "the other two still a group: {:?}", sizes);
+        assert_eq!(app.retrain_after, Some(open.stories[0].0.id));
+
+        // Undo puts it back
+        let _ = app.update(super::Message::UndoGroupCorrection);
+        assert_eq!(app.reader_group.as_ref().unwrap().group, named);
+        assert_eq!(user_label(&app.db, named, others[0]), None);
+        assert!(app.story_groups.iter().any(|g| g.members.len() == 3));
+        assert_eq!(app.retrain_after, None, "nothing left to learn");
+
+        // Looks right: every pair the same story
+        let _ = app.update(super::Message::ConfirmGroup);
+        assert!(app.reader_group.as_ref().unwrap().corrections.confirmed);
+        assert_eq!(user_label(&app.db, others[0], others[1]), Some(true));
+        assert!(!app.training_model);
+
+        // Leaving the group retrains
+        let ipad = app.story_groups.iter().find(|g| g.members.len() == 1).unwrap().members[0].id;
+        let _ = app.update(super::Message::SelectArticle(ipad));
+        assert!(app.training_model, "retraining on leaving");
+        assert_eq!(app.retrain_after, None);
     }
 
     /// Top stories: groups with a story from the last day, most reported
