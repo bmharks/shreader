@@ -14,8 +14,8 @@ categories = ["gui"]
 
 [workspace]
 # Tags (see tags/): the models that sort stories into tag views, shared with
-# the trainer
-members = ["tags"]
+# the trainer (trainer/, run with `cargo run -p shreader-train`)
+members = ["tags", "trainer"]
 
 [dependencies]
 # Tag models, and the story embeddings they work from

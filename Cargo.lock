@@ -4720,6 +4720,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shreader-train"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "iced",
+ "reqwest",
+ "rusqlite",
+ "shreader-tags",
+ "tokio",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,18 @@
+[package]
+name = "shreader-train"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Trains Shreader's tags: review stories, train each tag's model, and put it to use"
+license = "MIT"
+publish = false
+
+[dependencies]
+shreader-tags = { path = "../tags" }
+# The same versions as Shreader
+rusqlite = { version = "0.41.1", features = ["bundled", "chrono"] }
+iced = { version = "0.13", features = ["tokio"] }
+tokio = { version = "1.40", features = ["rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+directories = "5.0"
+anyhow = "1.0"
