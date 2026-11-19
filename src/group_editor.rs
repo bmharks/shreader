@@ -13,6 +13,7 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input,
 use iced::{Alignment, Element, Length, Theme};
 
 use crate::db::Database;
+use crate::models::Article;
 use crate::training::{LABEL_DAYS, SOURCE_USER};
 
 /// Most single stories and groups listed at once (the newest; searching
@@ -111,6 +112,21 @@ pub fn remove_from_group(db: &Database, story: i64, group: i64, members: &[i64])
     db.set_groups(&groups).map_err(|e| e.to_string())?;
     let previous_labels = db.set_pair_labels(&labels, SOURCE_USER).map_err(|e| e.to_string())?;
     Ok((remaining, Correction(Change { groups: previous, labels: previous_labels })))
+}
+
+/// Puts the stories `moving` (a group, or one story) into group `target`,
+/// whose stories are `staying`: each of one is recorded as the same story
+/// as each of the other.
+pub fn join_groups(db: &Database, moving: &[Article], target: i64, staying: &[i64]) -> Result<Correction, String> {
+    let groups: Vec<(i64, i64)> = moving.iter().map(|a| (a.id, target)).collect();
+    let previous: Vec<(i64, i64)> = moving.iter().map(|a| (a.id, a.group())).collect();
+    let labels: Vec<((i64, i64), Option<bool>)> = moving
+        .iter()
+        .flat_map(|a| staying.iter().map(move |&b| (pair(a.id, b), Some(true))))
+        .collect();
+    db.set_groups(&groups).map_err(|e| e.to_string())?;
+    let previous_labels = db.set_pair_labels(&labels, SOURCE_USER).map_err(|e| e.to_string())?;
+    Ok(Correction(Change { groups: previous, labels: previous_labels }))
 }
 
 /// Records every pair of `members` as the same story.
