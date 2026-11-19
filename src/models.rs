@@ -76,8 +76,9 @@ pub struct ArticleFilter {
     pub starred_only: bool,
     pub search_query: Option<String>,
     /// Only stories sorted into this tag. Without it, tagged stories are
-    /// left out (they're shown in their tag instead), except when searching
-    /// and among starred stories, which include everything.
+    /// left out (they're shown in their tag instead), except among starred
+    /// stories and when searching everything (no folder, feed or unread
+    /// limit), which include them.
     pub tag_id: Option<i64>,
     /// Only this story (to check whether it's part of a view)
     pub article_id: Option<i64>,

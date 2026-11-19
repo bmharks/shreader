@@ -943,11 +943,17 @@ impl Database {
             params_vec.push(Box::new(article_id));
         }
 
-        let searching = filter.search_query.as_ref().is_some_and(|q| !q.trim().is_empty());
+        // Searching All Stories finds tagged stories too (so none is ever
+        // out of reach); searching a folder, feed or Unread keeps to what
+        // they show
+        let searching_everything = filter.search_query.as_ref().is_some_and(|q| !q.trim().is_empty())
+            && filter.folder_id.is_none()
+            && filter.feed_id.is_none()
+            && !filter.unread_only;
         if let Some(tag_id) = filter.tag_id {
             clause.push_str(" AND a.id IN (SELECT article_id FROM story_tags WHERE tag_id = ?)");
             params_vec.push(Box::new(tag_id));
-        } else if !searching && !filter.starred_only {
+        } else if !searching_everything && !filter.starred_only {
             clause.push_str(" AND NOT EXISTS (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)");
         }
 
@@ -1677,7 +1683,7 @@ mod tests {
     }
 
     /// Stories sorted into a tag are left out of their feed and folder, and
-    /// of All and Unread, but are found by searching and among starred
+    /// of All and Unread, but are found by searching All and among starred
     #[test]
     fn tagged_stories_are_kept_apart() {
         use shreader_tags::store;
@@ -1702,6 +1708,12 @@ mod tests {
         assert_eq!(count(ArticleFilter { feed_id: Some(feed), ..Default::default() }), 1);
         assert_eq!(count(ArticleFilter { tag_id: Some(tag), ..Default::default() }), 1);
         assert_eq!(count(ArticleFilter { search_query: Some("coupon".into()), ..Default::default() }), 1);
+        // Searching a folder or feed keeps to what they show
+        let search = |filter: ArticleFilter| count(ArticleFilter { search_query: Some("coupon".into()), ..filter });
+        assert_eq!(search(ArticleFilter { folder_id: Some(folder), ..Default::default() }), 0);
+        assert_eq!(search(ArticleFilter { feed_id: Some(feed), ..Default::default() }), 0);
+        assert_eq!(search(ArticleFilter { unread_only: true, ..Default::default() }), 0);
+        assert_eq!(search(ArticleFilter { tag_id: Some(tag), ..Default::default() }), 1);
         db.toggle_article_starred(promo).unwrap();
         assert_eq!(count(ArticleFilter { starred_only: true, ..Default::default() }), 1);
         assert_eq!(db.get_article(promo).unwrap().unwrap().tag_id, Some(tag));
