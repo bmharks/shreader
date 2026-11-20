@@ -212,65 +212,63 @@ pub fn import_new_feeds(opml_content: &str, db: &Database) -> Result<OpmlImport>
 
 /// Exports all subscribed feeds from the database to an OPML 2.0 XML string with folder outlines.
 pub fn export_opml_from_db(db: &Database) -> Result<String> {
+    use quick_xml::events::{BytesDecl, BytesText, Event};
+
     let folders = db.get_folders().context("Failed to get folders for OPML export")?;
     let feeds = db.get_feeds().context("Failed to get feeds for OPML export")?;
 
-    let mut out = String::new();
-    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str("<opml version=\"2.0\">\n");
-    out.push_str("  <head>\n");
-    out.push_str("    <title>Shreader RSS Reader Subscriptions</title>\n");
-    out.push_str("  </head>\n");
-    out.push_str("  <body>\n");
+    // quick-xml escapes the text and attribute values
+    let mut writer = quick_xml::Writer::new_with_indent(Vec::new(), b' ', 2);
+    writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
+    writer.create_element("opml").with_attribute(("version", "2.0")).write_inner_content(|w| {
+        w.create_element("head").write_inner_content(|w| {
+            w.create_element("title")
+                .write_text_content(BytesText::new("Shreader RSS Reader Subscriptions"))?;
+            Ok(())
+        })?;
+        w.create_element("body").write_inner_content(|w| {
+            // 1. Folders with their feeds inside (Akregator style)
+            for folder in &folders {
+                w.create_element("outline")
+                    .with_attributes([("text", folder.name.as_str()), ("title", folder.name.as_str())])
+                    .write_inner_content(|w| {
+                        for feed in feeds.iter().filter(|f| f.folder_id == Some(folder.id)) {
+                            write_feed_outline(w, feed)?;
+                        }
+                        Ok(())
+                    })?;
+            }
+            // 2. Feeds in no folder
+            for feed in feeds.iter().filter(|f| f.folder_id.is_none()) {
+                write_feed_outline(w, feed)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    })?;
 
-    // 1. Export folders with their nested feeds (Akregator style)
-    for folder in &folders {
-        let safe_folder_name = escape_xml(&folder.name);
-        out.push_str(&format!(
-            "    <outline text=\"{}\" title=\"{}\">\n",
-            safe_folder_name, safe_folder_name
-        ));
-
-        for feed in feeds.iter().filter(|f| f.folder_id == Some(folder.id)) {
-            out.push_str(&feed_outline(feed, "      "));
-        }
-
-        out.push_str("    </outline>\n");
-    }
-
-    // 2. Export uncategorized / root feeds
-    for feed in feeds.iter().filter(|f| f.folder_id.is_none()) {
-        out.push_str(&feed_outline(feed, "    "));
-    }
-
-    out.push_str("  </body>\n");
-    out.push_str("</opml>\n");
-
+    let mut out = String::from_utf8(writer.into_inner()).context("OPML export isn't UTF-8")?;
+    out.push('\n');
     Ok(out)
 }
 
-/// One feed's `<outline>` line. `htmlUrl` is left out when unknown rather
-/// than written empty.
-fn feed_outline(feed: &crate::models::Feed, indent: &str) -> String {
-    let title = escape_xml(&feed.title);
-    let mut line = format!(
-        "{indent}<outline text=\"{title}\" title=\"{title}\" type=\"rss\" xmlUrl=\"{}\"",
-        escape_xml(&feed.url)
-    );
+/// One feed's `<outline>`. `htmlUrl` is left out when unknown rather than
+/// written empty.
+fn write_feed_outline<W: std::io::Write>(
+    writer: &mut quick_xml::Writer<W>,
+    feed: &crate::models::Feed,
+) -> std::io::Result<()> {
+    let mut outline = writer.create_element("outline").with_attributes([
+        ("text", feed.title.as_str()),
+        ("title", feed.title.as_str()),
+        ("type", "rss"),
+        ("xmlUrl", feed.url.as_str()),
+    ]);
     if let Some(site) = feed.site_url.as_deref().filter(|s| !s.is_empty()) {
-        line += &format!(" htmlUrl=\"{}\"", escape_xml(site));
+        outline = outline.with_attribute(("htmlUrl", site));
     }
-    line += " />\n";
-    line
-}
-
-fn escape_xml(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    outline.write_empty()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,6 +384,9 @@ mod import_tests {
 
         let exported = export_opml_from_db(&db).unwrap();
         assert!(!exported.contains("htmlUrl=\"\""));
+        assert!(exported.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(exported.contains(r#"text="A &lt;Blog&gt;""#), "{}", exported);
+        assert!(exported.contains(r#"xmlUrl="https://a.com/feed?x=1&amp;y=2""#), "{}", exported);
 
         let copy = Database::open_in_memory().unwrap();
         let import = import_new_feeds(&exported, &copy).unwrap();
