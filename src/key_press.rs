@@ -10,6 +10,8 @@
 //!
 //! Also here: `scroll_into_view`, which scrolls a `scrollable` just enough
 //! for a container with a given id to be fully visible.
+//! And `find_anchor` / `restore_anchor`, which keep an item where it is on
+//! screen while the list around it is reloaded.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
@@ -388,5 +390,149 @@ impl Operation<Option<f32>> for FindPair {
             offset = (to_bottom - viewport.height + SCROLL_MARGIN).min(to_top - SCROLL_MARGIN).max(0.0);
         }
         operation::Outcome::Some((offset != translation.y).then_some(offset))
+    }
+}
+
+/// Where a list item sits on screen: its id and how far its top is below
+/// the top of the scrollable's viewport (negative if partly scrolled past).
+pub type Anchor<K> = (K, f32);
+
+/// Finds the item to keep in place while the scrollable `scroll_id` is
+/// reloaded: `preferred` if it's in view, otherwise the topmost item in
+/// view. `items` names the candidates (container id → key). `None` when
+/// none is in view, or when the list is at its very top and `preferred`
+/// isn't in view: there, what's new above should show.
+pub fn find_anchor<K: Clone + Send + 'static>(
+    scroll_id: scrollable::Id,
+    items: std::collections::HashMap<widget::Id, K>,
+    preferred: Option<container::Id>,
+) -> Task<Option<Anchor<K>>> {
+    iced::advanced::widget::operate(FindAnchor {
+        scroll_id: scroll_id.into(),
+        items,
+        preferred: preferred.map(Into::into),
+        scroll: None,
+        found: Vec::new(),
+    })
+}
+
+struct FindAnchor<K> {
+    scroll_id: widget::Id,
+    items: std::collections::HashMap<widget::Id, K>,
+    preferred: Option<widget::Id>,
+    /// (viewport bounds, content bounds, current translation)
+    scroll: Option<(Rectangle, Rectangle, Vector)>,
+    /// (key, bounds, is the preferred one)
+    found: Vec<(K, Rectangle, bool)>,
+}
+
+impl<K: Clone + Send + 'static> Operation<Option<Anchor<K>>> for FindAnchor<K> {
+    fn container(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        operate_on_children: &mut dyn FnMut(&mut dyn Operation<Option<Anchor<K>>>),
+    ) {
+        if let Some(key) = id.and_then(|id| self.items.get(id)) {
+            let preferred = self.preferred.as_ref() == id;
+            self.found.push((key.clone(), bounds, preferred));
+            return;
+        }
+        operate_on_children(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        _state: &mut dyn operation::Scrollable,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+    ) {
+        if id == Some(&self.scroll_id) {
+            self.scroll = Some((bounds, content_bounds, translation));
+        }
+    }
+
+    fn finish(&self) -> operation::Outcome<Option<Anchor<K>>> {
+        let Some((viewport, content, translation)) = self.scroll else {
+            return operation::Outcome::Some(None);
+        };
+        // Top of each item below the viewport's top, and whether it shows
+        let on_screen = |bounds: &Rectangle| {
+            let from_top = bounds.y - content.y - translation.y;
+            (from_top, from_top < viewport.height && from_top + bounds.height > 0.0)
+        };
+        let visible = || self.found.iter().filter(|(_, b, _)| on_screen(b).1);
+        let anchor = visible()
+            .find(|(_, _, preferred)| *preferred)
+            .or_else(|| (translation.y > 0.0).then(|| visible().min_by(|a, b| a.1.y.total_cmp(&b.1.y))).flatten())
+            .map(|(key, bounds, _)| (key.clone(), on_screen(bounds).0));
+        operation::Outcome::Some(anchor)
+    }
+}
+
+/// Scrolls the scrollable `scroll_id` so container `item_id` is
+/// `from_top` below the top of its viewport again (as far as the list can
+/// scroll). Does nothing if the item is no longer in the list.
+pub fn restore_anchor<Message: Send + 'static>(
+    scroll_id: scrollable::Id,
+    item_id: container::Id,
+    from_top: f32,
+) -> Task<Message> {
+    let find = FindItem {
+        scroll_id: scroll_id.clone().into(),
+        item_id: item_id.into(),
+        scroll: None,
+        item: None,
+    };
+    iced::advanced::widget::operate(PlaceItem { find, from_top }).then(move |offset: Option<f32>| match offset {
+        Some(y) => scrollable::scroll_to(scroll_id.clone(), scrollable::AbsoluteOffset { x: 0.0, y }),
+        None => Task::none(),
+    })
+}
+
+/// `FindItem`'s search, with a different outcome: the offset that puts the
+/// item `from_top` below the viewport's top.
+struct PlaceItem {
+    find: FindItem,
+    from_top: f32,
+}
+
+impl Operation<Option<f32>> for PlaceItem {
+    fn container(
+        &mut self,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        operate_on_children: &mut dyn FnMut(&mut dyn Operation<Option<f32>>),
+    ) {
+        if self.find.item.is_some() {
+            return;
+        }
+        if id == Some(&self.find.item_id) {
+            self.find.item = Some(bounds);
+            return;
+        }
+        operate_on_children(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        state: &mut dyn operation::Scrollable,
+        id: Option<&widget::Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+    ) {
+        self.find.scrollable(state, id, bounds, content_bounds, translation);
+    }
+
+    fn finish(&self) -> operation::Outcome<Option<f32>> {
+        let (Some((viewport, content, translation)), Some(item)) = (self.find.scroll, self.find.item) else {
+            return operation::Outcome::Some(None);
+        };
+        let max_offset = (content.height - viewport.height).max(0.0);
+        let offset = (item.y - content.y - self.from_top).clamp(0.0, max_offset);
+        operation::Outcome::Some(((offset - translation.y).abs() >= 0.5).then_some(offset))
     }
 }

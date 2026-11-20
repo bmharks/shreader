@@ -14,7 +14,7 @@ use crate::feed::{FeedFetcher, FeedPreview, StoryImage};
 use crate::story_content::{self, Block, LinkSpan};
 use crate::context_menu::context_menu;
 use crate::follow_cursor::follow_cursor;
-use crate::key_press::{on_key_press, scroll_by_step, scroll_into_view};
+use crate::key_press::{find_anchor, on_key_press, restore_anchor, scroll_by_step, scroll_into_view};
 use crate::lazy_load::on_visible;
 use crate::image_space::image_space;
 use crate::story_text::{find_matches, story_text, TextRange};
@@ -382,6 +382,9 @@ pub enum Message {
     /// Stories were sorted into tags in the background (after a refresh):
     /// how many are in one
     TagsSorted(Result<usize, String>),
+    /// Reload after a refresh, then scroll the list so this story (with
+    /// how far below the list's top it was) is back where it was
+    ReloadKeepingPlace(Option<(i64, f32)>),
     /// From the reader: a story is (`true`) or isn't in a tag
     CorrectTag(i64, i64, bool),
     /// Left/Right arrow: open the previous (`false`) or next (`true`) story
@@ -805,10 +808,21 @@ impl RssApp {
         match message {
             Message::TagsSorted(result) => {
                 match result {
-                    Ok(_) => self.reload_data(),
-                    Err(e) => tracing::warn!("Sorting stories into tags failed: {}", e),
+                    Ok(_) => self.reload_keeping_place(),
+                    Err(e) => {
+                        tracing::warn!("Sorting stories into tags failed: {}", e);
+                        Task::none()
+                    }
                 }
-                Task::none()
+            }
+            Message::ReloadKeepingPlace(anchor) => {
+                self.reload_data();
+                match anchor {
+                    Some((id, from_top)) => {
+                        then_redraw(restore_anchor(article_list_scroll_id(), story_card_id(id), from_top))
+                    }
+                    None => Task::none(),
+                }
             }
             Message::CorrectTag(article_id, tag_id, is_tag) => {
                 let name = self.tag_views.iter().find(|t| t.id == tag_id).map(|t| t.name.clone()).unwrap_or_default();
@@ -1557,8 +1571,7 @@ impl RssApp {
                         }
                         message += &held_back_note(&summaries);
                         self.status_message = Some((message, !failed.is_empty()));
-                        self.reload_data();
-                        return self.sort_into_tags();
+                        return Task::batch([self.reload_keeping_place(), self.sort_into_tags()]);
                     }
                     Err(e) => {
                         self.status_message = Some((format!("Sync failed: {}", e), true));
@@ -1649,7 +1662,6 @@ impl RssApp {
             }
             Message::PartialRefreshFinished(name, result) => {
                 self.syncs_running = self.syncs_running.saturating_sub(1);
-                self.reload_data();
                 self.status_message = Some(match result {
                     Ok(summaries) => {
                         let inserted: usize = summaries.iter().map(|s| s.articles_inserted).sum();
@@ -1691,7 +1703,7 @@ impl RssApp {
                     }
                     Err(e) => (format!("Couldn't refresh {}: {}", name, e), true),
                 });
-                self.sort_into_tags()
+                Task::batch([self.reload_keeping_place(), self.sort_into_tags()])
             }
             Message::MarkAllRead => {
                 let (target_feed, target_folder) = match self.active_filter {
@@ -2222,6 +2234,21 @@ impl RssApp {
     /// Embeds new stories in folders with tags and sorts stories into tags,
     /// in the background (see `sort_stories`). After every refresh, and at
     /// start (the trainer may have put a new model to use).
+    /// Reloads everything after stories arrived or moved without the reader
+    /// asking (a refresh, sorting into tags), keeping the story list where
+    /// it was on screen. Plain `reload_data` keeps the list's scroll offset,
+    /// so new stories above the open one pushed it down out of view.
+    ///
+    /// The open story's card stays put if it's showing, otherwise the top
+    /// one showing does. It's measured first, then `ReloadKeepingPlace`
+    /// reloads and scrolls back to it: iced lays out the new list before
+    /// running the scroll.
+    fn reload_keeping_place(&self) -> Task<Message> {
+        let cards = self.articles.iter().map(|a| (story_card_id(a.id).into(), a.id)).collect();
+        let open = self.selected_article_id.map(story_card_id);
+        find_anchor(article_list_scroll_id(), cards, open).map(Message::ReloadKeepingPlace)
+    }
+
     fn sort_into_tags(&self) -> Task<Message> {
         let db = self.db.clone();
         Task::perform(
@@ -5077,6 +5104,13 @@ mod tests {
         assert_eq!(label(2880), "2 days");
     }
 
+    /// Sorting into tags finished. The reload waits for the list to be
+    /// measured on screen, which needs a window: here it's done directly.
+    fn sorted(app: &mut super::RssApp, result: Result<usize, String>) {
+        let _ = app.update(super::Message::TagsSorted(result));
+        let _ = app.update(super::Message::ReloadKeepingPlace(None));
+    }
+
     /// A tagged story is shown in its tag instead of its folder, and
     /// correcting it from the reader moves it, keeping it open.
     #[tokio::test]
@@ -5138,8 +5172,8 @@ mod tests {
 
         // A tag no folder uses any more goes from the sidebar (and its view)
         db.with_conn(|c| store::set_folder_tag(c, folder, tag, false)).unwrap();
-        let _ = app.update(super::Message::TagsSorted(Ok(0)));
-        let _ = app.update(super::Message::TagsSorted(db.with_conn(|c| store::sort_into_tags(c)).map_err(|e| e.to_string())));
+        sorted(&mut app, Ok(0));
+        sorted(&mut app, db.with_conn(|c| store::sort_into_tags(c)).map_err(|e| e.to_string()));
         assert!(app.tag_views.is_empty());
         assert_eq!(app.active_filter, super::ActiveFilter::All);
         assert_eq!(app.articles.len(), 4);
@@ -5149,7 +5183,7 @@ mod tests {
             store::set_folder_tag(c, folder, tag, true).unwrap();
             store::sort_into_tags(c).unwrap();
         });
-        let _ = app.update(super::Message::TagsSorted(Ok(1)));
+        sorted(&mut app, Ok(1));
         assert_eq!(app.tag_views.len(), 1);
         let _ = app.update(super::Message::OpenTagMenu(tag));
         let _ = app.update(super::Message::AskDeleteTag(tag));
@@ -5169,7 +5203,7 @@ mod tests {
             again
         });
         assert_eq!(again, tag);
-        let _ = app.update(super::Message::TagsSorted(Ok(1)));
+        sorted(&mut app, Ok(1));
         assert_eq!(app.tag_views[0].total_count, 1);
         let _ = app.update(super::Message::DeleteTag { tag_id: tag, keep_training: false });
         assert!(app.tag_views.is_empty());
