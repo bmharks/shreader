@@ -688,7 +688,7 @@ impl FeedFetcher {
                 .as_ref()
                 .map(|t| feed_line(&t.content, Markup::of_title(t, &parsed_feed.feed_type), MAX_TITLE_CHARS));
             let raw_title = entry.title.map(|t| t.content).unwrap_or_else(|| "Untitled".to_string());
-            let link = entry.links.first().map(|l| clean_tracking_params(&l.href));
+            let link = entry.links.first().map(|l| l.href.clone());
             let guid = if entry.id.trim().is_empty() {
                 None
             } else {
@@ -731,9 +731,7 @@ impl FeedFetcher {
             let content_text = if state == StoredState::Unchanged {
                 None
             } else {
-                content_html.as_deref().or(summary.as_deref()).and_then(|html| {
-                    html2text::from_read(crate::story_content::limit_nesting(html).as_bytes(), 80).ok()
-                })
+                content_html.as_deref().or(summary.as_deref()).and_then(|html| crate::story_content::plain_text(html, 80))
             };
 
             let published_at = entry.published;
@@ -879,39 +877,6 @@ impl FeedFetcher {
     }
 }
 
-/// Strips tracking query parameters (such as `utm_*`, `ref`, `fbclid`, `gclid`)
-/// so links are normalized and stories are not duplicated when tracking codes change.
-pub fn clean_tracking_params(raw_url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(raw_url) {
-        let filtered_pairs: Vec<(String, String)> = parsed
-            .query_pairs()
-            .filter(|(k, _)| {
-                let lower = k.to_lowercase();
-                !lower.starts_with("utm_")
-                    && lower != "ref"
-                    && lower != "fbclid"
-                    && lower != "gclid"
-                    && lower != "mc_eid"
-                    && lower != "mc_cid"
-            })
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-
-        if filtered_pairs.is_empty() {
-            parsed.set_query(None);
-        } else {
-            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            for (k, v) in filtered_pairs {
-                serializer.append_pair(&k, &v);
-            }
-            parsed.set_query(Some(&serializer.finish()));
-        }
-        parsed.to_string()
-    } else {
-        raw_url.to_string()
-    }
-}
-
 /// Derives a deterministic canonical hash for an article.
 /// Fallback order ensures an article has a stable identifier even if
 /// the publisher doesn't supply a GUID, or changes URLs, or vice versa.
@@ -932,7 +897,7 @@ pub fn generate_guid_hash(
         hasher.update(g.trim().as_bytes());
     } else if let Some(l) = link.filter(|s| !s.trim().is_empty()) {
         hasher.update(b"link:");
-        hasher.update(clean_tracking_params(l).as_bytes());
+        hasher.update(l.trim().as_bytes());
     } else {
         hasher.update(b"title:");
         hasher.update(title.trim().as_bytes());
@@ -950,24 +915,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_clean_tracking_params() {
-        let dirty = "https://example.com/article?utm_source=twitter&utm_medium=social&id=42&ref=newsletter";
-        let clean = clean_tracking_params(dirty);
-        assert_eq!(clean, "https://example.com/article?id=42");
-
-        let pure_utm = "https://example.com/article?utm_source=rss";
-        assert_eq!(clean_tracking_params(pure_utm), "https://example.com/article");
-    }
-
-    #[test]
     fn test_guid_hash_stability() {
         let hash1 = generate_guid_hash(1, Some("guid-123"), Some("https://example.com"), "Title", None);
         let hash2 = generate_guid_hash(1, Some("guid-123"), Some("https://different-link.com"), "Title 2", None);
         assert_eq!(hash1, hash2, "Same GUID should produce identical hash regardless of link");
 
-        let hash_link1 = generate_guid_hash(1, None, Some("https://example.com/post?utm_source=rss"), "Title", None);
-        let hash_link2 = generate_guid_hash(1, None, Some("https://example.com/post"), "Title", None);
-        assert_eq!(hash_link1, hash_link2, "Same clean URL should produce identical hash");
+        let hash_link1 = generate_guid_hash(1, None, Some("https://example.com/post"), "Title", None);
+        let hash_link2 = generate_guid_hash(1, None, Some("https://example.com/post"), "Title 2", None);
+        assert_eq!(hash_link1, hash_link2, "Without a GUID, the same link is the same story");
     }
 
     /// Entries with no id and no link keep the same identity across
@@ -1345,7 +1300,33 @@ mod tests {
                         <item><guid>1</guid><title>First</title><description>One</description></item>
                         <item><guid>2</guid><title>Second</title><description>Two</description></item>
                         </channel></rss>"#;
+                    let gzip = |body: &[u8]| {
+                        use std::io::Write;
+                        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                        encoder.write_all(body).unwrap();
+                        encoder.finish().unwrap()
+                    };
+                    let accepts_gzip = request
+                        .lines()
+                        .any(|l| l.to_ascii_lowercase().starts_with("accept-encoding:") && l.contains("gzip"));
                     match path.as_str() {
+                        // Only to clients that ask for it, as servers do
+                        "/gzip" if accepts_gzip => {
+                            let body = gzip(feed.as_bytes());
+                            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                            let _ = sock.write_all(header.as_bytes()).await;
+                            let _ = sock.write_all(&body).await;
+                        }
+                        "/gzip" => {
+                            let _ = sock.write_all(b"HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        }
+                        // 26 MB of feed in about 26 KB: over the limit once unpacked
+                        "/gzip-bomb" => {
+                            let body = gzip(&vec![b' '; MAX_FEED_BYTES + 1024 * 1024]);
+                            let header = format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                            let _ = sock.write_all(header.as_bytes()).await;
+                            let _ = sock.write_all(&body).await;
+                        }
                         "/good" => {
                             let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", feed.len(), feed).as_bytes()).await;
                         }
@@ -1385,6 +1366,23 @@ mod tests {
             }
         });
         base
+    }
+
+    /// Feeds are asked for compressed and unpacked as they arrive; the size
+    /// limit applies to the unpacked feed, so a small download can't
+    /// unpack into gigabytes.
+    #[tokio::test]
+    async fn compressed_feeds_are_unpacked_within_the_size_limit() {
+        let base = test_server().await;
+        let db = Database::open_in_memory().unwrap();
+        let fetcher = FeedFetcher::new();
+        let gzip = db.add_or_update_feed(&format!("{}/gzip", base), "G", None, None, None).unwrap();
+        let summary = fetcher.fetch_and_sync(&db, gzip).await;
+        assert_eq!((summary.error.as_deref(), summary.articles_inserted), (None, 2));
+
+        let bomb = db.add_or_update_feed(&format!("{}/gzip-bomb", base), "B", None, None, None).unwrap();
+        let error = fetcher.fetch_and_sync(&db, bomb).await.error.unwrap_or_default();
+        assert!(error.contains("too large"), "{}", error);
     }
 
     /// One feed failing in any way doesn't stop the others from refreshing.

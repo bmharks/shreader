@@ -1,10 +1,19 @@
 //! Turns a story's HTML into what the reader shows: text paragraphs with the
 //! story's images in between, in their original order.
+//!
+//! The HTML is parsed once, by html5ever (the HTML standard's parser, via
+//! scraper), as a browser without scripts would. Images are chosen from the
+//! parsed elements and replaced by numbered markers; html2text then lays out
+//! the whole story in one go and reports each marker where it falls, which
+//! is where the text is split around the image.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 
+use ego_tree::NodeId;
 use html2text::render::{TaggedLine, TextDecorator};
+use html5ever::{local_name, namespace_url, ns, Attribute, QualName};
+use scraper::node::Element;
+use scraper::{Html, Node};
 
 /// One piece of a story, in reading order.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,86 +34,108 @@ pub struct LinkSpan {
     pub url: String,
 }
 
-/// Splits `html` into text and image blocks. Relative image URLs are resolved
-/// against `base_url` (the story's own link).
+/// Splits `html` into text and image blocks. Relative links and image URLs
+/// are resolved against `base_url` (the story's own link).
 pub fn blocks(html: &str, base_url: Option<&str>) -> Vec<Block> {
-    let html = &*limit_nesting(html);
     let base = base_url.and_then(|u| url::Url::parse(u).ok());
+    let mut doc = parse(html);
+    let images = mark_images(&mut doc, base.as_ref());
+
+    // Wide enough that html2text never wraps a paragraph itself
+    const NO_WRAP: usize = 100_000;
+    let Ok(lines) =
+        html2text::config::with_decorator(ReaderDecorator).lines_from_read(doc.html().as_bytes(), NO_WRAP)
+    else {
+        return Vec::new();
+    };
+
     let mut blocks = Vec::new();
-    let mut seen_images = HashSet::new();
-    let mut text_start = 0;
-    let mut cursor = 0;
-
-    while let Some((tag_start, tag_end)) = next_img_tag(html, cursor) {
-        let tag = &html[tag_start..tag_end];
-        cursor = tag_end;
-
-        let Some(src) = image_source(tag, base.as_ref()) else {
-            continue; // tracking pixel, data: URI, …: leave it out of the text too
-        };
-        push_text(&mut blocks, &html[text_start..tag_start], base.as_ref());
-        text_start = tag_end;
-        // Lazy-loading pages often repeat each image in a <noscript> fallback
-        if seen_images.insert(src.clone()) {
-            blocks.push(Block::Image { src });
+    let mut text = TextBlock::default();
+    for line in &lines {
+        let mut current = String::new();
+        // Just after an image: the space that was beside it is left out
+        let mut after_image = false;
+        for piece in line.tagged_strings() {
+            let marks = piece.tag.iter().flatten();
+            if let Some(&Mark::Image(n)) = marks.clone().find(|m| matches!(m, Mark::Image(_))) {
+                // The text so far ends a block, the image follows, and the
+                // rest of the line starts the next block
+                current.truncate(current.trim_end().len());
+                let line_number = text.lines.len();
+                for link in text.links.iter_mut().filter(|l| l.line == line_number) {
+                    link.end = link.end.min(current.len());
+                }
+                text.links.retain(|l| l.start < l.end);
+                text.lines.push(std::mem::take(&mut current));
+                text.finish(&mut blocks);
+                blocks.push(Block::Image { src: images[n].clone() });
+                after_image = true;
+                continue;
+            }
+            let piece_text = if after_image { piece.s.trim_start() } else { piece.s.as_str() };
+            if piece_text.is_empty() {
+                continue;
+            }
+            after_image = false;
+            let start = current.len();
+            current.push_str(piece_text);
+            // The innermost link, if the piece is inside one
+            let link = marks.rev().find_map(|m| match m {
+                Mark::Link(url) => Some(url),
+                Mark::Image(_) => None,
+            });
+            let Some(url) = link.and_then(|url| resolve_link(url, base.as_ref())) else {
+                continue;
+            };
+            let line_number = text.lines.len();
+            match text.links.last_mut() {
+                // A link split into pieces (e.g. by <em> inside it)
+                Some(last) if last.line == line_number && last.end == start && last.url == url => {
+                    last.end = current.len();
+                }
+                _ => text.links.push(LinkSpan { line: line_number, start, end: current.len(), url }),
+            }
         }
+        text.lines.push(current);
     }
-    push_text(&mut blocks, &html[text_start..], base.as_ref());
+    text.finish(&mut blocks);
     blocks
 }
 
-fn push_text(blocks: &mut Vec<Block>, html: &str, base: Option<&url::Url>) {
-    let (text, links) = text_with_links(html, base);
-    if !text.is_empty() {
-        blocks.push(Block::Text { text, links });
-    }
+/// Plain text of a story, wrapped at `width` columns (for search). Parsed
+/// like `blocks`; images show as html2text's usual "[alt text]".
+pub fn plain_text(html: &str, width: usize) -> Option<String> {
+    let mut doc = parse(html);
+    // Its images are left as they are, but the noscript copies of them
+    // would otherwise show as markup
+    unwrap_noscript(&mut doc);
+    html2text::from_read(doc.html().as_bytes(), width).ok()
 }
 
-/// Plain text with each paragraph on one line (the reader wraps it to the
-/// column width), and where its links are. A link shows as just its text:
-/// footnote markers like "[3]" would be noise, and would restart in every
-/// chunk between images.
-fn text_with_links(html: &str, base: Option<&url::Url>) -> (String, Vec<LinkSpan>) {
-    // Wide enough that html2text never wraps a paragraph itself
-    const NO_WRAP: usize = 100_000;
-    let Ok(lines) = html2text::config::with_decorator(ReaderDecorator).lines_from_read(html.as_bytes(), NO_WRAP)
-    else {
-        return (String::new(), Vec::new());
-    };
+/// A text block being collected: its lines, and the links in them.
+#[derive(Default)]
+struct TextBlock {
+    lines: Vec<String>,
+    links: Vec<LinkSpan>,
+}
 
-    let mut text_lines: Vec<String> = Vec::new();
-    let mut links: Vec<LinkSpan> = Vec::new();
-    for line in &lines {
-        let line_number = text_lines.len();
-        let mut text = String::new();
-        for piece in line.tagged_strings() {
-            let start = text.len();
-            text.push_str(&piece.s);
-            // The innermost link, if the piece is inside one
-            let Some(url) = piece.tag.iter().rev().find_map(|tag| tag.as_deref()) else {
-                continue;
-            };
-            let Some(url) = resolve_link(url, base) else { continue };
-            match links.last_mut() {
-                // A link split into pieces (e.g. by <em> inside it)
-                Some(last) if last.line == line_number && last.end == start && last.url == url => {
-                    last.end = text.len();
-                }
-                _ => links.push(LinkSpan { line: line_number, start, end: text.len(), url }),
-            }
+impl TextBlock {
+    /// Adds the block to `blocks`, without blank lines at its start and end
+    /// (or not at all, if that leaves nothing), and starts a new one.
+    fn finish(&mut self, blocks: &mut Vec<Block>) {
+        let TextBlock { lines, links } = std::mem::take(self);
+        let first = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(lines.len());
+        let last = lines.iter().rposition(|l| !l.trim().is_empty()).map_or(first, |i| i + 1);
+        if first == last {
+            return;
         }
-        text_lines.push(text);
+        let links = links
+            .into_iter()
+            .filter(|link| (first..last).contains(&link.line))
+            .map(|link| LinkSpan { line: link.line - first, ..link })
+            .collect();
+        blocks.push(Block::Text { text: lines[first..last].join("\n"), links });
     }
-
-    // Leave out blank lines at the start and end
-    let first = text_lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(text_lines.len());
-    let last = text_lines.iter().rposition(|l| !l.trim().is_empty()).map_or(first, |i| i + 1);
-    let links = links
-        .into_iter()
-        .filter(|link| (first..last).contains(&link.line))
-        .map(|link| LinkSpan { line: link.line - first, ..link })
-        .collect();
-    (text_lines[first..last].join("\n"), links)
 }
 
 /// A link's address made absolute, if it's one worth offering: web pages
@@ -118,260 +149,243 @@ fn resolve_link(href: &str, base: Option<&url::Url>) -> Option<String> {
     matches!(url.scheme(), "http" | "https" | "mailto").then(|| url.to_string())
 }
 
-/// The story's text alone (for tests)
-#[cfg(test)]
-fn html_to_text(html: &str) -> String {
-    text_with_links(html, None).0
-}
-
-/// Deepest tag nesting converted to text as is. Real pages stay far below
-/// this (a few dozen levels); converting gets quadratically slower with
-/// depth (100,000 nested `<div>`s, 1 MB of HTML, took 21 seconds).
+/// Deepest element nesting laid out as is. Real pages stay far below this
+/// (a few dozen levels). Deeper HTML is slow to handle: html5ever's tree
+/// builder, like a browser's, takes quadratic time on it (100,000 nested
+/// `<div>`s, 1 MB of HTML, took over 100 seconds), and so does html2text.
 const MAX_HTML_DEPTH: usize = 256;
 
-/// `html`, unless its tags nest deeper than `MAX_HTML_DEPTH`: then the same
-/// text and images with every other tag removed, so converting it stays fast.
-/// Formatting is lost only for such (hostile or broken) HTML.
-pub fn limit_nesting(html: &str) -> Cow<'_, str> {
-    if !nests_deeper_than(html, MAX_HTML_DEPTH) {
-        return Cow::Borrowed(html);
+/// Parses a story as a browser without scripts would: `<noscript>`
+/// content is real content (lazy-loading pages put their images there).
+/// HTML nested deeper than `MAX_HTML_DEPTH` is flattened instead.
+fn parse(html: &str) -> Html {
+    use html5ever::driver::{parse_document, ParseOpts};
+    use html5ever::tendril::TendrilSink;
+    use html5ever::tree_builder::TreeBuilderOpts;
+    let scan = scan(html);
+    if scan.too_deep.get() {
+        return flat_document(scan.pieces.into_inner());
     }
-    let mut flat = String::with_capacity(html.len() / 2);
-    let mut last = 0;
-    for (start, end, name, _) in tags(html) {
-        flat.push_str(&html[last..start]);
-        if name.eq_ignore_ascii_case("img") {
-            flat.push_str(&html[start..end]);
-        } else {
-            flat.push(' ');
-        }
-        last = end;
-    }
-    flat.push_str(&html[last..]);
-    Cow::Owned(flat)
-}
-
-/// Whether open tags nest more than `max` deep. Approximate, but never
-/// overcounts real HTML: elements that close themselves or are routinely
-/// left unclosed (`<br>`, `<p>`, `<li>`, …) aren't counted.
-fn nests_deeper_than(html: &str, max: usize) -> bool {
-    const UNCOUNTED: &[&str] = &[
-        // Void elements
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-        "source", "track", "wbr",
-        // End tags often omitted
-        "p", "li", "dt", "dd", "tr", "td", "th", "thead", "tbody", "tfoot", "option", "optgroup",
-        "colgroup", "rt", "rp", "caption",
-    ];
-    let mut depth: usize = 0;
-    for (_, _, name, kind) in tags(html) {
-        if UNCOUNTED.iter().any(|u| name.eq_ignore_ascii_case(u)) {
-            continue;
-        }
-        match kind {
-            TagKind::Open => {
-                depth += 1;
-                if depth > max {
-                    return true;
-                }
-            }
-            TagKind::Close => depth = depth.saturating_sub(1),
-            TagKind::SelfClosing => {}
-        }
-    }
-    false
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TagKind {
-    Open,
-    Close,
-    SelfClosing,
-}
-
-/// The tags in `html`, as (start, end, name, kind); comments and
-/// declarations (`<!…>`, `<?…>`) are skipped. A simple linear scan.
-fn tags(html: &str) -> impl Iterator<Item = (usize, usize, &str, TagKind)> {
-    let bytes = html.as_bytes();
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        while i < bytes.len() {
-            let Some(offset) = bytes[i..].iter().position(|&b| b == b'<') else {
-                i = bytes.len();
-                return None;
-            };
-            let start = i + offset;
-            let rest = &bytes[start..];
-            if rest.starts_with(b"<!--") {
-                i = match find(rest, b"-->") {
-                    Some(end) => start + end + 3,
-                    None => bytes.len(),
-                };
-                continue;
-            }
-            let closing = rest.get(1) == Some(&b'/');
-            let name_start = start + 1 + closing as usize;
-            let name_len = bytes[name_start.min(bytes.len())..]
-                .iter()
-                .take_while(|b| b.is_ascii_alphanumeric())
-                .count();
-            if name_len == 0 {
-                // "<!DOCTYPE", "<?xml", or a stray "<" in text
-                i = start + 1;
-                if matches!(rest.get(1), Some(b'!' | b'?')) {
-                    i = find(rest, b">").map_or(bytes.len(), |end| start + end + 1);
-                }
-                continue;
-            }
-            // The closing '>' that isn't inside a quoted attribute value
-            let mut quote = None;
-            let mut end = None;
-            for (j, &c) in bytes[name_start + name_len..].iter().enumerate() {
-                match (quote, c) {
-                    (None, b'"' | b'\'') => quote = Some(c),
-                    (Some(q), c) if c == q => quote = None,
-                    (None, b'>') => {
-                        end = Some(name_start + name_len + j + 1);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            let Some(end) = end else {
-                i = bytes.len(); // unterminated: the rest is text
-                return None;
-            };
-            i = end;
-            let kind = if closing {
-                TagKind::Close
-            } else if bytes[end - 2] == b'/' {
-                TagKind::SelfClosing
-            } else {
-                TagKind::Open
-            };
-            return Some((start, end, &html[name_start..name_start + name_len], kind));
-        }
-        None
-    })
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Byte range of the next `<img …>` tag at or after `from`.
-fn next_img_tag(html: &str, from: usize) -> Option<(usize, usize)> {
-    let bytes = html.as_bytes();
-    let mut i = from;
-    while i + 4 <= bytes.len() {
-        let rest = &bytes[i..];
-        if rest[0] == b'<'
-            && rest[1..4].eq_ignore_ascii_case(b"img")
-            && rest
-                .get(4)
-                .is_some_and(|c| c.is_ascii_whitespace() || *c == b'/' || *c == b'>')
-        {
-            // Find the closing '>' that isn't inside a quoted attribute value
-            let mut quote = None;
-            for (offset, &c) in rest.iter().enumerate().skip(4) {
-                match (quote, c) {
-                    (None, b'"' | b'\'') => quote = Some(c),
-                    (Some(q), c) if c == q => quote = None,
-                    (None, b'>') => return Some((i, i + offset + 1)),
-                    _ => {}
-                }
-            }
-            return None; // unterminated tag
-        }
-        i += 1;
-    }
-    None
-}
-
-/// The attributes of an `<img …>` tag, names lowercased.
-fn attributes(tag: &str) -> Vec<(String, String)> {
-    let inner = tag
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim_end_matches('/');
-    let inner = &inner[3.min(inner.len())..]; // skip "img"
-    let chars: Vec<char> = inner.chars().collect();
-    let mut attrs = Vec::new();
-    let mut i = 0;
-
-    while i < chars.len() {
-        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == '/') {
-            i += 1;
-        }
-        let name_start = i;
-        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '=' {
-            i += 1;
-        }
-        let name: String = chars[name_start..i].iter().collect::<String>().to_ascii_lowercase();
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        let mut value = String::new();
-        if i < chars.len() && chars[i] == '=' {
-            i += 1;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            if i < chars.len() && (chars[i] == '"' || chars[i] == '\'') {
-                let quote = chars[i];
-                i += 1;
-                let start = i;
-                while i < chars.len() && chars[i] != quote {
-                    i += 1;
-                }
-                value = chars[start..i].iter().collect();
-                i += 1;
-            } else {
-                let start = i;
-                while i < chars.len() && !chars[i].is_whitespace() {
-                    i += 1;
-                }
-                value = chars[start..i].iter().collect();
-            }
-        }
-        if !name.is_empty() {
-            attrs.push((name, decode_entities(&value)));
-        }
-    }
-    attrs
-}
-
-/// The few entities that commonly appear in URLs inside attributes.
-fn decode_entities(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&#38;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-}
-
-/// The URL to download for an `<img>` tag, or `None` if it should be skipped.
-fn image_source(tag: &str, base: Option<&url::Url>) -> Option<String> {
-    let attrs = attributes(tag);
-    let get = |name: &str| {
-        attrs
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.trim())
-            .filter(|v| !v.is_empty())
+    let opts = ParseOpts {
+        tree_builder: TreeBuilderOpts { scripting_enabled: false, ..Default::default() },
+        ..Default::default()
     };
+    parse_document(scraper::HtmlTreeSink::new(Html::new_document()), opts).one(html)
+}
+
+/// Elements not counted toward nesting depth: void elements, and ones whose
+/// end tag is routinely left out (counting those would overcount real HTML)
+const UNCOUNTED: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr", "p", "li", "dt", "dd", "tr", "td", "th", "thead", "tbody", "tfoot", "option",
+    "optgroup", "colgroup", "rt", "rp", "caption",
+];
+
+/// Runs html5ever's tokenizer (linear time, unlike tree building) over
+/// `html`: how deep its tags nest, roughly, and its text and images in
+/// reading order, to flatten it with if that's too deep.
+fn scan(html: &str) -> Scan {
+    use html5ever::tokenizer::{BufferQueue, Tokenizer, TokenizerOpts};
+    let input = BufferQueue::default();
+    input.push_back(html.into());
+    let tokenizer = Tokenizer::new(Scan::default(), TokenizerOpts::default());
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    tokenizer.sink
+}
+
+#[derive(Default)]
+struct Scan {
+    depth: std::cell::Cell<usize>,
+    too_deep: std::cell::Cell<bool>,
+    /// Inside an element whose content isn't shown (`<script>`, `<style>`)
+    hidden: std::cell::Cell<bool>,
+    pieces: std::cell::RefCell<Vec<Piece>>,
+}
+
+/// Text or an image, as the tokenizer found it
+enum Piece {
+    Text(scraper::StrTendril),
+    Image(Vec<Attribute>),
+}
+
+impl html5ever::tokenizer::TokenSink for Scan {
+    type Handle = ();
+
+    fn process_token(
+        &self,
+        token: html5ever::tokenizer::Token,
+        _line: u64,
+    ) -> html5ever::tokenizer::TokenSinkResult<()> {
+        use html5ever::tokenizer::states::RawKind;
+        use html5ever::tokenizer::{TagKind, Token, TokenSinkResult};
+        let mut pieces = self.pieces.borrow_mut();
+        match token {
+            Token::TagToken(tag) => {
+                let name: &str = &tag.name;
+                let counted = !UNCOUNTED.contains(&name);
+                // A tag separates the text on either side of it
+                if matches!(pieces.last(), Some(Piece::Text(t)) if !t.ends_with(char::is_whitespace)) {
+                    pieces.push(Piece::Text(" ".into()));
+                }
+                match tag.kind {
+                    TagKind::StartTag => {
+                        if counted && !tag.self_closing {
+                            self.depth.set(self.depth.get() + 1);
+                            if self.depth.get() > MAX_HTML_DEPTH {
+                                self.too_deep.set(true);
+                            }
+                        }
+                        if name == "img" && !self.hidden.get() {
+                            pieces.push(Piece::Image(tag.attrs));
+                            return TokenSinkResult::Continue;
+                        }
+                        // As the tree builder tells the tokenizer: these
+                        // elements' content is text, not markup
+                        let (raw, hidden) = match name {
+                            "script" => (RawKind::ScriptData, true),
+                            "style" | "xmp" | "iframe" | "noembed" | "noframes" => (RawKind::Rawtext, true),
+                            "title" => (RawKind::Rcdata, true),
+                            "textarea" => (RawKind::Rcdata, false),
+                            "plaintext" => return TokenSinkResult::Plaintext,
+                            _ => return TokenSinkResult::Continue,
+                        };
+                        self.hidden.set(hidden);
+                        return TokenSinkResult::RawData(raw);
+                    }
+                    TagKind::EndTag => {
+                        if counted {
+                            self.depth.set(self.depth.get().saturating_sub(1));
+                        }
+                        // In raw text, the only end tag is the element's own
+                        self.hidden.set(false);
+                    }
+                }
+            }
+            Token::CharacterTokens(text) if !self.hidden.get() => pieces.push(Piece::Text(text)),
+            _ => {}
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+/// A document of just `pieces` in `<body>`: the text and images of HTML
+/// too deeply nested to lay out, without the elements around them.
+fn flat_document(pieces: Vec<Piece>) -> Html {
+    let element =
+        |name, attrs| Node::Element(Element::new(QualName::new(None, ns!(html), name), attrs));
+    let mut doc = Html::new_document();
+    let mut root = doc.tree.root_mut();
+    let mut html = root.append(element(local_name!("html"), Vec::new()));
+    let mut body = html.append(element(local_name!("body"), Vec::new()));
+    for piece in pieces {
+        body.append(match piece {
+            Piece::Text(text) => Node::Text(scraper::node::Text { text }),
+            Piece::Image(attrs) => element(local_name!("img"), attrs),
+        });
+    }
+    doc
+}
+
+/// The elements named `name`, in document order.
+fn element_ids(doc: &Html, name: &str) -> Vec<NodeId> {
+    doc.tree
+        .root()
+        .descendants()
+        .filter(|n| matches!(n.value(), Node::Element(e) if e.name() == name))
+        .map(|n| n.id())
+        .collect()
+}
+
+/// Replaces each `<noscript>` with its content, as a browser without
+/// scripts shows it. (html2text parses as a browser with scripts, which
+/// would show the content as markup.)
+fn unwrap_noscript(doc: &mut Html) {
+    for noscript in element_ids(doc, "noscript") {
+        let children: Vec<NodeId> =
+            doc.tree.get(noscript).map(|n| n.children().map(|c| c.id()).collect()).unwrap_or_default();
+        let Some(mut node) = doc.tree.get_mut(noscript) else { continue };
+        if node.parent().is_none() {
+            continue; // already moved out of the document
+        }
+        for child in children {
+            node.insert_id_before(child);
+        }
+        node.detach();
+    }
+}
+
+/// `src` of the image markers `mark_images` leaves for html2text
+const IMAGE_MARKER: &str = "shreader-image:";
+
+/// Chooses each image's address and replaces the image with a marker
+/// (`<img src="shreader-image:N">`, N indexing the returned addresses).
+/// Images not worth showing (tracking pixels, repeats, ones without a
+/// usable address) are removed, from the text too.
+fn mark_images(doc: &mut Html, base: Option<&url::Url>) -> Vec<String> {
+    unwrap_noscript(doc);
+    let mut sources: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for id in element_ids(doc, "img") {
+        let chosen = doc.tree.get(id).and_then(|img| image_source(img, base));
+        let Some(mut node) = doc.tree.get_mut(id) else { continue };
+        match chosen {
+            // Lazy-loading pages often repeat each image in a <noscript> fallback
+            Some(src) if seen.insert(src.clone()) => {
+                let attr = |name, value: &str| Attribute {
+                    name: QualName::new(None, ns!(), name),
+                    value: value.into(),
+                };
+                let marker = format!("{}{}", IMAGE_MARKER, sources.len());
+                // html2text only reports images with alt text
+                *node.value() = Node::Element(Element::new(
+                    QualName::new(None, ns!(html), local_name!("img")),
+                    vec![attr(local_name!("src"), &marker), attr(local_name!("alt"), "image")],
+                ));
+                sources.push(src);
+            }
+            _ => node.detach(),
+        }
+    }
+    sources
+}
+
+/// Image types a `<picture>` source can be shown in
+const SHOWN_TYPES: &[&str] =
+    &["image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "image/svg+xml"];
+
+/// The address to download for an `<img>`, or `None` if it should be skipped.
+fn image_source(img: ego_tree::NodeRef<Node>, base: Option<&url::Url>) -> Option<String> {
+    let element = img.value().as_element()?;
+    let get = |name: &str| element.attr(name).map(str::trim).filter(|v| !v.is_empty());
 
     // Tracking pixels
-    let is_tiny = |name: &str| get(name).and_then(|v| v.trim_end_matches("px").parse::<u32>().ok()).is_some_and(|n| n <= 2);
+    let is_tiny =
+        |name: &str| get(name).and_then(|v| v.trim_end_matches("px").parse::<u32>().ok()).is_some_and(|n| n <= 2);
     if is_tiny("width") || is_tiny("height") {
         return None;
     }
 
-    // Lazy-loading pages put a placeholder (often a data: URI) in `src` and the
-    // real image in another attribute
+    // In a <picture>, the first <source> the browser would pick: one for any
+    // screen (a `media` query is for some screens only) in a type that shows
+    let from_picture = img
+        .parent()
+        .filter(|p| matches!(p.value(), Node::Element(e) if e.name() == "picture"))
+        .into_iter()
+        .flat_map(|picture| picture.children())
+        .take_while(|child| child.id() != img.id())
+        .filter_map(|child| child.value().as_element().filter(|e| e.name() == "source"))
+        .find(|source| {
+            source.attr("media").is_none_or(|m| m.trim().is_empty() || m.trim().eq_ignore_ascii_case("all"))
+                && source.attr("type").is_none_or(|t| SHOWN_TYPES.contains(&t.trim().to_ascii_lowercase().as_str()))
+        })
+        .and_then(|source| source.attr("srcset"))
+        .and_then(best_srcset_candidate);
+
+    // Lazy-loading pages put a placeholder (often a data: URI) in `src` and
+    // the real image in another attribute
     let candidates = [
+        from_picture,
         get("src"),
         get("data-src"),
         get("data-lazy-src"),
@@ -379,11 +393,7 @@ fn image_source(tag: &str, base: Option<&url::Url>) -> Option<String> {
         get("srcset").and_then(best_srcset_candidate),
         get("data-srcset").and_then(best_srcset_candidate),
     ];
-    let raw = candidates
-        .into_iter()
-        .flatten()
-        .find(|c| !c.starts_with("data:"))?;
-
+    let raw = candidates.into_iter().flatten().find(|c| !c.starts_with("data:"))?;
     let resolved = match base {
         Some(base) => base.join(raw).ok()?,
         None => url::Url::parse(raw).ok()?,
@@ -391,25 +401,88 @@ fn image_source(tag: &str, base: Option<&url::Url>) -> Option<String> {
     matches!(resolved.scheme(), "http" | "https").then(|| resolved.to_string())
 }
 
-/// The widest candidate in a `srcset` ("a.jpg 480w, b.jpg 1080w"), or the
-/// first one when there are no width descriptors.
+/// The best candidate in a `srcset`: the widest ("480w"), else the densest
+/// ("2x"), else the first. Parsed as the HTML standard says, so a URL may
+/// contain commas ("w_400,h_300/a.jpg 400w") and a candidate with an
+/// invalid descriptor is dropped.
 fn best_srcset_candidate(srcset: &str) -> Option<&str> {
-    srcset
-        .split(',')
-        .filter_map(|candidate| {
-            let mut parts = candidate.split_whitespace();
-            let url = parts.next()?;
-            let width = parts
-                .next()
-                .and_then(|d| d.strip_suffix('w'))
-                .and_then(|w| w.parse::<u32>().ok())
-                .unwrap_or(0);
-            Some((url, width))
-        })
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0C' | '\r');
+    let mut candidates: Vec<(&str, f64, f64)> = Vec::new(); // (url, width, density)
+    let mut rest = srcset;
+    loop {
+        rest = rest.trim_start_matches(|c: char| is_space(c) || c == ',');
+        if rest.is_empty() {
+            break;
+        }
+        let url_end = rest.find(is_space).unwrap_or(rest.len());
+        let (mut url, after) = rest.split_at(url_end);
+        rest = after;
+        let mut descriptors: Vec<String> = Vec::new();
+        if url.ends_with(',') {
+            url = url.trim_end_matches(',');
+        } else {
+            // Descriptors, up to a comma outside parentheses
+            let mut current = String::new();
+            let mut in_parens = false;
+            let mut used = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    ',' if !in_parens => {
+                        used = i + 1;
+                        break;
+                    }
+                    '(' => in_parens = true,
+                    ')' => in_parens = false,
+                    c if is_space(c) && !in_parens => {
+                        if !current.is_empty() {
+                            descriptors.push(std::mem::take(&mut current));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                current.push(c);
+            }
+            if !current.is_empty() {
+                descriptors.push(current);
+            }
+            rest = &rest[used..];
+        }
+        let (mut width, mut density, mut valid) = (None, None, true);
+        for d in &descriptors {
+            let (number, unit) = d.split_at(d.len() - 1);
+            match unit {
+                "w" if width.is_none() && density.is_none() => {
+                    width = number.parse::<u32>().ok().filter(|&w| w > 0).map(f64::from);
+                    valid &= width.is_some();
+                }
+                "x" if width.is_none() && density.is_none() => {
+                    density = number.parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0);
+                    valid &= density.is_some();
+                }
+                "h" => {} // only meaningful with a width; not used for choosing
+                _ => valid = false,
+            }
+        }
+        if valid && !url.is_empty() {
+            candidates.push((url, width.unwrap_or(0.0), density.unwrap_or(1.0)));
+        }
+    }
+    candidates
+        .iter()
         .enumerate()
-        // Highest width wins; on ties (no descriptors) the first one
-        .max_by_key(|(index, (_, width))| (*width, std::cmp::Reverse(*index)))
-        .map(|(_, (url, _))| url)
+        // Highest width, then density; on ties the first one
+        .max_by(|(i, a), (j, b)| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)).then(j.cmp(i)))
+        .map(|(_, (url, _, _))| *url)
+}
+
+/// What html2text attaches to a piece of text
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mark {
+    /// Inside a link to this address
+    Link(String),
+    /// The marker of image N (see `mark_images`)
+    Image(usize),
 }
 
 /// Plain-text rendering for the reader: like html2text's plain style, but
@@ -419,48 +492,51 @@ fn best_srcset_candidate(srcset: &str) -> Option<&str> {
 struct ReaderDecorator;
 
 impl TextDecorator for ReaderDecorator {
-    /// The address of the link a piece of text is in
-    type Annotation = Option<String>;
+    type Annotation = Option<Mark>;
 
-    fn decorate_link_start(&mut self, url: &str) -> (String, Option<String>) {
-        (String::new(), Some(url.to_string()))
+    fn decorate_link_start(&mut self, url: &str) -> (String, Option<Mark>) {
+        (String::new(), Some(Mark::Link(url.to_string())))
     }
     fn decorate_link_end(&mut self) -> String {
         String::new()
     }
-    fn decorate_em_start(&self) -> (String, Option<String>) {
+    fn decorate_em_start(&self) -> (String, Option<Mark>) {
         (String::new(), None)
     }
     fn decorate_em_end(&self) -> String {
         String::new()
     }
-    fn decorate_strong_start(&self) -> (String, Option<String>) {
+    fn decorate_strong_start(&self) -> (String, Option<Mark>) {
         (String::new(), None)
     }
     fn decorate_strong_end(&self) -> String {
         String::new()
     }
-    fn decorate_strikeout_start(&self) -> (String, Option<String>) {
+    fn decorate_strikeout_start(&self) -> (String, Option<Mark>) {
         (String::new(), None)
     }
     fn decorate_strikeout_end(&self) -> String {
         String::new()
     }
-    fn decorate_code_start(&self) -> (String, Option<String>) {
+    fn decorate_code_start(&self) -> (String, Option<Mark>) {
         (String::new(), None)
     }
     fn decorate_code_end(&self) -> String {
         String::new()
     }
-    fn decorate_preformat_first(&self) -> Option<String> {
+    fn decorate_preformat_first(&self) -> Option<Mark> {
         None
     }
-    fn decorate_preformat_cont(&self) -> Option<String> {
+    fn decorate_preformat_cont(&self) -> Option<Mark> {
         None
     }
-    fn decorate_image(&mut self, _src: &str, _title: &str) -> (String, Option<String>) {
-        // Images are shown as real images (or deliberately skipped)
-        (String::new(), None)
+    fn decorate_image(&mut self, src: &str, _title: &str) -> (String, Option<Mark>) {
+        // Where `blocks` puts the image; U+FFFC is Unicode's placeholder for
+        // an embedded object (never shown: the text is split there)
+        match src.strip_prefix(IMAGE_MARKER).and_then(|n| n.parse().ok()) {
+            Some(n) => ("\u{FFFC}".to_string(), Some(Mark::Image(n))),
+            None => (String::new(), None),
+        }
     }
     fn header_prefix(&self, _level: usize) -> String {
         String::new()
@@ -481,35 +557,13 @@ impl TextDecorator for ReaderDecorator {
     fn make_subblock_decorator(&self) -> Self {
         *self
     }
-    fn finalise(&mut self, _links: Vec<String>) -> Vec<TaggedLine<Option<String>>> {
+    fn finalise(&mut self, _links: Vec<String>) -> Vec<TaggedLine<Option<Mark>>> {
         Vec::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    /// Deeply nested HTML is flattened (fast, text and images kept); normal
-    /// HTML, including the usual unclosed <p> and <li>, is left alone.
-    #[test]
-    fn deep_nesting_is_flattened() {
-        let deep = format!("{}Hello <img src=\"https://e.com/a.png\"> world{}", "<div>".repeat(100_000), "</div>".repeat(100_000));
-        let start = std::time::Instant::now();
-        let flat = limit_nesting(&deep);
-        assert!(matches!(flat, Cow::Owned(_)));
-        assert!(flat.contains("Hello") && flat.contains("<img src=\"https://e.com/a.png\">") && !flat.contains("<div>"));
-        let blocks = blocks(&deep, None);
-        assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
-        assert_eq!(blocks.len(), 3, "{:?}", blocks);
-
-        let normal = format!(
-            "<!DOCTYPE html><html><body><div><ul>{}</ul>{}<!-- <div><div> --></div></body></html>",
-            "<li>item".repeat(1000),
-            "<p>para<br>".repeat(1000)
-        );
-        assert!(matches!(limit_nesting(&normal), Cow::Borrowed(_)));
-    }
-
     use super::*;
 
     fn images(blocks: &[Block]) -> Vec<&str> {
@@ -520,6 +574,48 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The story's text alone: its text blocks, a blank line apart
+    fn html_to_text(html: &str) -> String {
+        blocks(html, None)
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::Text { text, .. } => Some(text),
+                Block::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Deeply nested HTML is flattened (fast, text and images kept); normal
+    /// HTML, including the usual unclosed <p> and <li>, is left alone.
+    #[test]
+    fn deep_nesting_is_flattened() {
+        let deep = format!(
+            "{}Hello <img src=\"https://e.com/a.png\"> world{}",
+            "<div>".repeat(100_000),
+            "</div>".repeat(100_000)
+        );
+        let start = std::time::Instant::now();
+        let blocks = blocks(&deep, None);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert_eq!(
+            blocks,
+            [
+                Block::Text { text: "Hello".into(), links: vec![] },
+                Block::Image { src: "https://e.com/a.png".into() },
+                Block::Text { text: "world".into(), links: vec![] },
+            ]
+        );
+        assert!(plain_text(&deep, 80).unwrap().contains("Hello"));
+
+        let normal = format!(
+            "<!DOCTYPE html><html><body><div><ul>{}</ul>{}<!-- <div><div> --></div></body></html>",
+            "<li>item".repeat(1000),
+            "<p>para<br>".repeat(1000)
+        );
+        assert!(!scan(&normal).too_deep.get());
     }
 
     #[test]
@@ -535,12 +631,24 @@ mod tests {
         );
     }
 
+    /// Text around an image keeps its structure: the list goes on after it.
+    #[test]
+    fn an_image_inside_a_list_keeps_the_list() {
+        let html = r#"<ul><li>One</li><li>Two <img src="https://x.com/a.jpg"> more</li><li>Three</li></ul>"#;
+        let blocks = blocks(html, None);
+        assert_eq!(images(&blocks), ["https://x.com/a.jpg"]);
+        assert_eq!(blocks[0], Block::Text { text: "- One\n- Two".into(), links: vec![] });
+        assert_eq!(blocks[2], Block::Text { text: "more\n- Three".into(), links: vec![] });
+    }
+
+    /// Attribute values are decoded as the HTML standard says, so
+    /// WordPress's "&#038;" in image addresses is a "&".
     #[test]
     fn resolves_relative_urls_and_entities() {
-        let html = r#"<IMG SRC='/img/b.png?w=1&amp;h=2'>"#;
+        let html = r#"<IMG SRC='/img/b.png?w=1&amp;h=2'><img src="https://x.com/c.jpg?w=1&#038;h=2&#x26;q=3">"#;
         assert_eq!(
             images(&blocks(html, Some("https://site.org/post/1"))),
-            vec!["https://site.org/img/b.png?w=1&h=2"]
+            ["https://site.org/img/b.png?w=1&h=2", "https://x.com/c.jpg?w=1&h=2&q=3"]
         );
     }
 
@@ -553,11 +661,58 @@ mod tests {
         assert_eq!(images(&blocks(html, None)), vec!["https://x.com/l.jpg"]);
     }
 
+    /// `srcset` is parsed as the standard says: commas inside a URL,
+    /// densities, and candidates with descriptors that aren't valid.
+    #[test]
+    fn srcset_follows_the_standard() {
+        assert_eq!(
+            best_srcset_candidate("https://c.example/w_400,h_300/a.jpg 400w, https://c.example/w_800,h_600/a.jpg 800w"),
+            Some("https://c.example/w_800,h_600/a.jpg")
+        );
+        assert_eq!(best_srcset_candidate("a.jpg, b.jpg 2x, c.jpg 1.5x"), Some("b.jpg"));
+        assert_eq!(best_srcset_candidate("a.jpg 100w, b.jpg 9000q, c.jpg 50w"), Some("a.jpg"));
+        // A comma straight after a URL ends it; one inside it is part of it
+        assert_eq!(best_srcset_candidate("first.jpg, second.jpg 2x"), Some("second.jpg"));
+        assert_eq!(best_srcset_candidate("first.jpg,second.jpg"), Some("first.jpg,second.jpg"));
+        assert_eq!(best_srcset_candidate("  ,, "), None);
+    }
+
     #[test]
     fn skips_tracking_pixels_and_duplicates() {
         let html = r#"<img src="https://t.co/p.gif" width="1" height="1">
             <img src="https://x.com/a.jpg"><noscript><img src="https://x.com/a.jpg"></noscript>"#;
         assert_eq!(images(&blocks(html, None)), vec!["https://x.com/a.jpg"]);
+    }
+
+    /// Only images a browser would show: not ones in comments or scripts.
+    /// Without scripts, <noscript> content is shown, as text, not markup.
+    #[test]
+    fn hidden_images_stay_hidden() {
+        let html = r#"<p>Text</p><!-- <img src="https://x.com/old.jpg"> -->
+            <script>var s = '<img src="https://x.com/js.jpg">';</script>
+            <noscript><p>Fallback</p><img src="https://x.com/only.jpg"></noscript>"#;
+        let blocks = blocks(html, None);
+        assert_eq!(images(&blocks), ["https://x.com/only.jpg"]);
+        assert_eq!(html_to_text(html), "Text\n\nFallback");
+        assert!(!plain_text(html, 80).unwrap().contains('<'));
+    }
+
+    /// In a <picture>, the source a browser would pick: for any screen, in
+    /// a type that can be shown; otherwise the <img> itself.
+    #[test]
+    fn pictures_use_the_source_a_browser_would() {
+        let picture = |sources: &str| {
+            let html = format!(r#"<picture>{}<img src="https://x.com/fallback.jpg"></picture>"#, sources);
+            images(&blocks(&html, None)).iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            picture(r#"<source srcset="https://x.com/a.avif" type="image/avif"><source srcset="https://x.com/a.webp 1x, https://x.com/b.webp 2x" type="image/webp">"#),
+            ["https://x.com/b.webp"]
+        );
+        assert_eq!(
+            picture(r#"<source media="(max-width: 600px)" srcset="https://x.com/small.jpg">"#),
+            ["https://x.com/fallback.jpg"]
+        );
     }
 
     #[test]
@@ -602,24 +757,29 @@ mod tests {
     }
 
     /// Links are found with their position in the text, relative addresses
-    /// resolved; ones that aren't web or email links are plain text.
+    /// resolved; ones that aren't web or email links are plain text. Line
+    /// numbers count from the start of each block, around images too.
     #[test]
     fn links_are_located() {
         let html = r#"<p>Read <a href="/2026/11/post">the <em>full</em> post</a> or
             <a href="https://other.example/x?a=1&amp;b=2">this</a>.</p>
-            <p>Mail <a href="mailto:me@example.com">me</a>, not <a href="javascript:alert(1)">this</a>.</p>"#;
-        let (text, links) = text_with_links(html, url::Url::parse("https://pluralistic.net/2026/11/15/").ok().as_ref());
-        let lines: Vec<&str> = text.lines().collect();
-        let found: Vec<(&str, &str)> = links
-            .iter()
-            .map(|l| (&lines[l.line][l.start..l.end], l.url.as_str()))
-            .collect();
+            <p>Mail <a href="mailto:me@example.com">me</a>, not <a href="javascript:alert(1)">this</a>.</p>
+            <img src="https://x.com/a.jpg"><p>After <a href="https://after.example/">it</a></p>"#;
+        let mut found = Vec::new();
+        for block in blocks(html, Some("https://pluralistic.net/2026/11/15/")) {
+            if let Block::Text { text, links } = block {
+                let lines: Vec<&str> = text.lines().collect();
+                found.extend(links.iter().map(|l| (lines[l.line][l.start..l.end].to_string(), l.url.clone())));
+            }
+        }
+        let found: Vec<(&str, &str)> = found.iter().map(|(t, u)| (t.as_str(), u.as_str())).collect();
         assert_eq!(
             found,
             [
                 ("the full post", "https://pluralistic.net/2026/11/post"),
                 ("this", "https://other.example/x?a=1&b=2"),
                 ("me", "mailto:me@example.com"),
+                ("it", "https://after.example/"),
             ]
         );
     }
