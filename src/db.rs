@@ -365,6 +365,21 @@ impl Database {
         // out of their folders into tag views, and what the trainer learned
         shreader_tags::store::ensure_schema(&conn)?;
 
+        // 5. Once: titles stored before HTML character references were
+        // decoded ("Google&#8217;s"), as they're stored now
+        let done: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", params![TITLES_DECODED_SETTING], |r| r.get(0))
+            .optional()?;
+        if done.is_none() {
+            let tx = conn.unchecked_transaction()?;
+            let fixed = decode_stored_titles(&tx)?;
+            tx.execute("INSERT INTO settings (key, value) VALUES (?1, 'true')", params![TITLES_DECODED_SETTING])?;
+            tx.commit()?;
+            if fixed > 0 {
+                tracing::info!("Decoded HTML character references in {} story titles", fixed);
+            }
+        }
+
         Ok(())
     }
 
@@ -1258,6 +1273,37 @@ impl Database {
     }
 }
 
+/// Setting: the one-time `decode_stored_titles` has run
+const TITLES_DECODED_SETTING: &str = "titles_decoded";
+
+/// Decodes HTML character references in stored story titles and authors
+/// (see `feed::decode_html_line`). Only rows that look like they hold one
+/// are read, and only changed ones written. How many stories changed.
+fn decode_stored_titles(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, author FROM articles WHERE title GLOB '*&*;*' OR author GLOB '*&*;*'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut changed = 0;
+    for (id, title, author) in rows {
+        let new_title = crate::feed::clean_line(&crate::feed::decode_html_line(&title), crate::feed::MAX_TITLE_CHARS);
+        let new_author = author
+            .as_deref()
+            .map(|a| crate::feed::clean_line(&crate::feed::decode_html_line(a), crate::feed::MAX_AUTHOR_CHARS));
+        if new_title != title || new_author != author {
+            conn.execute(
+                "UPDATE articles SET title = ?1, author = ?2 WHERE id = ?3",
+                params![new_title, new_author, id],
+            )?;
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 /// What's typed in the search box, as an FTS5 query.
 ///
 /// Each word is looked for on its own, in any order, and the last one also
@@ -1473,6 +1519,36 @@ mod tests {
         };
         assert_eq!(search("haystack"), 1);
         assert_eq!(search("needle"), 0);
+    }
+
+    /// Titles stored with HTML codes in them are decoded once, and found
+    /// by search as they read.
+    #[test]
+    fn stored_titles_are_decoded_once() {
+        let db = Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://f.example/rss", "F", None, None, None).unwrap();
+        let add = |hash: &str, title: &str| {
+            db.upsert_article(feed, Some(hash), hash, title, None, None, None, None, Some("body"), None, None).unwrap()
+        };
+        add("a", "Google&#8217;s AI satellites");
+        add("b", "AT&T earnings; R&D");
+        let conn = db.lock();
+        conn.execute("UPDATE articles SET author = 'Pat O&#8217;Brien' WHERE guid_hash = 'a'", []).unwrap();
+        assert_eq!(decode_stored_titles(&conn).unwrap(), 1, "only the story with codes changes");
+        assert_eq!(decode_stored_titles(&conn).unwrap(), 0);
+        let row = |hash: &str| {
+            conn.query_row("SELECT title, author FROM articles WHERE guid_hash = ?1", [hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(row("a"), ("Google’s AI satellites".into(), Some("Pat O’Brien".into())));
+        assert_eq!(row("b").0, "AT&T earnings; R&D");
+        drop(conn);
+        let found = db.get_articles(&ArticleFilter { search_query: Some("google".into()), ..Default::default() });
+        assert_eq!(found.unwrap().len(), 1, "re-indexed");
+        // Opening ran it already, and won't again
+        assert_eq!(db.get_setting(TITLES_DECODED_SETTING).unwrap().as_deref(), Some("true"));
     }
 
     #[test]

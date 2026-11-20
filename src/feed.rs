@@ -282,7 +282,7 @@ const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 /// Longest story title stored, in characters
 pub(crate) const MAX_TITLE_CHARS: usize = 500;
 /// Longest author line stored, in characters
-const MAX_AUTHOR_CHARS: usize = 300;
+pub(crate) const MAX_AUTHOR_CHARS: usize = 300;
 /// Largest story body (and summary) stored. The largest real story seen was
 /// 175 KB; anything bigger is cut, with a note.
 const MAX_STORY_BYTES: usize = 512 * 1024;
@@ -311,6 +311,78 @@ pub(crate) fn clean_line(text: &str, max_chars: usize) -> String {
         Some((cut, _)) => format!("{}…", &trimmed[..cut]),
         None => trimmed.to_string(),
     }
+}
+
+/// A title from a feed, as plain text. Atom titles marked `type="html"` are
+/// HTML, and RSS titles in practice often are too, so character references
+/// (`&#8217;`, `&rsquo;`, `&amp;`) become the characters they stand for:
+/// The Verge's "Google&#8217;s" is "Google’s". Tags are dropped from HTML
+/// titles. Then it's cleaned like any line (`clean_line`).
+pub(crate) fn title_line(title: &feed_rs::model::Text, max_chars: usize) -> String {
+    let is_html = title.content_type.to_string().starts_with("text/html");
+    let text = if is_html { strip_tags(&title.content) } else { title.content.clone() };
+    clean_line(&decode_html_line(&text), max_chars)
+}
+
+/// `text` without anything between `<` and `>`.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `text` with HTML character references decoded, for one line: no-break
+/// spaces become plain spaces, so a title can still wrap. Anything that
+/// isn't a reference HTML knows (a lone "&", "AT&T") stays as it is.
+pub(crate) fn decode_html_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        match decode_reference(rest) {
+            Some((decoded, used)) => {
+                out.extend(decoded.into_iter().map(|c| if c == '\u{a0}' { ' ' } else { c }));
+                rest = &rest[used..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The character(s) the reference at the start of `text` (which starts
+/// with "&") stands for, and how many bytes it takes up. Only references
+/// with their closing ";".
+fn decode_reference(text: &str) -> Option<(Vec<char>, usize)> {
+    // The longest name HTML has is 31 characters
+    let end = text.char_indices().take(34).find(|(_, c)| *c == ';')?.0;
+    let name = &text[1..end];
+    let used = end + 1;
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse().ok()?,
+        };
+        // NUL and anything that isn't a character: the replacement character
+        let c = char::from_u32(code).filter(|&c| c != '\0').unwrap_or('\u{FFFD}');
+        return Some((vec![c], used));
+    }
+    let &(first, second) = markup5ever::data::NAMED_ENTITIES.get(&text[1..used])?;
+    let chars = [first, second].into_iter().filter(|&c| c != 0).filter_map(char::from_u32).collect();
+    Some((chars, used))
 }
 
 /// Unicode's invisible bidirectional formatting characters: marks,
@@ -573,7 +645,7 @@ impl FeedFetcher {
         let parsed_title = parsed_feed
             .title
             .as_ref()
-            .map(|t| clean_line(&t.content.split_whitespace().collect::<Vec<_>>().join(" "), MAX_TITLE_CHARS))
+            .map(|t| title_line(t, MAX_TITLE_CHARS).split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|t| !t.is_empty());
         let description = parsed_feed.description.as_ref().map(|d| clean_line(&d.content, 10_000));
         let Some(feed_title) = db.update_feed_from_fetch(
@@ -608,6 +680,9 @@ impl FeedFetcher {
         let mut limited = false;
 
         for entry in parsed_feed.entries {
+            // The title as sent identifies a story without an id or link
+            // (`generate_guid_hash`), so that stays as it was; it's shown decoded
+            let title = entry.title.as_ref().map(|t| title_line(t, MAX_TITLE_CHARS));
             let raw_title = entry.title.map(|t| t.content).unwrap_or_else(|| "Untitled".to_string());
             let link = entry.links.first().map(|l| clean_tracking_params(&l.href));
             let guid = if entry.id.trim().is_empty() {
@@ -622,11 +697,11 @@ impl FeedFetcher {
 
             // Stored within sane sizes: an enormous title or story makes the
             // list and reader unusable (a 5 MB story: 2 s per click)
-            let title = clean_line(&raw_title, MAX_TITLE_CHARS);
+            let title = title.filter(|t| !t.is_empty()).unwrap_or_else(|| clean_line(&raw_title, MAX_TITLE_CHARS));
             let link = link.filter(|l| l.len() <= MAX_URL_BYTES);
             let author = if !entry.authors.is_empty() {
                 let names = entry.authors.into_iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
-                Some(clean_line(&names, MAX_AUTHOR_CHARS))
+                Some(clean_line(&decode_html_line(&names), MAX_AUTHOR_CHARS))
             } else {
                 None
             };
@@ -739,7 +814,7 @@ impl FeedFetcher {
 
         let title = parsed
             .title
-            .map(|t| clean_line(&t.content.split_whitespace().collect::<Vec<_>>().join(" "), MAX_TITLE_CHARS))
+            .map(|t| title_line(&t, MAX_TITLE_CHARS).split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|t| !t.is_empty());
 
         Ok(FeedPreview {
@@ -1110,6 +1185,43 @@ mod tests {
         db.add_intake(other, "2000-01-01", 0, 0).unwrap();
         let next_day = fetcher.fetch_and_sync(&db, other).await;
         assert_eq!(next_day.articles_inserted, MAX_NEW_PER_REFRESH);
+    }
+
+    /// "Blue Origin will launch Google&#8217;s AI server satellites": The
+    /// Verge's titles are HTML, and sometimes use character references.
+    #[test]
+    fn titles_show_the_characters_html_codes_stand_for() {
+        let atom = br#"<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+            <title type="text">The Verge</title><id>v</id><updated>2026-11-19T13:53:38Z</updated>
+            <entry><title type="html"><![CDATA[Blue Origin will launch Google&#8217;s AI server satellites in 2029]]></title>
+              <id>a</id><updated>2026-11-19T13:53:38Z</updated></entry>
+            <entry><title type="html">Snakes &amp;#038; Ladders &lt;em&gt;live&lt;/em&gt; &amp;lt;3</title>
+              <id>b</id><updated>2026-11-19T13:53:38Z</updated></entry>
+            <entry><title type="text">x &lt;b&gt; y</title><id>c</id><updated>2026-11-19T13:53:38Z</updated></entry>
+        </feed>"#;
+        let feed = parse_feed(atom).unwrap();
+        let titles: Vec<String> =
+            feed.entries.iter().map(|e| title_line(e.title.as_ref().unwrap(), MAX_TITLE_CHARS)).collect();
+        assert_eq!(titles[0], "Blue Origin will launch Google’s AI server satellites in 2029");
+        assert_eq!(titles[1], "Snakes & Ladders live <3", "tags dropped, then codes decoded");
+        assert_eq!(titles[2], "x <b> y", "a plain-text title keeps what looks like a tag");
+
+        // RSS titles (Kagi Small Web, Slashdot)
+        assert_eq!(decode_html_line("The thing&hellip;"), "The thing…");
+        assert_eq!(decode_html_line("It&rsquo;s &ldquo;gatekeeping&rdquo;"), "It’s “gatekeeping”");
+        assert_eq!(decode_html_line("AT&amp;T &#x2014; 5&#8211;7"), "AT&T — 5–7");
+        assert_eq!(decode_html_line("So&nbsp;many&nbsp;years"), "So many years", "and it can wrap");
+        // Not references: left alone
+        assert_eq!(decode_html_line("AT&T & Verizon; R&D;"), "AT&T & Verizon; R&D;");
+        assert_eq!(decode_html_line("&notaname; &#; &#xZZ; &#1114112;"), "&notaname; &#; &#xZZ; \u{FFFD}");
+        assert_eq!(decode_html_line("trailing &"), "trailing &");
+        // A decoded control or direction override is cleaned like any other
+        let sneaky = feed_rs::model::Text {
+            content_type: "text/plain".parse().unwrap(),
+            src: None,
+            content: "Invoice for &#8238;fdp.exe&#10;x".into(),
+        };
+        assert_eq!(title_line(&sneaky, 100), "Invoice for fdp.exe x");
     }
 
     #[test]
