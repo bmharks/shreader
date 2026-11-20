@@ -50,6 +50,10 @@ scraper = { version = "=0.23.1", default-features = false }
 # The tree scraper keeps the parsed story in (the version scraper uses)
 ego-tree = "0.10.0"
 
+# Find in a story ignores accents, as search does (FTS5's unicode61): text
+# is decomposed (NFD) and its combining marks left out
+unicode-normalization = "0.1.26"
+
 # System & Linux XDG paths
 directories = "5.0"
 

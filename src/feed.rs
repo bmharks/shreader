@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -145,45 +145,89 @@ fn render_svg(bytes: &[u8]) -> Result<StoryImage, String> {
 }
 
 /// Whether `ip` is on the public internet, as opposed to this machine, the
-/// local network or other special ranges.
+/// local network or other special ranges: as IANA's special-purpose address
+/// registries say (RFC 6890; iana.org/assignments/iana-ipv4-special-registry
+/// and iana-ipv6-special-registry, as of 2026), plus multicast and the
+/// deprecated ranges a public server would never use. An IPv4 address
+/// carried inside an IPv6 one is judged as itself.
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_loopback()            // 127/8
-                || v4.is_private()        // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local()     // 169.254/16 (incl. cloud metadata)
-                || v4.is_unspecified()    // 0.0.0.0
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                || a == 0                 // 0/8 "this network"
-                || (a == 100 && (64..128).contains(&b)) // 100.64/10 shared (CGNAT, Tailscale)
-                || (a == 198 && (18..20).contains(&b))  // 198.18/15 benchmarking
-                || a >= 240)              // reserved
+            let bits = v4.to_bits();
+            let within = |&(net, len): &(Ipv4Addr, u32)| len == 0 || bits >> (32 - len) == net.to_bits() >> (32 - len);
+            V4_GLOBAL_EXCEPTIONS.iter().any(within) || !V4_NOT_GLOBAL.iter().any(within)
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public_ip(IpAddr::V4(v4));
             }
+            let bits = v6.to_bits();
             // NAT64 (64:ff9b::/96): an IPv4 address in the last 32 bits, which
             // the network's gateway translates to, local ones included
-            let segments = v6.segments();
-            if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                let [a, b] = segments[6].to_be_bytes();
-                let [c, d] = segments[7].to_be_bytes();
-                return is_public_ip(IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)));
+            if bits >> 32 == Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0).to_bits() >> 32 {
+                return is_public_ip(IpAddr::V4(Ipv4Addr::from_bits(bits as u32)));
             }
-            let first = v6.segments()[0];
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (first & 0xfe00) == 0xfc00  // fc00::/7 unique local
-                || (first & 0xffc0) == 0xfe80  // fe80::/10 link-local
-                || (first & 0xffc0) == 0xfec0) // fec0::/10 site-local (deprecated)
+            let within = |&(net, len): &(Ipv6Addr, u32)| len == 0 || bits >> (128 - len) == net.to_bits() >> (128 - len);
+            V6_GLOBAL_EXCEPTIONS.iter().any(within) || !V6_NOT_GLOBAL.iter().any(within)
         }
     }
 }
+
+/// IPv4 ranges that aren't reachable on the public internet (IANA:
+/// "Globally Reachable: False"), plus multicast and the deprecated 6to4 relay
+const V4_NOT_GLOBAL: &[(Ipv4Addr, u32)] = &[
+    (Ipv4Addr::new(0, 0, 0, 0), 8),         // "this network" (RFC 791)
+    (Ipv4Addr::new(10, 0, 0, 0), 8),        // private (RFC 1918)
+    (Ipv4Addr::new(100, 64, 0, 0), 10),     // shared: carrier NAT, Tailscale (RFC 6598)
+    (Ipv4Addr::new(127, 0, 0, 0), 8),       // loopback (RFC 1122)
+    (Ipv4Addr::new(169, 254, 0, 0), 16),    // link-local, cloud metadata (RFC 3927)
+    (Ipv4Addr::new(172, 16, 0, 0), 12),     // private (RFC 1918)
+    (Ipv4Addr::new(192, 0, 0, 0), 24),      // IETF protocol assignments (RFC 6890)
+    (Ipv4Addr::new(192, 0, 2, 0), 24),      // documentation (RFC 5737)
+    (Ipv4Addr::new(192, 88, 99, 0), 24),    // 6to4 relay anycast, deprecated (RFC 7526)
+    (Ipv4Addr::new(192, 168, 0, 0), 16),    // private (RFC 1918)
+    (Ipv4Addr::new(198, 18, 0, 0), 15),     // benchmarking (RFC 2544)
+    (Ipv4Addr::new(198, 51, 100, 0), 24),   // documentation (RFC 5737)
+    (Ipv4Addr::new(203, 0, 113, 0), 24),    // documentation (RFC 5737)
+    (Ipv4Addr::new(224, 0, 0, 0), 4),       // multicast (RFC 5771)
+    (Ipv4Addr::new(240, 0, 0, 0), 4),       // reserved, and broadcast (RFC 1112, RFC 919)
+];
+
+/// Single addresses inside those ranges that are public services
+const V4_GLOBAL_EXCEPTIONS: &[(Ipv4Addr, u32)] = &[
+    (Ipv4Addr::new(192, 0, 0, 9), 32),  // Port Control Protocol anycast (RFC 7723)
+    (Ipv4Addr::new(192, 0, 0, 10), 32), // TURN anycast (RFC 8155)
+];
+
+/// IPv6 ranges that aren't reachable on the public internet (IANA:
+/// "Globally Reachable: False"), plus multicast, the deprecated ranges, and
+/// the tunnels that carry an IPv4 address (6to4, Teredo)
+const V6_NOT_GLOBAL: &[(Ipv6Addr, u32)] = &[
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0), 96),                   // unspecified, loopback, IPv4-compatible (deprecated, RFC 4291)
+    (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),           // local-use IPv4/IPv6 translation (RFC 8215)
+    (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),               // discard-only (RFC 6666)
+    (Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64),               // dummy prefix (RFC 9780)
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),              // IETF protocol assignments, Teredo (RFC 2928, RFC 4380)
+    (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),          // documentation (RFC 3849)
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),              // 6to4, deprecated (RFC 3056)
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),              // documentation (RFC 9637)
+    (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),              // segment routing (SRv6) SIDs (RFC 9602)
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),               // unique local (RFC 4193)
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),              // link-local (RFC 4291)
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),              // site-local, deprecated (RFC 3879)
+    (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),               // multicast (RFC 4291)
+];
+
+/// Addresses inside those ranges that are public services
+const V6_GLOBAL_EXCEPTIONS: &[(Ipv6Addr, u32)] = &[
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 1), 128),   // Port Control Protocol anycast (RFC 7723)
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 2), 128),   // TURN anycast (RFC 8155)
+    (Ipv6Addr::new(0x2001, 1, 0, 0, 0, 0, 0, 3), 128),   // DNS-SD service registration anycast (RFC 9665)
+    (Ipv6Addr::new(0x2001, 3, 0, 0, 0, 0, 0, 0), 32),    // AMT (RFC 7450)
+    (Ipv6Addr::new(0x2001, 4, 0x112, 0, 0, 0, 0, 0), 48), // AS112-v6 (RFC 7535)
+    (Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0), 28), // ORCHIDv2 (RFC 7343)
+    (Ipv6Addr::new(0x2001, 0x30, 0, 0, 0, 0, 0, 0), 28), // drone remote ID (RFC 9374)
+];
 
 /// Whether a public download (a story image, a public feed, a redirect) may
 /// go to `url`: web addresses only, and not a numeric address on this
@@ -1057,12 +1101,20 @@ mod tests {
 
     #[test]
     fn public_and_local_addresses() {
-        let public = ["93.184.215.14", "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "100.128.0.1", "64:ff9b::808:808"];
+        let public = [
+            "93.184.215.14", "8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "100.128.0.1", "64:ff9b::808:808",
+            "172.32.0.1", "192.0.1.1", "192.0.0.9", "192.31.196.1", "192.175.48.1", "223.255.255.255",
+            "2001:4860:4860::8888", "2001:1::1", "2001:4:112::1", "2001:20::1", "2620:4f:8000::1", "2a00:1450::1",
+        ];
         let local = [
             "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254",
             "0.0.0.0", "100.64.0.1", "100.127.255.255", "255.255.255.255", "224.0.0.1",
             "::1", "::", "fe80::1", "fd12:3456::1", "::ffff:192.168.1.1", "::ffff:127.0.0.1",
             "64:ff9b::c0a8:101", "64:ff9b::7f00:1",
+            // In the IANA registries, but missed before
+            "192.0.0.1", "192.0.0.170", "192.88.99.1", "240.0.0.1", "198.19.255.255",
+            "2001:db8::1", "100::1", "2002:c0a8:101::1", "2001::c0a8:101", "2001:2::1", "2001:10::1",
+            "64:ff9b:1::c0a8:101", "3fff::1", "5f00::1", "::192.168.1.1", "ff02::1", "fec0::1",
         ];
         for ip in public {
             assert!(is_public_ip(ip.parse().unwrap()), "{} should be public", ip);

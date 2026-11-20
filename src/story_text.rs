@@ -345,28 +345,38 @@ where
     }
 }
 
-/// Every occurrence of `query` in `text` (case-insensitive), line by line.
-/// At most `limit`.
+/// Every occurrence of `query` in `text`, line by line, ignoring case and
+/// accents as the story list's search does ("cafe" finds "Café"). At most
+/// `limit`.
 pub fn find_matches(text: &str, query: &str, limit: usize) -> Vec<TextRange> {
-    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let needle: Vec<char> = query.chars().flat_map(fold).collect();
     if needle.is_empty() {
         return Vec::new();
     }
     let mut found = Vec::new();
     for (number, line) in text.split('\n').enumerate() {
-        // The line lowercased, each character remembering which bytes of
-        // the original it came from (lowercasing can change lengths)
-        let lowered: Vec<(char, usize, usize)> = line
-            .char_indices()
-            .flat_map(|(start, c)| {
-                let end = start + c.len_utf8();
-                c.to_lowercase().map(move |lc| (lc, start, end))
-            })
-            .collect();
+        // The line folded, each character remembering which bytes of the
+        // original it came from (folding can change lengths)
+        let mut folded: Vec<(char, usize, usize)> = Vec::new();
+        for (start, c) in line.char_indices() {
+            let end = start + c.len_utf8();
+            let mut any = false;
+            for f in fold(c) {
+                folded.push((f, start, end));
+                any = true;
+            }
+            // A combining accent written on its own belongs to the letter
+            // before it, so a match on that letter includes it
+            if !any {
+                if let Some(last) = folded.last_mut() {
+                    last.2 = end;
+                }
+            }
+        }
         let mut i = 0;
-        while i + needle.len() <= lowered.len() {
-            if lowered[i..i + needle.len()].iter().map(|(c, _, _)| *c).eq(needle.iter().copied()) {
-                found.push(TextRange { line: number, start: lowered[i].1, end: lowered[i + needle.len() - 1].2 });
+        while i + needle.len() <= folded.len() {
+            if folded[i..i + needle.len()].iter().map(|(c, _, _)| *c).eq(needle.iter().copied()) {
+                found.push(TextRange { line: number, start: folded[i].1, end: folded[i + needle.len() - 1].2 });
                 if found.len() >= limit {
                     return found;
                 }
@@ -377,6 +387,14 @@ pub fn find_matches(text: &str, query: &str, limit: usize) -> Vec<TextRange> {
         }
     }
     found
+}
+
+/// `c` without its accents (its Unicode canonical decomposition, NFD,
+/// without the combining marks), lowercased.
+fn fold(c: char) -> impl Iterator<Item = char> {
+    use unicode_normalization::char::is_combining_mark;
+    use unicode_normalization::UnicodeNormalization;
+    std::iter::once(c).nfd().filter(|d| !is_combining_mark(*d)).flat_map(char::to_lowercase)
 }
 
 #[cfg(test)]
@@ -397,5 +415,18 @@ mod tests {
         assert_eq!(find_matches("aaaa", "a", 3).len(), 3);
         assert!(find_matches("anything", "", 10).is_empty());
         assert_eq!(find_matches(text, "the end", 10).len(), 2);
+    }
+
+    /// Accents are ignored either way round, as in the story list's search,
+    /// and a match covers its letters' accents, however they're written.
+    #[test]
+    fn finds_matches_ignoring_accents() {
+        let text = "Café, CAFÉ and cafe\u{301}; naïve résumé";
+        let found = find_matches(text, "cafe", 10);
+        let words: Vec<&str> = found.iter().map(|m| &text[m.start..m.end]).collect();
+        assert_eq!(words, ["Café", "CAFÉ", "cafe\u{301}"]);
+        assert_eq!(find_matches(text, "café", 10).len(), 3);
+        assert_eq!(find_matches(text, "naive resume", 10).len(), 1);
+        assert_eq!(find_matches("Ångström", "angstrom", 10).len(), 1);
     }
 }

@@ -4487,7 +4487,10 @@ impl RssApp {
                             .size(11)
                             .style(dim_text),
                         horizontal_space(),
-                        text(format!("Fetched: {}", art.fetched_at.format("%Y-%m-%d %H:%M UTC")))
+                        text(format!(
+                            "Fetched: {}",
+                            art.fetched_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                        ))
                             .size(11)
                             .style(dim_text),
                     ],
@@ -4563,8 +4566,17 @@ fn sort_stories(db: &Database) -> anyhow::Result<usize> {
     db.with_conn(|c| store::sort_into_tags(c))
 }
 
+/// When a story was published, for the list: how long ago, or after a week
+/// the date, in the computer's time zone.
 fn format_date(dt: DateTime<Utc>) -> String {
-    let now = Utc::now();
+    format_date_in(dt, Utc::now(), &chrono::Local)
+}
+
+/// `format_date` as of `now`, with dates in time zone `zone`.
+fn format_date_in<Z: chrono::TimeZone>(dt: DateTime<Utc>, now: DateTime<Utc>, zone: &Z) -> String
+where
+    Z::Offset: std::fmt::Display,
+{
     let diff = now.signed_duration_since(dt);
 
     if diff.num_minutes() < 60 {
@@ -4574,7 +4586,7 @@ fn format_date(dt: DateTime<Utc>) -> String {
     } else if diff.num_days() < 7 {
         format!("{}d ago", diff.num_days())
     } else {
-        dt.format("%b %d, %Y").to_string()
+        dt.with_timezone(zone).format("%b %d, %Y").to_string()
     }
 }
 
@@ -5148,6 +5160,19 @@ mod tests {
         assert_eq!(label(720), "12 hours");
         assert_eq!(label(1440), "1 day");
         assert_eq!(label(2880), "2 days");
+    }
+
+    /// Dates in the list are in the computer's time zone: 03:00 UTC on
+    /// Nov 2 is still Nov 1 in New York.
+    #[test]
+    fn dates_are_shown_in_the_local_time_zone() {
+        use chrono::{TimeZone, Utc};
+        let story = Utc.with_ymd_and_hms(2026, 11, 2, 3, 0, 0).unwrap();
+        let now = story + chrono::Duration::days(30);
+        let new_york = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        assert_eq!(super::format_date_in(story, now, &new_york), "Nov 01, 2026");
+        assert_eq!(super::format_date_in(story, now, &Utc), "Nov 02, 2026");
+        assert_eq!(super::format_date_in(story, story + chrono::Duration::hours(3), &new_york), "3h ago");
     }
 
     /// Sorting into tags finished. The reload waits for the list to be

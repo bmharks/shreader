@@ -776,7 +776,7 @@ impl Trainer {
             }
         }
         let in_use = match &self.published {
-            Some((_, summary, at)) => format!("In use since {} UTC: {}", &at[..16.min(at.len())], summary),
+            Some((_, summary, at)) => format!("In use since {}: {}", local_time(at), summary),
             None => "No model in use yet: Shreader only sorts the stories you've answered about.".to_string(),
         };
         panel.push(text(in_use).size(13).style(text::secondary)).into()
@@ -866,4 +866,12 @@ async fn download(url: String, max_bytes: usize) -> Result<Vec<u8>, String> {
         return Err("larger than expected".to_string());
     }
     Ok(bytes.to_vec())
+}
+
+/// A time SQLite recorded (`datetime('now')`: UTC, "2026-11-20 20:24:29"),
+/// in the computer's time zone, to the minute. As stored if it doesn't parse.
+fn local_time(utc: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(utc, "%Y-%m-%d %H:%M:%S")
+        .map(|t| t.and_utc().with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| utc.to_string())
 }
