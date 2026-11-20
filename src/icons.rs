@@ -55,7 +55,7 @@ static EXTERNAL_LINK_H: LazyLock<svg::Handle> =
 pub enum Tint {
     /// Regular text
     Text,
-    /// Dimmed text (`text::secondary`)
+    /// Dimmed text (`dim_text`)
     Secondary,
     /// Text on a `button::primary` background
     OnPrimary,
@@ -70,13 +70,30 @@ impl Tint {
         let palette = theme.extended_palette();
         match self {
             Tint::Text => palette.background.base.text,
-            Tint::Secondary => palette.secondary.strong.color,
+            Tint::Secondary => dim_color(theme),
             // `button::primary` draws on `primary.strong`; `primary.base.text` is black
             Tint::OnPrimary => palette.primary.strong.text,
             Tint::OnSecondary => palette.secondary.base.text,
             Tint::Gold => Color::from_rgb8(0xF5, 0xB4, 0x2A),
         }
     }
+}
+
+/// Color of dimmed text and icons: iced's `secondary.strong`, except on a
+/// light theme, where that grey is too faint to read on white.
+pub fn dim_color(theme: &Theme) -> Color {
+    let palette = theme.extended_palette();
+    if palette.is_dark {
+        palette.secondary.strong.color
+    } else {
+        Color::from_rgb(0.40, 0.40, 0.43)
+    }
+}
+
+/// Style for dimmed text (dates, notes, counts), in place of
+/// `text::secondary`, which is too faint on the light theme.
+pub fn dim_text(theme: &Theme) -> iced::widget::text::Style {
+    iced::widget::text::Style { color: Some(dim_color(theme)) }
 }
 
 /// A square icon of `size` pixels, tinted with `tint`.

@@ -18,7 +18,7 @@ use crate::key_press::{find_anchor, on_key_press, restore_anchor, scroll_by_step
 use crate::lazy_load::on_visible;
 use crate::image_space::image_space;
 use crate::story_text::{find_matches, story_text, TextRange};
-use crate::icons::{icon, Icon, Tint};
+use crate::icons::{dim_color, dim_text, icon, Icon, Tint};
 use crate::spinner::spinner;
 use crate::split::split;
 use crate::on_escape::on_escape;
@@ -51,6 +51,9 @@ const STORY_IMAGE_MEMORY: u64 = 400 * 1024 * 1024;
 /// Story images downloaded at once. Each download can hold up to 20 MB
 /// until it's decoded, and a story can ask for 100+ images in one go.
 const MAX_IMAGE_DOWNLOADS: usize = 4;
+
+/// Setting: "light" for the light theme; dark otherwise (the default)
+const THEME_SETTING: &str = "theme";
 
 /// Setting: download story images as they scroll into view (default), or
 /// only when clicked
@@ -151,6 +154,8 @@ pub struct RssApp {
     load_images: bool,
     /// Whether messages pop up in the corner (`NOTIFICATIONS_SETTING`)
     notifications: bool,
+    /// The light theme instead of the dark one (`THEME_SETTING`)
+    light_mode: bool,
     /// Whether the story list shows unread stories first (`UNREAD_FIRST_SETTING`)
     unread_first: bool,
     /// The main window, while it's open (it isn't while running in the tray)
@@ -400,6 +405,7 @@ pub enum Message {
     SetAutoRefresh(bool),
     SetLoadImages(bool),
     SetNotifications(bool),
+    SetLightMode(bool),
     ToggleUnreadFirst,
     /// The window's close button
     WindowCloseRequested,
@@ -562,6 +568,7 @@ impl RssApp {
             image_downloads: HashMap::new(),
             load_images: true,
             notifications: true,
+            light_mode: false,
             unread_first: false,
             main_window: None,
             tray,
@@ -616,6 +623,7 @@ impl RssApp {
         if let Ok(Some(on)) = app.db.get_setting(NOTIFICATIONS_SETTING) {
             app.notifications = on != "false";
         }
+        app.light_mode = matches!(app.db.get_setting(THEME_SETTING), Ok(Some(theme)) if theme == "light");
         app.unread_first = matches!(app.db.get_setting(UNREAD_FIRST_SETTING), Ok(Some(on)) if on == "true");
         app.keep_in_tray = !matches!(app.db.get_setting(KEEP_IN_TRAY_SETTING), Ok(Some(on)) if on == "false");
         if let Ok(Some(on)) = app.db.get_setting(AUTO_REFRESH_SETTING) {
@@ -1518,6 +1526,11 @@ impl RssApp {
                 self.reload_articles();
                 then_redraw(scrollable::snap_to(article_list_scroll_id(), scrollable::RelativeOffset::START))
             }
+            Message::SetLightMode(on) => {
+                self.light_mode = on;
+                let _ = self.db.set_setting(THEME_SETTING, if on { "light" } else { "dark" });
+                Task::none()
+            }
             Message::SetNotifications(on) => {
                 self.notifications = on;
                 let _ = self.db.set_setting(NOTIFICATIONS_SETTING, if on { "true" } else { "false" });
@@ -2391,7 +2404,7 @@ impl RssApp {
                 .size(13)
                 .padding(5)
                 .width(Length::Fill),
-            text(count).size(12).style(text::secondary),
+            text(count).size(12).style(dim_text),
             nav("Previous", Message::FindPrevious),
             nav("Next", Message::FindNext),
             button(text("Close").size(12))
@@ -2513,8 +2526,8 @@ impl RssApp {
     ) -> Element<'a, Message> {
         let links = self.reader_links.get(index).cloned().unwrap_or_default();
         let editor = text_editor(content)
-            .highlight_with::<LinkHighlighter>(links, |_, _| iced::advanced::text::highlighter::Format {
-                color: Some(LINK_COLOR),
+            .highlight_with::<LinkHighlighter>(links, |_, theme| iced::advanced::text::highlighter::Format {
+                color: Some(link_color(theme)),
                 font: None,
             })
             .on_action(move |action| Message::ReaderTextAction(index, action))
@@ -2607,7 +2620,7 @@ impl RssApp {
             .into(),
             Some(&ImageState::Reloading { width, height }) => image_space(width, height).into(),
             Some(ImageState::Loading) => {
-                text("Loading image…").size(11).style(text::secondary).into()
+                text("Loading image…").size(11).style(dim_text).into()
             }
             // Automatic loading off: only on request (an image can tell its
             // sender that the story was opened)
@@ -2618,7 +2631,7 @@ impl RssApp {
                 .into(),
             // Not requested yet: ask for it once it's near the visible area
             None => on_visible(
-                text("Loading image…").size(11).style(text::secondary),
+                text("Loading image…").size(11).style(dim_text),
                 Message::LoadStoryImage(src.to_string()),
                 IMAGE_PRELOAD_MARGIN,
             )
@@ -2924,7 +2937,7 @@ impl RssApp {
         let mut form = column![
             text("Edit feed").size(16),
             column![
-                text("Name").size(12).style(text::secondary),
+                text("Name").size(12).style(dim_text),
                 text_input("Feed name", &dialog.title)
                     .id(text_input::Id::new(EDIT_FEED_TITLE_INPUT_ID))
                     .on_input(Message::EditFeedTitleChanged)
@@ -2934,7 +2947,7 @@ impl RssApp {
             ]
             .spacing(4),
             column![
-                text("Feed URL").size(12).style(text::secondary),
+                text("Feed URL").size(12).style(dim_text),
                 text_input("https://example.com/feed.xml", &dialog.url)
                     .on_input(Message::EditFeedUrlChanged)
                     .on_submit(Message::SaveEditFeed)
@@ -2952,7 +2965,7 @@ impl RssApp {
         } else if url_changed {
             text("Archived stories are kept. The new URL is fetched on the next refresh.")
                 .size(11)
-                .style(text::secondary)
+                .style(dim_text)
                 .into()
         } else {
             Space::with_height(0).into()
@@ -2990,7 +3003,7 @@ impl RssApp {
                 text("Import from OPML").size(14),
                 text("Add feeds and folders exported from another reader. Feeds you already have are left as they are.")
                     .size(12)
-                    .style(text::secondary),
+                    .style(dim_text),
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -3036,7 +3049,20 @@ impl RssApp {
             .align_y(Alignment::Center),
             text("Feeds are also refreshed when the app starts.")
                 .size(12)
-                .style(text::secondary),
+                .style(dim_text),
+        ]
+        .spacing(6);
+
+        // Appearance: two buttons, the current one highlighted
+        let theme_button = |label: &'static str, light: bool| {
+            button(text(label).size(12))
+                .padding([4, 14])
+                .style(if self.light_mode == light { button::primary } else { button::secondary })
+                .on_press(Message::SetLightMode(light))
+        };
+        let appearance_section = column![
+            text("Appearance").size(14),
+            row![theme_button("Dark", false), theme_button("Light", true)].spacing(6),
         ]
         .spacing(6);
 
@@ -3049,7 +3075,7 @@ impl RssApp {
                 .text_size(12),
             text("Loading an image can let the sender see that you opened the story. When this is off, each image has a button to load it.")
                 .size(12)
-                .style(text::secondary),
+                .style(dim_text),
         ]
         .spacing(6);
 
@@ -3068,7 +3094,7 @@ impl RssApp {
                 "This desktop doesn't have a system tray, so closing the window quits Shreader."
             })
             .size(12)
-            .style(text::secondary),
+            .style(dim_text),
         ]
         .spacing(6);
 
@@ -3081,7 +3107,7 @@ impl RssApp {
                 .text_size(12),
             text("Messages in the corner of the window, after refreshes and other actions. When this is off, none appear, including ones about problems.")
                 .size(12)
-                .style(text::secondary),
+                .style(dim_text),
         ]
         .spacing(6);
 
@@ -3091,7 +3117,7 @@ impl RssApp {
                 text("Export to OPML").size(14),
                 text("Save your feeds and folders to a file, as a backup or to use in another reader. Stories aren't included.")
                     .size(12)
-                    .style(text::secondary),
+                    .style(dim_text),
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -3131,7 +3157,7 @@ impl RssApp {
             details += "Feeds and folders stay. Stories your feeds still list will download again on the next refresh. This can't be undone.";
             column![
                 text(format!("Delete {}?", plural(to_delete, "archived story", "archived stories"))).size(14),
-                text(details).size(12).style(text::secondary),
+                text(details).size(12).style(dim_text),
                 row![
                     horizontal_space(),
                     button(text("Cancel").size(13))
@@ -3154,7 +3180,7 @@ impl RssApp {
                         text("Clear archived stories").size(14),
                         text("Delete stored stories. Your feeds and folders are kept.")
                             .size(12)
-                            .style(text::secondary),
+                            .style(dim_text),
                         archive_size,
                     ]
                     .spacing(2)
@@ -3178,7 +3204,7 @@ impl RssApp {
         let note: Element<'a, Message> = if self.is_syncing() {
             text("Wait for the current refresh to finish before clearing stories.")
                 .size(11)
-                .style(text::secondary)
+                .style(dim_text)
                 .into()
         } else {
             Space::with_height(0).into()
@@ -3187,6 +3213,8 @@ impl RssApp {
         // The sections scroll when the window is too short to show them all
         let sections = scrollable(
             column![
+                appearance_section,
+                horizontal_rule(1),
                 refresh_section,
                 horizontal_rule(1),
                 images_section,
@@ -3241,7 +3269,7 @@ impl RssApp {
     fn add_feed_dialog_view<'a>(&'a self, dialog: &'a AddFeedDialog) -> Element<'a, Message> {
         let lookup_note: Element<'a, Message> = match &dialog.lookup {
             FeedLookup::Idle => Space::with_height(0).into(),
-            FeedLookup::Pending => text("Looking up feed…").size(11).style(text::secondary).into(),
+            FeedLookup::Pending => text("Looking up feed…").size(11).style(dim_text).into(),
             FeedLookup::Found { story_count } => text(match story_count {
                 0 => "Found the feed. It has no stories right now.".to_string(),
                 1 => "Found the feed (1 story).".to_string(),
@@ -3264,7 +3292,7 @@ impl RssApp {
         let form = column![
             text("Add feed").size(16),
             column![
-                text("Feed URL").size(12).style(text::secondary),
+                text("Feed URL").size(12).style(dim_text),
                 text_input("https://example.com/feed.xml", &dialog.url)
                     .id(text_input::Id::new(ADD_FEED_URL_INPUT_ID))
                     .on_input(Message::AddFeedUrlChanged)
@@ -3276,7 +3304,7 @@ impl RssApp {
             ]
             .spacing(4),
             column![
-                text("Name").size(12).style(text::secondary),
+                text("Name").size(12).style(dim_text),
                 text_input(
                     if dialog.lookup == FeedLookup::Pending {
                         "Filling in from the feed…"
@@ -3292,7 +3320,7 @@ impl RssApp {
             ]
             .spacing(4),
             column![
-                text("Folder").size(12).style(text::secondary),
+                text("Folder").size(12).style(dim_text),
                 pick_list(
                     self.folder_choices(),
                     Some(dialog.folder.clone()),
@@ -3364,7 +3392,7 @@ impl RssApp {
                     n => format!("Its {} archived stories will be permanently deleted too.", n),
                 })
                 .size(11)
-                .style(text::secondary),
+                .style(dim_text),
                 row![
                     horizontal_space(),
                     button(text("Cancel").size(12))
@@ -3430,8 +3458,8 @@ impl RssApp {
                 text(format!("Delete the {} tag?", tag.name)).size(13),
                 text(format!("Its {} stories go back to their folders. No stories are deleted.", tag.total_count))
                     .size(11)
-                    .style(text::secondary),
-                text(answers_text).size(11).style(text::secondary),
+                    .style(dim_text),
+                text(answers_text).size(11).style(dim_text),
                 button(
                     column![
                         text("Delete the tag, keep its answers and model").size(12),
@@ -3498,7 +3526,7 @@ impl RssApp {
                     ),
                 })
                 .size(11)
-                .style(text::secondary),
+                .style(dim_text),
                 row![
                     horizontal_space(),
                     button(text("Cancel").size(12))
@@ -3680,7 +3708,7 @@ impl RssApp {
                         text(format!("Dragging: {}", feed_title)).size(13).style(text::primary),
                         text(hint)
                             .size(11)
-                            .style(text::secondary),
+                            .style(dim_text),
                     ]
                     .spacing(2),
                 ]
@@ -3712,7 +3740,7 @@ impl RssApp {
                 text("Shreader RSS Reader").size(18),
                 text("Permanent SQL Archive")
                     .size(11)
-                    .style(text::secondary),
+                    .style(dim_text),
             ]
             .spacing(2),
             horizontal_space(),
@@ -3769,7 +3797,7 @@ impl RssApp {
         let mut categories = column![all_btn, unread_btn, starred_btn].spacing(4);
         // Stories sorted out of their folders (see the trainer)
         if !self.tag_views.is_empty() {
-            categories = categories.push(text("TAGS").size(11).style(text::secondary));
+            categories = categories.push(text("TAGS").size(11).style(dim_text));
             for tag in &self.tag_views {
                 let badge = if tag.unread_count > 0 { tag.unread_count.to_string() } else { String::new() };
                 let menu = self.tag_menu.filter(|m| m.tag_id == tag.id).map(|m| self.tag_menu_view(tag, m.confirm_delete));
@@ -3785,7 +3813,7 @@ impl RssApp {
 
         // Subscriptions & Folders Header
         let subscriptions_header = row![
-            text("SUBSCRIPTIONS").size(11).style(text::secondary),
+            text("SUBSCRIPTIONS").size(11).style(dim_text),
             horizontal_space(),
             button(text("+ Feed").size(11))
                 .padding([2, 6])
@@ -3996,7 +4024,7 @@ impl RssApp {
                     tree_items = tree_items.push(
                         row![
                             Space::with_width(18),
-                            text("(empty folder)").size(11).style(text::secondary),
+                            text("(empty folder)").size(11).style(dim_text),
                         ]
                     );
                 } else {
@@ -4030,7 +4058,7 @@ impl RssApp {
                 })
                 .size(10)
                 .wrapping(text::Wrapping::None)
-                .style(if is_over_uncategorized { text::primary } else { text::secondary }),
+                .style(if is_over_uncategorized { text::primary } else { dim_text }),
             )
             .padding([5, 6])
             .width(Length::Fill)
@@ -4063,7 +4091,7 @@ impl RssApp {
                 self.folders.len(), total_feeds, total_articles
             ))
             .size(11)
-            .style(text::secondary),
+            .style(dim_text),
         ]
         .spacing(4);
 
@@ -4112,7 +4140,7 @@ impl RssApp {
             row![
                 label_row,
                 if !badge.is_empty() {
-                    text(badge_owned).size(12).style(text::secondary)
+                    text(badge_owned).size(12).style(dim_text)
                 } else {
                     text("")
                 },
@@ -4205,7 +4233,7 @@ impl RssApp {
             };
 
             article_items = article_items.push(
-                container(text(empty_msg).size(13).style(text::secondary))
+                container(text(empty_msg).size(13).style(dim_text))
                     .padding(20)
                     .center_x(Length::Fill),
             );
@@ -4230,12 +4258,12 @@ impl RssApp {
 
                 let card_title = text(&article.title)
                     .size(13)
-                    .color(if article.is_read { READ_TITLE } else { UNREAD_TITLE });
+                    .style(move |theme: &Theme| text::Style { color: Some(title_color(theme, article.is_read)) });
 
                 let meta_row = row![
-                    text(feed_name).size(11).style(text::secondary),
-                    text("•").size(11).style(text::secondary),
-                    text(date_str).size(11).style(text::secondary),
+                    text(feed_name).size(11).style(dim_text),
+                    text("•").size(11).style(dim_text),
+                    text(date_str).size(11).style(dim_text),
                 ]
                 .spacing(4);
 
@@ -4306,7 +4334,7 @@ impl RssApp {
                     text("No Story Selected").size(18),
                     text("Select an article from the list to view its contents.")
                         .size(13)
-                        .style(text::secondary),
+                        .style(dim_text),
                 ]
                 .spacing(6)
                 .align_x(Alignment::Center),
@@ -4340,28 +4368,28 @@ impl RssApp {
 
 
                 let mut meta_items = row![
-                    text(format!("Feed: {}", feed_title)).size(12).style(text::secondary),
+                    text(format!("Feed: {}", feed_title)).size(12).style(dim_text),
                 ]
                 .spacing(6);
 
                 if let Some(ref fld) = folder_name {
-                    meta_items = meta_items.push(text("•").size(12).style(text::secondary));
+                    meta_items = meta_items.push(text("•").size(12).style(dim_text));
                     meta_items = meta_items.push(
                         row![
                             icon(Icon::Folder, 12.0, Tint::Secondary),
-                            text(fld.clone()).size(12).style(text::secondary),
+                            text(fld.clone()).size(12).style(dim_text),
                         ]
                         .spacing(4)
                         .align_y(Alignment::Center),
                     );
                 }
 
-                meta_items = meta_items.push(text("•").size(12).style(text::secondary));
-                meta_items = meta_items.push(text(format!("Date: {}", date_str)).size(12).style(text::secondary));
+                meta_items = meta_items.push(text("•").size(12).style(dim_text));
+                meta_items = meta_items.push(text(format!("Date: {}", date_str)).size(12).style(dim_text));
 
                 if let Some(author) = art.author {
-                    meta_items = meta_items.push(text("•").size(12).style(text::secondary));
-                    meta_items = meta_items.push(text(format!("By: {}", author)).size(12).style(text::secondary));
+                    meta_items = meta_items.push(text("•").size(12).style(dim_text));
+                    meta_items = meta_items.push(text(format!("By: {}", author)).size(12).style(dim_text));
                 }
 
                 // Actions toolbar
@@ -4457,11 +4485,11 @@ impl RssApp {
                     row![
                         text(format!("Permanently archived in SQLite (ID: #{})", art.id))
                             .size(11)
-                            .style(text::secondary),
+                            .style(dim_text),
                         horizontal_space(),
                         text(format!("Fetched: {}", art.fetched_at.format("%Y-%m-%d %H:%M UTC")))
                             .size(11)
-                            .style(text::secondary),
+                            .style(dim_text),
                     ],
                 ]
                 .spacing(4);
@@ -4510,7 +4538,11 @@ impl RssApp {
     }
 
     pub fn theme(&self, _window: iced::window::Id) -> Theme {
-        Theme::Dark
+        if self.light_mode {
+            Theme::Light
+        } else {
+            Theme::Dark
+        }
     }
 }
 
@@ -4555,7 +4587,7 @@ fn grip_icon<'a>(active: bool) -> Element<'a, Message> {
             let color = if active {
                 palette.primary.base.color
             } else {
-                palette.secondary.strong.color
+                dim_color(theme)
             };
             container::Style {
                 background: Some(color.into()),
@@ -4852,8 +4884,15 @@ fn release_memory() {
 const READER_TEXT_SIZE: f32 = 14.0;
 const READER_TEXT_WRAPPING: iced::widget::text::Wrapping = iced::widget::text::Wrapping::WordOrGlyph;
 
-/// Color of links in story text
-const LINK_COLOR: Color = Color::from_rgb(0.45, 0.70, 1.0);
+/// Color of links in story text: a light blue on the dark theme, a deeper
+/// one on the light theme so it stays readable on white
+fn link_color(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgb(0.45, 0.70, 1.0)
+    } else {
+        Color::from_rgb(0.08, 0.38, 0.78)
+    }
+}
 
 /// Colors the links in a story text block (the text editor's highlighter
 /// hook): given each block's links, it marks their ranges line by line.
@@ -4896,10 +4935,17 @@ impl iced::advanced::text::Highlighter for LinkHighlighter {
     }
 }
 
-/// Title color of a story that hasn't been read yet.
-const UNREAD_TITLE: Color = Color::from_rgb(0.36, 0.84, 0.49);
-/// Title color of a read story.
-const READ_TITLE: Color = Color::WHITE;
+/// Title color of a story in the list: green until it's read, then the
+/// theme's text color. The green is darker on the light theme, so it
+/// reads on white.
+fn title_color(theme: &Theme, is_read: bool) -> Color {
+    let palette = theme.extended_palette();
+    match (is_read, palette.is_dark) {
+        (true, _) => palette.background.base.text,
+        (false, true) => Color::from_rgb(0.36, 0.84, 0.49),
+        (false, false) => Color::from_rgb(0.05, 0.50, 0.22),
+    }
+}
 
 /// A story in the list: the page background with a grey outline, so the
 /// colored titles stay readable. Hovering brightens the outline; the open
