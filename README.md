@@ -1,10 +1,18 @@
-# Shreader (Pronounced Shredder)
-
+# Shreader 
+(Pronounced Shredder)
 An RSS and Atom feed reader for Linux that keeps every story it receives.
 
 Shreader puts an emphasis on simplicity and never losing a story. It keeps every story it downloads in a local, searchable archive via SQLite, even after it drops out of the feed. It does not include a web-browser or any of the other bloat that other RSS readers have included as of late. It is made to my tastes, but has an easily accessible interface with dragging, right click contexts, and other niceties that somebody may want.
 
-Part of the reason I wanted to write this one from scratch was to include story grouping/deduplication for similar or further developing stories from multiple sources. Think Ground News but for everything in your personal interests. More updates on this soon.
+Shreader has early support for ML tagging of stories. Model Training is currently done outside of the main application.
+To configure:
+```
+cargo run -p shreader-train
+```
+From here it is recommended that you create a tag, sort by "Most likely", and search for an article that begins in that category to begin annotating until relevant examples run out. Tags will be removed from that folder and put in their respective tag (i.e. promotions). Corrections can be made in the app, but to retrain the model with these corrections, you must relaunch the configuration tool. Models for each tag are applied in the order they were added (this will be adjustable in the future).
+This approach allows for simple, but powerfully individualized sorting.
+
+One of the reasons this is written from scratch was to include story grouping/deduplication for similar or further developing stories from multiple sources. Think Ground News but for everything in your personal interests. More updates on this soon.
 It will also have a light mode. At some point.
 
 ## Installing
