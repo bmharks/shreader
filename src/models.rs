@@ -30,7 +30,6 @@ pub struct Feed {
     pub last_fetched_at: Option<DateTime<Utc>>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
-    pub created_at: DateTime<Utc>,
     pub unread_count: i64,
     pub total_count: i64,
 }

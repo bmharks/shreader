@@ -631,7 +631,7 @@ impl Database {
             r#"
             SELECT 
                 f.id, f.url, f.title, f.description, f.site_url,
-                f.last_fetched_at, f.etag, f.last_modified, f.created_at,
+                f.last_fetched_at, f.etag, f.last_modified,
                 (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0 AND NOT EXISTS
                     (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)) as unread_count,
                 (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND NOT EXISTS
@@ -644,7 +644,6 @@ impl Database {
 
         let rows = stmt.query_map([], |row| {
             let last_fetched_str: Option<String> = row.get(5)?;
-            let created_at_str: String = row.get(8)?;
 
             Ok(Feed {
                 id: row.get(0)?,
@@ -655,12 +654,9 @@ impl Database {
                 last_fetched_at: last_fetched_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
                 etag: row.get(6)?,
                 last_modified: row.get(7)?,
-                created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                unread_count: row.get(9)?,
-                total_count: row.get(10)?,
-                folder_id: row.get(11)?,
+                unread_count: row.get(8)?,
+                total_count: row.get(9)?,
+                folder_id: row.get(10)?,
             })
         })?;
 
@@ -677,7 +673,7 @@ impl Database {
             r#"
             SELECT 
                 f.id, f.url, f.title, f.description, f.site_url,
-                f.last_fetched_at, f.etag, f.last_modified, f.created_at,
+                f.last_fetched_at, f.etag, f.last_modified,
                 (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND a.is_read = 0 AND NOT EXISTS
                     (SELECT 1 FROM story_tags s WHERE s.article_id = a.id)) as unread_count,
                 (SELECT COUNT(*) FROM articles a WHERE a.feed_id = f.id AND NOT EXISTS
@@ -690,7 +686,6 @@ impl Database {
 
         let result = stmt.query_row(params![id], |row| {
             let last_fetched_str: Option<String> = row.get(5)?;
-            let created_at_str: String = row.get(8)?;
 
             Ok(Feed {
                 id: row.get(0)?,
@@ -701,12 +696,9 @@ impl Database {
                 last_fetched_at: last_fetched_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))),
                 etag: row.get(6)?,
                 last_modified: row.get(7)?,
-                created_at: DateTime::parse_from_rfc3339(&created_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                unread_count: row.get(9)?,
-                total_count: row.get(10)?,
-                folder_id: row.get(11)?,
+                unread_count: row.get(8)?,
+                total_count: row.get(9)?,
+                folder_id: row.get(10)?,
             })
         }).optional()?;
 
