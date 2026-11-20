@@ -313,76 +313,72 @@ pub(crate) fn clean_line(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// A title from a feed, as plain text. Atom titles marked `type="html"` are
-/// HTML, and RSS titles in practice often are too, so character references
-/// (`&#8217;`, `&rsquo;`, `&amp;`) become the characters they stand for:
-/// The Verge's "Google&#8217;s" is "Google’s". Tags are dropped from HTML
-/// titles. Then it's cleaned like any line (`clean_line`).
-pub(crate) fn title_line(title: &feed_rs::model::Text, max_chars: usize) -> String {
-    let is_html = title.content_type.to_string().starts_with("text/html");
-    let text = if is_html { strip_tags(&title.content) } else { title.content.clone() };
-    clean_line(&decode_html_line(&text), max_chars)
+/// How a line of text in a feed is written, which decides how it's read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Markup {
+    /// HTML: tags are dropped and character references decoded, as a
+    /// browser would (Atom's `type="html"` and `type="xhtml"`)
+    Html,
+    /// Text with HTML character references (`&#8217;`, `&hellip;`) decoded,
+    /// but a `<` always kept as text. RSS doesn't say whether its titles
+    /// are HTML; in practice they're often double-escaped, so references
+    /// need decoding, while "Why <iframe> is risky" is plain text.
+    References,
+    /// Plain text, shown as sent (Atom's `type="text"`, JSON Feed)
+    Plain,
 }
 
-/// `text` without anything between `<` and `>`.
-fn strip_tags(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_tag = false;
-    for c in text.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+impl Markup {
+    /// How the title `text` from a feed of `feed_type` is written.
+    pub(crate) fn of_title(text: &feed_rs::model::Text, feed_type: &feed_rs::model::FeedType) -> Self {
+        use feed_rs::model::FeedType;
+        if text.content_type.to_string().starts_with("text/html") {
+            Markup::Html
+        } else if matches!(feed_type, FeedType::RSS0 | FeedType::RSS1 | FeedType::RSS2) {
+            Markup::References
+        } else {
+            Markup::Plain
         }
     }
-    out
 }
 
-/// `text` with HTML character references decoded, for one line: no-break
-/// spaces become plain spaces, so a title can still wrap. Anything that
-/// isn't a reference HTML knows (a lone "&", "AT&T") stays as it is.
-pub(crate) fn decode_html_line(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        rest = &rest[amp..];
-        match decode_reference(rest) {
-            Some((decoded, used)) => {
-                out.extend(decoded.into_iter().map(|c| if c == '\u{a0}' { ' ' } else { c }));
-                rest = &rest[used..];
+/// One line of feed text (a title, an author) as plain text to show:
+/// read as `markup` says (The Verge's "Google&#8217;s" is "Google’s"), then
+/// cleaned like any line (`clean_line`). No-break spaces become plain
+/// spaces, so a title can still wrap.
+pub(crate) fn feed_line(text: &str, markup: Markup, max_chars: usize) -> String {
+    let text = match markup {
+        Markup::Html => html_text(text),
+        Markup::References => html_text(&text.replace('<', "&lt;")),
+        Markup::Plain => text.to_string(),
+    };
+    clean_line(&text.replace('\u{a0}', " "), max_chars)
+}
+
+/// The text of an HTML fragment, as the HTML standard reads it: html5ever's
+/// tokenizer (the one html2text uses for stories) decodes character
+/// references, including those without their ";" and the old Windows
+/// numbers ("&#146;" is ’), and the tags and comments are left out.
+fn html_text(html: &str) -> String {
+    use html5ever::tokenizer::{BufferQueue, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts};
+
+    struct Collect(std::cell::RefCell<String>);
+    impl TokenSink for Collect {
+        type Handle = ();
+        fn process_token(&self, token: Token, _line: u64) -> TokenSinkResult<()> {
+            if let Token::CharacterTokens(text) = token {
+                self.0.borrow_mut().push_str(&text);
             }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
+            TokenSinkResult::Continue
         }
     }
-    out.push_str(rest);
-    out
-}
 
-/// The character(s) the reference at the start of `text` (which starts
-/// with "&") stands for, and how many bytes it takes up. Only references
-/// with their closing ";".
-fn decode_reference(text: &str) -> Option<(Vec<char>, usize)> {
-    // The longest name HTML has is 31 characters
-    let end = text.char_indices().take(34).find(|(_, c)| *c == ';')?.0;
-    let name = &text[1..end];
-    let used = end + 1;
-    if let Some(number) = name.strip_prefix('#') {
-        let code = match number.strip_prefix(['x', 'X']) {
-            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-            None => number.parse().ok()?,
-        };
-        // NUL and anything that isn't a character: the replacement character
-        let c = char::from_u32(code).filter(|&c| c != '\0').unwrap_or('\u{FFFD}');
-        return Some((vec![c], used));
-    }
-    let &(first, second) = markup5ever::data::NAMED_ENTITIES.get(&text[1..used])?;
-    let chars = [first, second].into_iter().filter(|&c| c != 0).filter_map(char::from_u32).collect();
-    Some((chars, used))
+    let input = BufferQueue::default();
+    input.push_back(html5ever::tendril::StrTendril::from_slice(html));
+    let tokenizer = Tokenizer::new(Collect(Default::default()), TokenizerOpts::default());
+    let _ = tokenizer.feed(&input);
+    tokenizer.end();
+    tokenizer.sink.0.into_inner()
 }
 
 /// Unicode's invisible bidirectional formatting characters: marks,
@@ -645,7 +641,12 @@ impl FeedFetcher {
         let parsed_title = parsed_feed
             .title
             .as_ref()
-            .map(|t| title_line(t, MAX_TITLE_CHARS).split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|t| {
+                feed_line(&t.content, Markup::of_title(t, &parsed_feed.feed_type), MAX_TITLE_CHARS)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .filter(|t| !t.is_empty());
         let description = parsed_feed.description.as_ref().map(|d| clean_line(&d.content, 10_000));
         let Some(feed_title) = db.update_feed_from_fetch(
@@ -682,7 +683,10 @@ impl FeedFetcher {
         for entry in parsed_feed.entries {
             // The title as sent identifies a story without an id or link
             // (`generate_guid_hash`), so that stays as it was; it's shown decoded
-            let title = entry.title.as_ref().map(|t| title_line(t, MAX_TITLE_CHARS));
+            let title = entry
+                .title
+                .as_ref()
+                .map(|t| feed_line(&t.content, Markup::of_title(t, &parsed_feed.feed_type), MAX_TITLE_CHARS));
             let raw_title = entry.title.map(|t| t.content).unwrap_or_else(|| "Untitled".to_string());
             let link = entry.links.first().map(|l| clean_tracking_params(&l.href));
             let guid = if entry.id.trim().is_empty() {
@@ -701,7 +705,8 @@ impl FeedFetcher {
             let link = link.filter(|l| l.len() <= MAX_URL_BYTES);
             let author = if !entry.authors.is_empty() {
                 let names = entry.authors.into_iter().map(|a| a.name).collect::<Vec<_>>().join(", ");
-                Some(clean_line(&decode_html_line(&names), MAX_AUTHOR_CHARS))
+                // Names have no declared type; WordPress sends "O&#8217;Brien"
+                Some(feed_line(&names, Markup::References, MAX_AUTHOR_CHARS))
             } else {
                 None
             };
@@ -814,7 +819,12 @@ impl FeedFetcher {
 
         let title = parsed
             .title
-            .map(|t| title_line(&t, MAX_TITLE_CHARS).split_whitespace().collect::<Vec<_>>().join(" "))
+            .map(|t| {
+                feed_line(&t.content, Markup::of_title(&t, &parsed.feed_type), MAX_TITLE_CHARS)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
             .filter(|t| !t.is_empty());
 
         Ok(FeedPreview {
@@ -1190,38 +1200,79 @@ mod tests {
     /// "Blue Origin will launch Google&#8217;s AI server satellites": The
     /// Verge's titles are HTML, and sometimes use character references.
     #[test]
-    fn titles_show_the_characters_html_codes_stand_for() {
+    fn titles_are_read_as_their_feed_writes_them() {
         let atom = br#"<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
             <title type="text">The Verge</title><id>v</id><updated>2026-11-19T13:53:38Z</updated>
             <entry><title type="html"><![CDATA[Blue Origin will launch Google&#8217;s AI server satellites in 2029]]></title>
               <id>a</id><updated>2026-11-19T13:53:38Z</updated></entry>
-            <entry><title type="html">Snakes &amp;#038; Ladders &lt;em&gt;live&lt;/em&gt; &amp;lt;3</title>
+            <entry><title type="html">Snakes &amp;#038; Ladders &lt;em&gt;live&lt;/em&gt;&lt;!-- x --&gt; &amp;lt;3</title>
               <id>b</id><updated>2026-11-19T13:53:38Z</updated></entry>
-            <entry><title type="text">x &lt;b&gt; y</title><id>c</id><updated>2026-11-19T13:53:38Z</updated></entry>
+            <entry><title type="text">x &lt;b&gt; y &amp;amp; z</title><id>c</id><updated>2026-11-19T13:53:38Z</updated></entry>
         </feed>"#;
-        let feed = parse_feed(atom).unwrap();
-        let titles: Vec<String> =
-            feed.entries.iter().map(|e| title_line(e.title.as_ref().unwrap(), MAX_TITLE_CHARS)).collect();
-        assert_eq!(titles[0], "Blue Origin will launch Google’s AI server satellites in 2029");
-        assert_eq!(titles[1], "Snakes & Ladders live <3", "tags dropped, then codes decoded");
-        assert_eq!(titles[2], "x <b> y", "a plain-text title keeps what looks like a tag");
-
-        // RSS titles (Kagi Small Web, Slashdot)
-        assert_eq!(decode_html_line("The thing&hellip;"), "The thing…");
-        assert_eq!(decode_html_line("It&rsquo;s &ldquo;gatekeeping&rdquo;"), "It’s “gatekeeping”");
-        assert_eq!(decode_html_line("AT&amp;T &#x2014; 5&#8211;7"), "AT&T — 5–7");
-        assert_eq!(decode_html_line("So&nbsp;many&nbsp;years"), "So many years", "and it can wrap");
-        // Not references: left alone
-        assert_eq!(decode_html_line("AT&T & Verizon; R&D;"), "AT&T & Verizon; R&D;");
-        assert_eq!(decode_html_line("&notaname; &#; &#xZZ; &#1114112;"), "&notaname; &#; &#xZZ; \u{FFFD}");
-        assert_eq!(decode_html_line("trailing &"), "trailing &");
-        // A decoded control or direction override is cleaned like any other
-        let sneaky = feed_rs::model::Text {
-            content_type: "text/plain".parse().unwrap(),
-            src: None,
-            content: "Invoice for &#8238;fdp.exe&#10;x".into(),
+        let rss = br#"<?xml version="1.0"?><rss version="2.0"><channel><title>Kagi&amp;nbsp;Small Web</title>
+            <item><title>Why &lt;iframe&gt; is risky &amp;hellip;</title><guid>d</guid></item>
+            <item><title>Comcast Is Just Cable, AT&amp;amp;T Says</title><guid>e</guid></item>
+        </channel></rss>"#;
+        let titles = |bytes: &[u8]| {
+            let feed = parse_feed(bytes).unwrap();
+            let mut all = vec![feed_line(
+                &feed.title.as_ref().unwrap().content,
+                Markup::of_title(feed.title.as_ref().unwrap(), &feed.feed_type),
+                MAX_TITLE_CHARS,
+            )];
+            for entry in &feed.entries {
+                let title = entry.title.as_ref().unwrap();
+                all.push(feed_line(&title.content, Markup::of_title(title, &feed.feed_type), MAX_TITLE_CHARS));
+            }
+            all
         };
-        assert_eq!(title_line(&sneaky, 100), "Invoice for fdp.exe x");
+        assert_eq!(
+            titles(atom),
+            [
+                "The Verge",
+                "Blue Origin will launch Google’s AI server satellites in 2029",
+                "Snakes & Ladders live <3", // HTML: tags and comments dropped, then decoded
+                "x <b> y &amp; z",          // plain text: shown as sent
+            ]
+        );
+        assert_eq!(
+            titles(rss),
+            [
+                "Kagi Small Web",
+                "Why <iframe> is risky …", // RSS: a "<" stays text
+                "Comcast Is Just Cable, AT&T Says",
+            ]
+        );
+    }
+
+    /// Character references are read as the HTML standard says, browsers'
+    /// quirks included.
+    #[test]
+    fn html_character_references_follow_the_standard() {
+        let read = |text: &str| feed_line(text, Markup::References, 200);
+        assert_eq!(read("It&rsquo;s &ldquo;gatekeeping&rdquo;&hellip;"), "It’s “gatekeeping”…");
+        assert_eq!(read("&#x2014; 5&#8211;7 &NotEqualTilde;"), "— 5–7 ≂̸");
+        // Old Windows numbers are Windows-1252 characters, not controls
+        assert_eq!(read("It&#146;s &#147;quoted&#148; &#150; &#128;5"), "It’s “quoted” – €5");
+        // Without the ";": the old names and numbers still count
+        assert_eq!(read("Fish &amp chips &copy 2026, &#8217s"), "Fish & chips © 2026, ’s");
+        // Not references: left alone
+        assert_eq!(read("AT&T & Verizon; R&D; Q&A trailing &"), "AT&T & Verizon; R&D; Q&A trailing &");
+        assert_eq!(read("&madeup; &#; &#xZZ;"), "&madeup; &#; &#xZZ;");
+        // NUL and numbers that aren't characters: the replacement character
+        assert_eq!(read("a&#0;b&#xD800;c&#1114112;d"), "a\u{FFFD}b\u{FFFD}c\u{FFFD}d");
+        // A browser's quirk: "&not" needs no ";", so this is "¬"
+        assert_eq!(read("&notit;"), "¬it;");
+        // No-break spaces become spaces, so a title can wrap
+        assert_eq!(read("So&nbsp;many&nbsp;years"), "So many years");
+        // HTML: a bare "<" before a space is text; "<y" starts a tag, as in a browser
+        assert_eq!(feed_line("x < y and z", Markup::Html, 200), "x < y and z");
+        assert_eq!(feed_line("x <y and z", Markup::Html, 200), "x");
+        assert_eq!(feed_line("a <b title=\"1 > 0\">bold</b> c", Markup::Html, 200), "a bold c");
+        // A decoded control or direction override is cleaned like any other
+        assert_eq!(read("Invoice for &#8238;fdp.exe&#10;x"), "Invoice for fdp.exe x");
+        // Authors keep an address in angle brackets
+        assert_eq!(read("Pat O&#8217;Brien <pat@example.com>"), "Pat O’Brien <pat@example.com>");
     }
 
     #[test]

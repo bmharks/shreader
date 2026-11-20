@@ -38,8 +38,9 @@ url = "2.5"
 sha2 = "0.10"
 hex = "0.4"
 html2text = "0.13"
-# HTML's named characters (&rsquo;, &hellip;) for feed titles; already used by html2text
-markup5ever = "0.14.1"
+# The HTML standard's tokenizer, for feed titles ("Google&#8217;s"). The
+# version html2text uses, so there's one copy: bump the two together.
+html5ever = "0.29.1"
 
 # System & Linux XDG paths
 directories = "5.0"

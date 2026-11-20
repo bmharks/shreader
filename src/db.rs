@@ -1277,7 +1277,7 @@ impl Database {
 const TITLES_DECODED_SETTING: &str = "titles_decoded";
 
 /// Decodes HTML character references in stored story titles and authors
-/// (see `feed::decode_html_line`). Only rows that look like they hold one
+/// (as `feed::Markup::References`). Only rows that look like they hold one
 /// are read, and only changed ones written. How many stories changed.
 fn decode_stored_titles(conn: &Connection) -> Result<usize> {
     let rows: Vec<(i64, String, Option<String>)> = {
@@ -1289,10 +1289,13 @@ fn decode_stored_titles(conn: &Connection) -> Result<usize> {
     };
     let mut changed = 0;
     for (id, title, author) in rows {
-        let new_title = crate::feed::clean_line(&crate::feed::decode_html_line(&title), crate::feed::MAX_TITLE_CHARS);
+        use crate::feed::{feed_line, Markup, MAX_AUTHOR_CHARS, MAX_TITLE_CHARS};
+        // Which kind of feed it came from isn't stored: references only, the
+        // way RSS titles and all authors are read now
+        let new_title = feed_line(&title, Markup::References, MAX_TITLE_CHARS);
         let new_author = author
             .as_deref()
-            .map(|a| crate::feed::clean_line(&crate::feed::decode_html_line(a), crate::feed::MAX_AUTHOR_CHARS));
+            .map(|a| feed_line(a, Markup::References, MAX_AUTHOR_CHARS));
         if new_title != title || new_author != author {
             conn.execute(
                 "UPDATE articles SET title = ?1, author = ?2 WHERE id = ?3",
