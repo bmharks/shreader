@@ -967,10 +967,14 @@ impl Database {
 
         if let Some(ref search) = filter.search_query {
             if !search.trim().is_empty() {
-                clause.push_str(" AND a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)");
-                // Format FTS5 search query nicely (e.g. quote words)
-                let fts_query = format!("\"{}\"", search.replace('"', "\"\""));
-                params_vec.push(Box::new(fts_query));
+                match fts_query(search) {
+                    Some(query) => {
+                        clause.push_str(" AND a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)");
+                        params_vec.push(Box::new(query));
+                    }
+                    // Only punctuation: no word to look for
+                    None => clause.push_str(" AND 0"),
+                }
             }
         }
 
@@ -1254,6 +1258,47 @@ impl Database {
     }
 }
 
+/// What's typed in the search box, as an FTS5 query.
+///
+/// Each word is looked for on its own, in any order, and the last one also
+/// matches as the start of a longer word while it's still being typed:
+/// `solar pan` finds "solar panels". A space after it ends the word, and
+/// text in quotes is an exact phrase. Everything is quoted for FTS5, so
+/// what's typed is never read as its syntax (`OR`, `-`, `:`, `*`).
+/// `None` if there's no word at all, only punctuation.
+fn fts_query(input: &str) -> Option<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        // (the term, what follows it, whether it's a phrase with its closing quote)
+        let (term, after, closed) = match rest.strip_prefix('"') {
+            Some(phrase) => match phrase.find('"') {
+                Some(end) => (&phrase[..end], &phrase[end + 1..], true),
+                None => (phrase, "", false), // being typed
+            },
+            None => {
+                let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
+                (&rest[..end], &rest[end..], false)
+            }
+        };
+        rest = after;
+        // Punctuation alone isn't a word (and would make an empty phrase)
+        if !term.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        let mut quoted = format!("\"{}\"", term);
+        if after.is_empty() && !closed && !input.ends_with(char::is_whitespace) {
+            quoted.push('*');
+        }
+        terms.push(quoted);
+    }
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1428,6 +1473,45 @@ mod tests {
         };
         assert_eq!(search("haystack"), 1);
         assert_eq!(search("needle"), 0);
+    }
+
+    #[test]
+    fn search_text_becomes_an_fts_query() {
+        assert_eq!(fts_query("solar pan").as_deref(), Some(r#""solar" "pan"*"#));
+        assert_eq!(fts_query("solar pan ").as_deref(), Some(r#""solar" "pan""#), "a space ends the word");
+        assert_eq!(fts_query(r#""solar panels" cheap"#).as_deref(), Some(r#""solar panels" "cheap"*"#));
+        assert_eq!(fts_query(r#"cheap "solar panels""#).as_deref(), Some(r#""cheap" "solar panels""#));
+        assert_eq!(fts_query(r#"cheap "solar pan"#).as_deref(), Some(r#""cheap" "solar pan"*"#));
+        assert_eq!(fts_query("rust OR go -c++").as_deref(), Some(r#""rust" "OR" "go" "-c++"*"#));
+        assert_eq!(fts_query("  - ; ").as_deref(), None);
+        assert_eq!(fts_query(r#"""#).as_deref(), None);
+    }
+
+    /// Partly typed words find stories, in any order; quotes keep a phrase.
+    #[test]
+    fn search_finds_words_as_they_are_typed() {
+        let db = Database::open_in_memory().unwrap();
+        let feed = db.add_or_update_feed("https://f.example/rss", "F", None, None, None).unwrap();
+        for (hash, title) in [("a", "Cheap solar panels for your roof"), ("b", "Panels discuss solar policy")] {
+            db.upsert_article(feed, Some(hash), hash, title, None, None, None, None, Some("body"), None, None).unwrap();
+        }
+        let search = |q: &str| {
+            let mut titles: Vec<String> = db
+                .get_articles(&ArticleFilter { search_query: Some(q.into()), ..Default::default() })
+                .unwrap()
+                .into_iter()
+                .map(|a| a.title)
+                .collect();
+            titles.sort();
+            titles
+        };
+        assert_eq!(search("sol").len(), 2);
+        assert_eq!(search("solar pan").len(), 2, "both words, either order");
+        assert_eq!(search("cheap sol"), ["Cheap solar panels for your roof"]);
+        assert_eq!(search("\"solar pan"), ["Cheap solar panels for your roof"], "a phrase keeps its order");
+        assert!(search("sol ").is_empty(), "\"sol\" on its own isn't a word in either");
+        assert!(search("-").is_empty());
+        assert!(search("roof OR").is_empty(), "OR is a word to find, not an operator");
     }
 
     /// A story dated in the future sorts (and shows) as of when it was
