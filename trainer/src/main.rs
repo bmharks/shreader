@@ -10,7 +10,7 @@ mod queue;
 use archive::Archive;
 
 fn main() -> iced::Result {
-    let archive = match Archive::default_path().and_then(|path| Archive::open(&path)) {
+    let archive = match shreader_tags::archive::path().and_then(|path| Archive::open(&path)) {
         Ok(archive) => archive,
         Err(e) => {
             eprintln!("shreader-train: {:#}", e);

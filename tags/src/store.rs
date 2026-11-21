@@ -16,9 +16,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::embedder;
 use crate::model::{Evaluation, Example, TagModel};
 
-/// Creates the tables if they aren't there yet. Safe to call every time
-/// the archive is opened.
-pub fn ensure_schema(conn: &Connection) -> Result<()> {
+/// Creates the tables, as part of Shreader's first schema step (see
+/// `crate::archive::SCHEMA_VERSION`); later changes to them are new steps
+/// there. Archives from before then may have some of them already.
+pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         -- Story embeddings (see embedder.rs), removed with their story. The
@@ -70,7 +71,9 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     )
     .context("creating the tag tables")?;
     // Tags tables made before deleting was possible
-    let _ = conn.execute("ALTER TABLE tags ADD COLUMN removed INTEGER NOT NULL DEFAULT 0", []);
+    if !crate::archive::has_column(conn, "tags", "removed")? {
+        conn.execute_batch("ALTER TABLE tags ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 
@@ -245,11 +248,11 @@ pub fn model(conn: &Connection, tag: i64) -> Result<Option<(TagModel, String, St
 /// Stories in folders with tags only get embeddings (and so a model's
 /// opinion) from this many days back; older ones keep whatever tag the
 /// user gave them.
-pub const RECENT_DAYS: i64 = 30;
+pub(crate) const RECENT_DAYS: i64 = 30;
 
 /// Up to `limit` stories in folders with a tag, dated `since` or later
 /// (newest first), with no embedding yet: (id, text to embed).
-pub fn stories_to_embed(conn: &Connection, since: &str, limit: usize) -> Result<Vec<(i64, String)>> {
+pub(crate) fn stories_to_embed(conn: &Connection, since: &str, limit: usize) -> Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT a.id, a.title, substr(COALESCE(a.content_text, ''), 1, 600)
          FROM articles a LEFT JOIN story_embeddings e ON e.article_id = a.id
@@ -395,7 +398,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// An archive with just what tags need from Shreader's tables (the
-    /// columns used here), and `ensure_schema`
+    /// columns used here), and `create_tables`
     pub fn archive() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -408,8 +411,8 @@ pub(crate) mod tests {
              INSERT INTO feeds VALUES (10, 1), (20, 2);",
         )
         .unwrap();
-        ensure_schema(&conn).unwrap();
-        ensure_schema(&conn).unwrap();
+        create_tables(&conn).unwrap();
+        create_tables(&conn).unwrap();
         conn
     }
 

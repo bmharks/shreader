@@ -30,9 +30,6 @@ const FILES: [(&str, &str, usize); 3] = [
     ("model.safetensors", "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db", 100 * 1024 * 1024),
 ];
 
-/// The model's total download, for messages
-pub const DOWNLOAD_MB: u32 = 91;
-
 /// Numbers per embedding
 pub const DIMENSIONS: usize = 384;
 
@@ -144,7 +141,7 @@ pub fn story_text(title: &str, text: &str) -> String {
 }
 
 /// An embedding as stored: 16-bit floats, little-endian (768 bytes)
-pub fn to_bytes(embedding: &[f32]) -> Vec<u8> {
+pub(crate) fn to_bytes(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|&x| half::f16::from_f32(x).to_le_bytes()).collect()
 }
 

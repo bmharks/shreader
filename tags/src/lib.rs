@@ -8,6 +8,7 @@
 //! user correct a story's tag, and the trainer (`shreader-train`), where
 //! the user reviews stories and trains the models.
 
+pub mod archive;
 pub mod embedder;
 pub mod model;
 pub mod store;

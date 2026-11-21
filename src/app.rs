@@ -425,6 +425,8 @@ pub enum Message {
     MarkAllRead,
     DeleteFeed(i64),
     OpenUrl(String),
+    /// Opening a link failed (why)
+    LinkNotOpened(String),
     DismissStatus,
     /// The auto-dismiss timer for status message number `.0` ran out
     StatusTimedOut(u64),
@@ -984,12 +986,10 @@ impl RssApp {
                 Task::none()
             }
             Message::ReaderMouseReleased => {
-                if let Some(url) = self.pressed_link.take() {
-                    if let Err(e) = open_in_browser(&url) {
-                        self.status_message = Some((e, true));
-                    }
+                match self.pressed_link.take() {
+                    Some(url) => open_link(&url),
+                    None => Task::none(),
                 }
-                Task::none()
             }
             Message::OpenReaderTextMenu(index, position) => {
                 self.feed_menu = None;
@@ -1912,9 +1912,10 @@ impl RssApp {
             }
             Message::OpenUrl(url) => {
                 self.reader_text_menu = None;
-                if let Err(e) = open_in_browser(&url) {
-                    self.status_message = Some((e, true));
-                }
+                open_link(&url)
+            }
+            Message::LinkNotOpened(e) => {
+                self.status_message = Some((e, true));
                 Task::none()
             }
             Message::ShowMoreArticles => {
@@ -4840,24 +4841,58 @@ fn held_back_note(summaries: &[crate::models::FeedSyncSummary]) -> String {
     )
 }
 
-/// Opens a web link in the default browser.
-///
-/// Links come from feeds, so only http(s) is passed on: `xdg-open` would also
-/// open local files, launchers and other apps' URL schemes.
-fn open_in_browser(url: &str) -> Result<(), String> {
+/// A link from a story, checked before it's opened: only http(s) is passed
+/// on, since the desktop would also open local files, launchers and other
+/// apps' URL schemes.
+fn web_link(url: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(url.trim()).map_err(|_| format!("Not a valid link: {}", url))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("Only web links are opened, not '{}:' links", parsed.scheme()));
     }
-    let mut child = std::process::Command::new("xdg-open")
-        .arg(parsed.as_str())
-        .spawn()
-        .map_err(|e| format!("Couldn't start the browser: {}", e))?;
-    // Collect its exit status, or it lingers as a zombie process until the app closes
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    Ok(parsed)
+}
+
+/// Opens a story's link in the default browser, in the background; a
+/// problem shows in the status bar.
+fn open_link(url: &str) -> Task<Message> {
+    match web_link(url) {
+        Ok(link) => Task::future(async move {
+            match open_in_browser(link).await {
+                Ok(()) => Message::Noop,
+                Err(e) => Message::LinkNotOpened(e),
+            }
+        }),
+        Err(e) => Task::done(Message::LinkNotOpened(e)),
+    }
+}
+
+/// Opens a web link in the default browser, through the desktop portal
+/// (org.freedesktop.portal.OpenURI): the standard way, which also works
+/// from a Flatpak sandbox. Without a portal service, `xdg-open` is used.
+async fn open_in_browser(link: url::Url) -> Result<(), String> {
+    use ashpd::desktop::ResponseError;
+    use ashpd::desktop::open_uri::OpenFileRequest;
+
+    match OpenFileRequest::default().send_uri(&link).await {
+        Ok(request) => match request.response() {
+            // Cancelled: the user closed the portal's app chooser
+            Ok(()) | Err(ashpd::Error::Response(ResponseError::Cancelled)) => Ok(()),
+            Err(e) => Err(format!("Couldn't open the link: {}", e)),
+        },
+        Err(e) => {
+            tracing::debug!("No desktop portal to open links ({}); using xdg-open", e);
+            let status = tokio::process::Command::new("xdg-open")
+                .arg(link.as_str())
+                .status()
+                .await
+                .map_err(|e| format!("Couldn't start the browser: {}", e))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err("Couldn't open the link: no browser responded".to_string())
+            }
+        }
+    }
 }
 
 /// Runs a scroll task, then has the window redrawn.
@@ -5010,7 +5045,7 @@ fn find_match_id() -> container::Id {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_size, open_in_browser, ImageState, RefreshInterval, RssApp};
+    use super::{format_size, web_link, ImageState, RefreshInterval, RssApp};
 
     /// The sidebar's Starred count covers the whole archive, whichever view
     /// is open.
@@ -5077,10 +5112,11 @@ mod tests {
         let db = crate::db::Database::open_in_memory().unwrap();
         let (mut app, _) = RssApp::new(db, false);
         let _ = app.update(super::Message::SetNotifications(false));
-        let _ = app.update(super::Message::OpenUrl("file:///etc/passwd".into())); // refused: an error message
+        let refused = || super::Message::LinkNotOpened("Only web links are opened".into());
+        let _ = app.update(refused());
         assert_eq!(app.status_message, None);
         let _ = app.update(super::Message::SetNotifications(true));
-        let _ = app.update(super::Message::OpenUrl("file:///etc/passwd".into()));
+        let _ = app.update(refused());
         assert!(app.status_message.is_some());
     }
 
@@ -5137,17 +5173,18 @@ mod tests {
     fn only_web_links_are_opened() {
         // Refused before anything is launched
         for url in ["file:///etc/passwd", "javascript:alert(1)", "-x", "/home/user/run.desktop", "steam://run/1"] {
-            assert!(open_in_browser(url).is_err(), "{}", url);
+            assert!(web_link(url).is_err(), "{}", url);
         }
+        assert!(web_link(" https://example.com/story ").is_ok());
     }
 
     #[test]
     fn size_labels() {
-        assert_eq!(format_size(0), "1 KB");
-        assert_eq!(format_size(86 * 1024), "86 KB");
-        assert_eq!(format_size(4_404_019), "4.2 MB");
-        assert_eq!(format_size(60_659_000), "58 MB");
-        assert_eq!(format_size(1_395_864_371), "1.3 GB");
+        assert_eq!(format_size(0), "1 KiB");
+        assert_eq!(format_size(86 * 1024), "86 KiB");
+        assert_eq!(format_size(4_404_019), "4.2 MiB");
+        assert_eq!(format_size(60_659_000), "58 MiB");
+        assert_eq!(format_size(1_395_864_371), "1.3 GiB");
     }
 
     #[test]
@@ -5283,19 +5320,19 @@ mod tests {
     }
 }
 
-/// A byte count for people: "850 KB", "4.2 MB", "58 MB", "1.3 GB".
+/// A byte count for people: "850 KB", "4.2 MiB", "58 MiB", "1.3 GiB".
 fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
     let b = bytes as f64;
-    if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else if b >= 10.0 * MB {
-        format!("{:.0} MB", b / MB)
-    } else if b >= MB {
-        format!("{:.1} MB", b / MB)
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= 10.0 * MIB {
+        format!("{:.0} MiB", b / MIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
     } else {
-        format!("{:.0} KB", (b / KB).max(1.0))
+        format!("{:.0} KiB", (b / KIB).max(1.0))
     }
 }

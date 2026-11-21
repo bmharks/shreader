@@ -56,17 +56,6 @@ pub struct Counts {
 const TEXT_CHARS: usize = 1500;
 
 impl Archive {
-    /// Shreader's archive: `$SHREADER_DB`, or its standard place. It must
-    /// already exist (the trainer never creates one).
-    pub fn default_path() -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("SHREADER_DB") {
-            return Ok(PathBuf::from(path));
-        }
-        let dirs = directories::ProjectDirs::from("io.github", "bmharks", "Shreader")
-            .context("couldn't work out where Shreader keeps its archive")?;
-        Ok(dirs.data_dir().join("shreader.db"))
-    }
-
     pub fn open(path: &Path) -> Result<Self> {
         if !path.exists() {
             bail!("there's no Shreader archive at {}: run Shreader first", path.display());
@@ -84,7 +73,15 @@ impl Archive {
         if !is_archive {
             bail!("{} isn't a Shreader archive", path.display());
         }
-        store::ensure_schema(&conn)?;
+        // Shreader creates and upgrades the archive; the trainer only works
+        // with the version it was built for
+        let version = shreader_tags::archive::schema_version(&conn)?;
+        let expected = shreader_tags::archive::SCHEMA_VERSION;
+        if version < expected {
+            bail!("the archive at {} is from an older Shreader: open Shreader once to update it", path.display());
+        } else if version > expected {
+            bail!("the archive at {} is from a newer Shreader: update the trainer to match", path.display());
+        }
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path: path.to_path_buf() })
     }
 
@@ -132,11 +129,9 @@ impl Archive {
     /// Unanswered stories in folders using `tag` that match a search (any
     /// age), best matches first
     pub fn search(&self, tag: i64, query: &str) -> Result<Vec<i64>> {
-        let words: Vec<String> =
-            query.split_whitespace().map(|w| format!("\"{}\"", w.replace('"', ""))).filter(|w| w.len() > 2).collect();
-        if words.is_empty() {
+        let Some(query) = shreader_tags::archive::fts_query(query) else {
             return Ok(Vec::new());
-        }
+        };
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT a.id FROM articles_fts
@@ -148,7 +143,7 @@ impl Archive {
              ORDER BY rank
              LIMIT 500",
         )?;
-        let rows = stmt.query_map(params![tag, words.join(" ")], |r| r.get(0))?;
+        let rows = stmt.query_map(params![tag, query], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -310,6 +305,8 @@ mod tests {
              INSERT INTO feeds VALUES (10, 1, 'Tech feed'), (20, 2, 'World feed');",
         )
         .unwrap();
+        store::create_tables(&conn).unwrap();
+        conn.pragma_update(None, "user_version", shreader_tags::archive::SCHEMA_VERSION).unwrap();
         let titles = ["Save 50% on laptops today", "Chip maker reports profits", "Promo codes for November",
             "Data breach at retailer", "New phone launched", "Old story", "World news"];
         for (n, title) in titles.iter().enumerate() {

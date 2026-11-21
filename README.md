@@ -63,6 +63,7 @@ The same program also works from a terminal:
 | `shreader --import-opml <file>` | Import feeds from an OPML file |
 | `shreader --export-opml [file]` | Export your feeds and folders to OPML |
 | `shreader --help` | Show this list |
+| `shreader --version` | Show which version is installed |
 
 ## Building and testing
 

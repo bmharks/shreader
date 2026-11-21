@@ -442,9 +442,9 @@ fn cap_story(html: String) -> String {
         cut -= 1;
     }
     format!(
-        "{}<p><em>[Shortened: this story is larger than Shreader stores ({} MB). Open it in the browser for the rest.]</em></p>",
+        "{}<p><em>[Shortened: this story is larger than Shreader stores ({} KiB). Open it in the browser for the rest.]</em></p>",
         &html[..cut],
-        MAX_STORY_BYTES / (1024 * 1024)
+        MAX_STORY_BYTES / 1024
     )
 }
 

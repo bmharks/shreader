@@ -102,13 +102,12 @@ impl Database {
     /// elsewhere would look like the archive was lost, and anything added
     /// would land in the wrong file.
     pub fn open_default() -> Result<Self> {
-        let env_path = std::env::var_os("SHREADER_DB").or_else(|| std::env::var_os("RSS_READER_DB"));
-        let path = match env_path {
-            Some(env_path) => PathBuf::from(env_path),
+        let path = match shreader_tags::archive::path_from_env() {
+            Some(path) => path,
             None => {
                 let path = match Self::legacy_db_path() {
-                    Some(legacy) => adopt_legacy_archive(&legacy, &Self::default_db_path()?),
-                    None => Self::default_db_path()?,
+                    Some(legacy) => adopt_legacy_archive(&legacy, &shreader_tags::archive::standard_path()?),
+                    None => shreader_tags::archive::standard_path()?,
                 };
                 // The app's own folder: private to this user, like the files
                 if let Some(dir) = path.parent() {
@@ -195,14 +194,6 @@ impl Database {
             .sum()
     }
 
-    /// ~/.local/share/shreader/shreader.db (named after the app ID,
-    /// io.github.bmharks.Shreader)
-    pub fn default_db_path() -> Result<PathBuf> {
-        let proj = ProjectDirs::from("io.github", "bmharks", "Shreader")
-            .context("Could not determine user XDG data directory")?;
-        Ok(proj.data_dir().join("shreader.db"))
-    }
-
     /// Where the archive was kept before the app was renamed:
     /// ~/.local/share/rss_reader/rss_reader.db
     fn legacy_db_path() -> Option<PathBuf> {
@@ -212,7 +203,7 @@ impl Database {
     fn init_schema(&self) -> Result<()> {
         let conn = self.lock();
 
-        // 1. Pragmas for high performance, crash-safety, and integrity
+        // Per connection (WAL is kept by the file once set)
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -221,165 +212,24 @@ impl Database {
             "#,
         )?;
 
-        // 2. Core Tables
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+        // Schema steps the archive hasn't had yet, each in a transaction
+        // with the version it reaches, so a failed one leaves the archive as
+        // it was and runs again next time
+        let version = shreader_tags::archive::schema_version(&conn)?;
+        if version > SCHEMA_STEPS.len() as i64 {
+            anyhow::bail!(
+                "this archive was used by a newer version of Shreader (archive version {}, this version knows up to {}); update Shreader to open it",
+                version,
+                SCHEMA_STEPS.len()
             );
-
-            CREATE TABLE IF NOT EXISTS folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS feeds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
-                url TEXT NOT NULL UNIQUE,
-                title TEXT NOT NULL,
-                description TEXT,
-                site_url TEXT,
-                last_fetched_at TEXT,
-                etag TEXT,
-                last_modified TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
-                guid TEXT,
-                guid_hash TEXT NOT NULL,
-                title TEXT NOT NULL,
-                url TEXT,
-                author TEXT,
-                summary TEXT,
-                content_html TEXT,
-                content_text TEXT,
-                published_at TEXT,
-                updated_at TEXT,
-                fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
-                is_read INTEGER NOT NULL DEFAULT 0,
-                is_starred INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(feed_id, guid_hash)
-            );
-
-            -- Feed lookups, and the sidebar's per-feed and per-folder counts
-            -- (total and unread), which it answers from the index alone instead
-            -- of reading every story. Replaces an index on feed_id by itself.
-            CREATE INDEX IF NOT EXISTS idx_articles_feed_read ON articles(feed_id, is_read);
-            DROP INDEX IF EXISTS idx_articles_feed_id;
-            -- Replaced by the idx_articles_*shown_date indexes below (the list
-            -- sorts by a combination of the two dates)
-            DROP INDEX IF EXISTS idx_articles_published_at;
-            DROP INDEX IF EXISTS idx_articles_fetched_at;
-            CREATE INDEX IF NOT EXISTS idx_articles_read_starred ON articles(is_read, is_starred);
-            "#,
-        )?;
-
-        // The story list's sort order (see `SHOWN_DATE`), so a page of the
-        // newest stories is read straight off an index instead of sorting
-        // the whole archive. Expression indexes only match a query that
-        // spells the expression the same way.
-        conn.execute_batch(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_articles_shown_date
-                ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at));
-            -- The Unread view, and "unread first" (read status, then newest
-            -- first). Replaces an index without the directions, which only
-            -- served the Unread view.
-            DROP INDEX IF EXISTS idx_articles_unread_shown_date;
-            CREATE INDEX IF NOT EXISTS idx_articles_read_shown_date
-                ON articles(is_read, MIN(COALESCE(published_at, fetched_at), fetched_at) DESC, id DESC);
-            CREATE INDEX IF NOT EXISTS idx_articles_starred_shown_date
-                ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at)) WHERE is_starred = 1;
-            -- Feed and folder views: lets a big folder be sorted from the
-            -- index rather than by reading all its stories
-            CREATE INDEX IF NOT EXISTS idx_articles_feed_shown_date
-                ON articles(feed_id, MIN(COALESCE(published_at, fetched_at), fetched_at));
-            "#,
-        )?;
-
-        // Migration: Ensure folder_id exists on feeds if database was created previously
-        let _ = conn.execute(
-            "ALTER TABLE feeds ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_feeds_folder_id ON feeds(folder_id)",
-            [],
-        );
-        // Migration: user-defined feed order within a folder (NULL = not yet
-        // arranged; those sort alphabetically after arranged feeds)
-        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN sort_order INTEGER", []);
-        // Migration: user-defined folder order (NULL = not yet arranged; those
-        // sort alphabetically after arranged folders)
-        let _ = conn.execute("ALTER TABLE folders ADD COLUMN sort_order INTEGER", []);
-        // Migration: how much each feed has added today (UTC), for the daily
-        // allowance that stops one feed from filling the disk
-        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_day TEXT", []);
-        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_stories INTEGER NOT NULL DEFAULT 0", []);
-        let _ = conn.execute("ALTER TABLE feeds ADD COLUMN intake_bytes INTEGER NOT NULL DEFAULT 0", []);
-
-        // 3. Full-Text Search (FTS5) for instant offline search across entire story history
-        conn.execute_batch(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
-                title,
-                summary,
-                content_text,
-                author,
-                content='articles',
-                content_rowid='id'
-            );
-
-            -- Triggers to keep FTS index synchronized with articles table
-            CREATE TRIGGER IF NOT EXISTS trg_articles_ai AFTER INSERT ON articles BEGIN
-                INSERT INTO articles_fts(rowid, title, summary, content_text, author)
-                VALUES (new.id, new.title, new.summary, new.content_text, new.author);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_articles_ad AFTER DELETE ON articles BEGIN
-                INSERT INTO articles_fts(articles_fts, rowid, title, summary, content_text, author)
-                VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
-            END;
-
-            -- Only text changes touch the search index; marking stories read
-            -- or starred mustn't re-index them. Recreated on every start so
-            -- databases made with the older any-column trigger get this one.
-            DROP TRIGGER IF EXISTS trg_articles_au;
-            CREATE TRIGGER trg_articles_au
-            AFTER UPDATE OF title, summary, content_text, author ON articles BEGIN
-                INSERT INTO articles_fts(articles_fts, rowid, title, summary, content_text, author)
-                VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
-                INSERT INTO articles_fts(rowid, title, summary, content_text, author)
-                VALUES (new.id, new.title, new.summary, new.content_text, new.author);
-            END;
-            "#,
-        )?;
-
-        // 4. Tags (see the shreader-tags crate): which stories are sorted
-        // out of their folders into tag views, and what the trainer learned
-        shreader_tags::store::ensure_schema(&conn)?;
-
-        // 5. Once: titles stored before HTML character references were
-        // decoded ("Google&#8217;s"), as they're stored now
-        let done: Option<String> = conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", params![TITLES_DECODED_SETTING], |r| r.get(0))
-            .optional()?;
-        if done.is_none() {
-            let tx = conn.unchecked_transaction()?;
-            let fixed = decode_stored_titles(&tx)?;
-            tx.execute("INSERT INTO settings (key, value) VALUES (?1, 'true')", params![TITLES_DECODED_SETTING])?;
-            tx.commit()?;
-            if fixed > 0 {
-                tracing::info!("Decoded HTML character references in {} story titles", fixed);
-            }
         }
-
+        for (done, step) in SCHEMA_STEPS.iter().enumerate().skip(version as usize) {
+            let reached = done as i64 + 1;
+            let tx = conn.unchecked_transaction()?;
+            step(&tx).with_context(|| format!("upgrading the archive to version {}", reached))?;
+            tx.pragma_update(None, "user_version", reached)?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -974,7 +824,7 @@ impl Database {
 
         if let Some(ref search) = filter.search_query {
             if !search.trim().is_empty() {
-                match fts_query(search) {
+                match shreader_tags::archive::fts_query(search) {
                     Some(query) => {
                         clause.push_str(" AND a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)");
                         params_vec.push(Box::new(query));
@@ -1265,8 +1115,173 @@ impl Database {
     }
 }
 
-/// Setting: the one-time `decode_stored_titles` has run
-const TITLES_DECODED_SETTING: &str = "titles_decoded";
+/// The archive's schema, as steps from an empty file; `PRAGMA user_version`
+/// is how many it has had. Changes go in a new step at the end (a step that
+/// has shipped is never edited), with `shreader_tags::archive::SCHEMA_VERSION`
+/// raised to match. The tag tables are the tags crate's, and set up here too.
+const SCHEMA_STEPS: &[fn(&Connection) -> Result<()>] = &[base_schema, decode_titles_once];
+
+/// Step 1: the schema as it was when versions began. Archives from before
+/// then are already partly there, so each part is only added if missing.
+fn base_schema(conn: &Connection) -> Result<()> {
+    // Tables
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
+            url TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            description TEXT,
+            site_url TEXT,
+            last_fetched_at TEXT,
+            etag TEXT,
+            last_modified TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+            guid TEXT,
+            guid_hash TEXT NOT NULL,
+            title TEXT NOT NULL,
+            url TEXT,
+            author TEXT,
+            summary TEXT,
+            content_html TEXT,
+            content_text TEXT,
+            published_at TEXT,
+            updated_at TEXT,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            is_read INTEGER NOT NULL DEFAULT 0,
+            is_starred INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(feed_id, guid_hash)
+        );
+
+        -- Feed lookups, and the sidebar's per-feed and per-folder counts
+        -- (total and unread), which it answers from the index alone instead
+        -- of reading every story. Replaces an index on feed_id by itself.
+        CREATE INDEX IF NOT EXISTS idx_articles_feed_read ON articles(feed_id, is_read);
+        DROP INDEX IF EXISTS idx_articles_feed_id;
+        -- Replaced by the idx_articles_*shown_date indexes below (the list
+        -- sorts by a combination of the two dates)
+        DROP INDEX IF EXISTS idx_articles_published_at;
+        DROP INDEX IF EXISTS idx_articles_fetched_at;
+        CREATE INDEX IF NOT EXISTS idx_articles_read_starred ON articles(is_read, is_starred);
+        "#,
+    )?;
+
+    // The story list's sort order (see `SHOWN_DATE`), so a page of the
+    // newest stories is read straight off an index instead of sorting
+    // the whole archive. Expression indexes only match a query that
+    // spells the expression the same way.
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_articles_shown_date
+            ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at));
+        -- The Unread view, and "unread first" (read status, then newest
+        -- first). Replaces an index without the directions, which only
+        -- served the Unread view.
+        DROP INDEX IF EXISTS idx_articles_unread_shown_date;
+        CREATE INDEX IF NOT EXISTS idx_articles_read_shown_date
+            ON articles(is_read, MIN(COALESCE(published_at, fetched_at), fetched_at) DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_articles_starred_shown_date
+            ON articles(MIN(COALESCE(published_at, fetched_at), fetched_at)) WHERE is_starred = 1;
+        -- Feed and folder views: lets a big folder be sorted from the
+        -- index rather than by reading all its stories
+        CREATE INDEX IF NOT EXISTS idx_articles_feed_shown_date
+            ON articles(feed_id, MIN(COALESCE(published_at, fetched_at), fetched_at));
+        "#,
+    )?;
+
+    // Columns added to tables that may predate them
+    let columns = [
+        ("feeds", "folder_id", "INTEGER REFERENCES folders(id) ON DELETE SET NULL"),
+        // User-arranged order within a folder (NULL = not yet arranged;
+        // those sort alphabetically after arranged ones)
+        ("feeds", "sort_order", "INTEGER"),
+        ("folders", "sort_order", "INTEGER"),
+        // How much each feed has added today (UTC), for the daily allowance
+        // that stops one feed from filling the disk
+        ("feeds", "intake_day", "TEXT"),
+        ("feeds", "intake_stories", "INTEGER NOT NULL DEFAULT 0"),
+        ("feeds", "intake_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (table, column, definition) in columns {
+        if !shreader_tags::archive::has_column(conn, table, column)? {
+            conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition))?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_feeds_folder_id ON feeds(folder_id)")?;
+
+    // Full-text search (FTS5) across the whole archive
+    conn.execute_batch(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
+            title,
+            summary,
+            content_text,
+            author,
+            content='articles',
+            content_rowid='id'
+        );
+
+        -- Triggers to keep FTS index synchronized with articles table
+        CREATE TRIGGER IF NOT EXISTS trg_articles_ai AFTER INSERT ON articles BEGIN
+            INSERT INTO articles_fts(rowid, title, summary, content_text, author)
+            VALUES (new.id, new.title, new.summary, new.content_text, new.author);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_articles_ad AFTER DELETE ON articles BEGIN
+            INSERT INTO articles_fts(articles_fts, rowid, title, summary, content_text, author)
+            VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
+        END;
+
+        -- Only text changes touch the search index; marking stories read
+        -- or starred mustn't re-index them. Recreated on every start so
+        -- databases made with the older any-column trigger get this one.
+        DROP TRIGGER IF EXISTS trg_articles_au;
+        CREATE TRIGGER trg_articles_au
+        AFTER UPDATE OF title, summary, content_text, author ON articles BEGIN
+            INSERT INTO articles_fts(articles_fts, rowid, title, summary, content_text, author)
+            VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
+            INSERT INTO articles_fts(rowid, title, summary, content_text, author)
+            VALUES (new.id, new.title, new.summary, new.content_text, new.author);
+        END;
+        "#,
+    )?;
+
+    // Tags (see the shreader-tags crate): which stories are sorted out of
+    // their folders into tag views, and what the trainer learned
+    shreader_tags::store::create_tables(conn)?;
+    Ok(())
+}
+
+/// Step 2: titles stored before HTML character references were decoded
+/// ("Google&#8217;s"), decoded as they're stored now. Archives that already
+/// had this done kept a setting saying so, which is no longer needed.
+fn decode_titles_once(conn: &Connection) -> Result<()> {
+    let done = conn.execute("DELETE FROM settings WHERE key = 'titles_decoded'", [])? > 0;
+    if !done {
+        let fixed = decode_stored_titles(conn)?;
+        if fixed > 0 {
+            tracing::info!("Decoded HTML character references in {} story titles", fixed);
+        }
+    }
+    Ok(())
+}
 
 /// Decodes HTML character references in stored story titles and authors
 /// (as `feed::Markup::References`). Only rows that look like they hold one
@@ -1297,47 +1312,6 @@ fn decode_stored_titles(conn: &Connection) -> Result<usize> {
         }
     }
     Ok(changed)
-}
-
-/// What's typed in the search box, as an FTS5 query.
-///
-/// Each word is looked for on its own, in any order, and the last one also
-/// matches as the start of a longer word while it's still being typed:
-/// `solar pan` finds "solar panels". A space after it ends the word, and
-/// text in quotes is an exact phrase. Everything is quoted for FTS5, so
-/// what's typed is never read as its syntax (`OR`, `-`, `:`, `*`).
-/// `None` if there's no word at all, only punctuation.
-fn fts_query(input: &str) -> Option<String> {
-    let mut terms: Vec<String> = Vec::new();
-    let mut rest = input;
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
-        // (the term, what follows it, whether it's a phrase with its closing quote)
-        let (term, after, closed) = match rest.strip_prefix('"') {
-            Some(phrase) => match phrase.find('"') {
-                Some(end) => (&phrase[..end], &phrase[end + 1..], true),
-                None => (phrase, "", false), // being typed
-            },
-            None => {
-                let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
-                (&rest[..end], &rest[end..], false)
-            }
-        };
-        rest = after;
-        // Punctuation alone isn't a word (and would make an empty phrase)
-        if !term.chars().any(char::is_alphanumeric) {
-            continue;
-        }
-        let mut quoted = format!("\"{}\"", term);
-        if after.is_empty() && !closed && !input.ends_with(char::is_whitespace) {
-            quoted.push('*');
-        }
-        terms.push(quoted);
-    }
-    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 #[cfg(test)]
@@ -1542,20 +1516,103 @@ mod tests {
         drop(conn);
         let found = db.get_articles(&ArticleFilter { search_query: Some("google".into()), ..Default::default() });
         assert_eq!(found.unwrap().len(), 1, "re-indexed");
-        // Opening ran it already, and won't again
-        assert_eq!(db.get_setting(TITLES_DECODED_SETTING).unwrap().as_deref(), Some("true"));
     }
 
     #[test]
-    fn search_text_becomes_an_fts_query() {
-        assert_eq!(fts_query("solar pan").as_deref(), Some(r#""solar" "pan"*"#));
-        assert_eq!(fts_query("solar pan ").as_deref(), Some(r#""solar" "pan""#), "a space ends the word");
-        assert_eq!(fts_query(r#""solar panels" cheap"#).as_deref(), Some(r#""solar panels" "cheap"*"#));
-        assert_eq!(fts_query(r#"cheap "solar panels""#).as_deref(), Some(r#""cheap" "solar panels""#));
-        assert_eq!(fts_query(r#"cheap "solar pan"#).as_deref(), Some(r#""cheap" "solar pan"*"#));
-        assert_eq!(fts_query("rust OR go -c++").as_deref(), Some(r#""rust" "OR" "go" "-c++"*"#));
-        assert_eq!(fts_query("  - ; ").as_deref(), None);
-        assert_eq!(fts_query(r#"""#).as_deref(), None);
+    fn schema_steps_match_the_shared_version() {
+        assert_eq!(SCHEMA_STEPS.len() as i64, shreader_tags::archive::SCHEMA_VERSION);
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.lock();
+        assert_eq!(shreader_tags::archive::schema_version(&conn).unwrap(), shreader_tags::archive::SCHEMA_VERSION);
+    }
+
+    /// An archive from before schema versions: missing the later columns,
+    /// with the old search trigger, and one with the titles already decoded
+    fn unversioned_archive(path: &Path, titles_decoded: bool) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')));
+             CREATE TABLE feeds (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+                 description TEXT, site_url TEXT, last_fetched_at TEXT, etag TEXT, last_modified TEXT,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')));
+             CREATE TABLE articles (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE, guid TEXT, guid_hash TEXT NOT NULL,
+                 title TEXT NOT NULL, url TEXT, author TEXT, summary TEXT, content_html TEXT, content_text TEXT,
+                 published_at TEXT, updated_at TEXT, fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 is_read INTEGER NOT NULL DEFAULT 0, is_starred INTEGER NOT NULL DEFAULT 0, UNIQUE(feed_id, guid_hash));
+             CREATE VIRTUAL TABLE articles_fts USING fts5(title, summary, content_text, author,
+                 content='articles', content_rowid='id');
+             CREATE TRIGGER trg_articles_ai AFTER INSERT ON articles BEGIN
+                 INSERT INTO articles_fts(rowid, title, summary, content_text, author)
+                 VALUES (new.id, new.title, new.summary, new.content_text, new.author);
+             END;
+             CREATE TRIGGER trg_articles_au AFTER UPDATE ON articles BEGIN
+                 INSERT INTO articles_fts(articles_fts, rowid, title, summary, content_text, author)
+                 VALUES('delete', old.id, old.title, old.summary, old.content_text, old.author);
+                 INSERT INTO articles_fts(rowid, title, summary, content_text, author)
+                 VALUES (new.id, new.title, new.summary, new.content_text, new.author);
+             END;
+             CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 sort_order INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+             INSERT INTO feeds (url, title) VALUES ('https://f.example/rss', 'F');
+             INSERT INTO articles (feed_id, guid_hash, title) VALUES (1, 'a', 'Google&#8217;s satellites');
+             INSERT INTO tags (name, sort_order) VALUES ('Promotions', 1);",
+        )
+        .unwrap();
+        if titles_decoded {
+            conn.execute("INSERT INTO settings VALUES ('titles_decoded', 'true')", []).unwrap();
+        }
+    }
+
+    #[test]
+    fn unversioned_archives_are_upgraded() {
+        let root = std::env::temp_dir().join(format!("shreader-schema-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for titles_decoded in [false, true] {
+            let path = root.join(format!("archive-{}.db", titles_decoded));
+            unversioned_archive(&path, titles_decoded);
+            let db = Database::open(&path).unwrap();
+            {
+                let conn = db.lock();
+                assert_eq!(shreader_tags::archive::schema_version(&conn).unwrap(), SCHEMA_STEPS.len() as i64);
+                for (table, column) in [("feeds", "folder_id"), ("feeds", "sort_order"), ("folders", "sort_order"),
+                    ("feeds", "intake_bytes"), ("tags", "removed")]
+                {
+                    assert!(shreader_tags::archive::has_column(&conn, table, column).unwrap(), "{}.{}", table, column);
+                }
+                let title: String = conn.query_row("SELECT title FROM articles", [], |r| r.get(0)).unwrap();
+                // An archive that had the titles done isn't gone over again
+                let expected = if titles_decoded { "Google&#8217;s satellites" } else { "Google’s satellites" };
+                assert_eq!(title, expected);
+            }
+            assert_eq!(db.get_setting("titles_decoded").unwrap(), None);
+            // The newer search trigger: marking a story read doesn't re-index it
+            let sql: String = db
+                .lock()
+                .query_row("SELECT sql FROM sqlite_master WHERE name = 'trg_articles_au'", [], |r| r.get(0))
+                .unwrap();
+            assert!(sql.contains("UPDATE OF title"), "{}", sql);
+            drop(db);
+            // Opening again changes nothing
+            Database::open(&path).unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn archives_from_newer_versions_are_left_alone() {
+        let root = std::env::temp_dir().join(format!("shreader-newer-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("archive.db");
+        drop(Database::open(&path).unwrap());
+        Connection::open(&path).unwrap().pragma_update(None, "user_version", 99).unwrap();
+        let error = format!("{:#}", Database::open(&path).err().expect("refused"));
+        assert!(error.contains("newer version of Shreader"), "{}", error);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Partly typed words find stories, in any order; quotes keep a phrase.

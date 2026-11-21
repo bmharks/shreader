@@ -57,6 +57,9 @@ unicode-normalization = "0.1.26"
 # System & Linux XDG paths
 directories = "5.0"
 
+# Command-line options (--help, --version and error messages included)
+clap = { version = "4.6.7", features = ["derive"] }
+
 # Error handling & logging
 anyhow = "1.0"
 tracing = "0.1"
@@ -77,6 +80,8 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # iced uses, so nothing extra is compiled)
 resvg = { version = "0.42", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# Opens links in the browser through the desktop portal (the version rfd uses)
+ashpd = { version = "0.11.1", default-features = false, features = ["tokio"] }
 libc = "0.2"
 # Downloads several feeds at once during a refresh
 futures = "0.3"
